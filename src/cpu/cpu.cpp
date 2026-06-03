@@ -748,6 +748,11 @@ void CPU_SetFlags(Bitu word,Bitu mask) {
 }
 
 bool CPU_PrepareException(Bitu which,Bitu error) {
+#if C_DEBUG
+# if C_HEAVY_DEBUG
+	LOG_MSG("CPU_PrepareException: Exception %d (error=0x%x) at CS:EIP=%04X:%08X", (int)which, (int)error, SegValue(cs), reg_eip);
+# endif
+#endif
 	cpu.exception.which=which;
 	cpu.exception.error=error;
 	return true;
@@ -1140,8 +1145,46 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	assert(which < 0x20);
 //	LOG_MSG("Exception %d error %x",which,error);
 
+#if C_DEBUG
+# if C_HEAVY_DEBUG
+	// Log all exceptions to see if GPF (13) is being caught
+	LOG_MSG("CPU_Exception: Exception %d (error=%x) at CS:EIP=%04X:%08X", (int)which, (int)error, SegValue(cs), reg_eip);
+# endif
+#endif
+
 	if(which >= 0x20)
 		E_Exit("CPU_Exception: Exception %d is out of range.", (int)which);
+
+#if C_DEBUG
+# if C_HEAVY_DEBUG
+	// Check for interrupt breakpoints BEFORE handling the exception
+	// This allows us to catch page faults and GPFs before they're handled
+	extern bool DEBUG_IntBreakpoint(uint8_t intNum);
+	extern Bitu DEBUG_EnableDebugger(void);
+	extern void DEBUG_Socket_NotifyBreakpoint(uint16_t seg, uint32_t off);
+	// Temporarily disable inhibit_int_breakpoint to allow exception breakpoints
+	extern bool inhibit_int_breakpoint;
+	bool old_inhibit = inhibit_int_breakpoint;
+	inhibit_int_breakpoint = false;
+	LOG_MSG("CPU_Exception: Checking interrupt breakpoint for exception %d (inhibit=%d)", (int)which, old_inhibit ? 1 : 0);
+	bool bp_hit = DEBUG_IntBreakpoint((uint8_t)which);
+	inhibit_int_breakpoint = old_inhibit;
+	LOG_MSG("CPU_Exception: Breakpoint check result for exception %d: %d", (int)which, bp_hit ? 1 : 0);
+	if (bp_hit) {
+		LOG_MSG("CPU_Exception: *** INTERRUPT BREAKPOINT HIT for exception %d at CS:EIP=%04X:%08X ***", (int)which, SegValue(cs), reg_eip);
+		DEBUG_EnableDebugger();
+		// Notify debug socket about the breakpoint
+		DEBUG_Socket_NotifyBreakpoint(SegValue(cs), reg_eip);
+		// Check exitLoop BEFORE calling CPU_Interrupt to prevent exception handler from taking control
+		extern bool exitLoop;
+		if (exitLoop) {
+			LOG_MSG("CPU_Exception: exitLoop=true, stopping BEFORE calling CPU_Interrupt for exception %d", (int)which);
+			return;  // Stop here - don't call CPU_Interrupt, don't transfer control to exception handler
+		}
+	}
+	// Note: If breakpoint wasn't hit, DEBUG_IntBreakpoint already logged why (or we can add logging here if needed)
+# endif
+#endif
 
 	if (CPU_Exception_Level[which] != 0) {
 		if (CPU_Exception_Level[EXCEPTION_DF] != 0 && cpu_triple_fault_reset) {
@@ -1178,7 +1221,21 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	}
 
 	cpu.exception.error=error;
+	LOG_MSG("CPU_Exception: Calling CPU_Interrupt for exception %d", (int)which);
 	CPU_Interrupt(which,CPU_INT_EXCEPTION | ((which>=8) ? CPU_INT_HAS_ERROR : 0),reg_eip);
+	LOG_MSG("CPU_Exception: Returned from CPU_Interrupt for exception %d", (int)which);
+
+#if C_DEBUG
+# if C_HEAVY_DEBUG
+	// Check if debugger wants to stop (interrupt breakpoint was hit)
+	extern bool exitLoop;
+	if (exitLoop) {
+		LOG_MSG("CPU_Exception: exitLoop=true, stopping exception handling for exception %d", (int)which);
+		// Don't continue exception handling - stop here
+		return;
+	}
+# endif
+#endif
 
 	/* allow recursive page faults. required for multitasking OSes like Windows 95.
 	 * we set this AFTER CPU_Interrupt so that if CPU_Interrupt faults while starting
@@ -1198,6 +1255,16 @@ void CPU_Exception(Bitu which,Bitu error ) {
 
 uint8_t lastint;
 void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
+#if C_DEBUG
+# if C_HEAVY_DEBUG
+	// Log all interrupts, especially exceptions
+	if (type & CPU_INT_EXCEPTION) {
+		LOG_MSG("CPU_Interrupt: Exception %d (type=0x%x) at CS:EIP=%04X:%08X", (int)num, (int)type, SegValue(cs), oldeip);
+	} else {
+		LOG_MSG("CPU_Interrupt: Interrupt %d (type=0x%x) at CS:EIP=%04X:%08X", (int)num, (int)type, SegValue(cs), oldeip);
+	}
+# endif
+#endif
     if (num == EXCEPTION_DB && (type&CPU_INT_EXCEPTION) == 0) {
       CPU_DebugException(0,oldeip); // DR6 bits need updating
       return;

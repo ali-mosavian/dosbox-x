@@ -322,28 +322,34 @@ AutoexecObject::~AutoexecObject(){
 }
 
 DOS_Shell::~DOS_Shell() {
-	if (bf != NULL) delete bf; /* free batch file */
+	/* DOS subsystem routines (DOS_FreeProcessMemory, CloseFiles, etc.) can throw int(N)
+	 * via DOS_Mem_E_Exit / similar when MCB chain corruption or other non-fatal errors are
+	 * detected during teardown.  Destructors are implicitly noexcept in C++11, so any
+	 * uncaught exception propagating out calls std::terminate().  Wrap the entire body. */
+	try {
+		if (bf != NULL) delete bf; /* free batch file */
 
-	/* shell termination is not handled like a normal program.
-	 * memory allocated by the shell is not automatically freed on termination.
-	 * files are not automatically closed */
-	if (psp->GetSegment()) {
-		/* BOOT will set the first MCB chain to zero to signal that low memory has been overwritten
-		 * by the guest OS boot code */
-		if (!dos_kernel_shutdown_mcb) {
-			DOS_FreeProcessMemory(psp->GetSegment());
+		/* shell termination is not handled like a normal program.
+		 * memory allocated by the shell is not automatically freed on termination.
+		 * files are not automatically closed */
+		if (psp->GetSegment()) {
+			/* BOOT will set the first MCB chain to zero to signal that low memory has been overwritten
+			 * by the guest OS boot code */
+			if (!dos_kernel_shutdown_mcb) {
+				DOS_FreeProcessMemory(psp->GetSegment());
 
-			/* NTS: DOS_PSP would ideally allow JFT handle operations regardless of whatever the
-			 *      current PSP segment is, but that's not how the code is written */
-			const uint16_t o_psp = dos.psp();
-			dos.psp(psp->GetSegment());
-			psp->CloseFiles();
-			dos.psp(o_psp);
+				/* NTS: DOS_PSP would ideally allow JFT handle operations regardless of whatever the
+				 *      current PSP segment is, but that's not how the code is written */
+				const uint16_t o_psp = dos.psp();
+				dos.psp(psp->GetSegment());
+				psp->CloseFiles();
+				dos.psp(o_psp);
+			}
 		}
-	}
 
-	if (psp->GetSegment() == shell_psp)
-		shell_psp = 0;
+		if (psp->GetSegment() == shell_psp)
+			shell_psp = 0;
+	} catch (...) {}
 }
 
 DOS_Shell::DOS_Shell():Program(){

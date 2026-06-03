@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include "dosbox.h"
 #include "debug.h"
+#include "debug/debug_socket.h"
 #include "cpu.h"
 #include "logging.h"
 #include "menudef.h"
@@ -433,6 +434,11 @@ static Bitu Normal_Loop(void) {
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
 
+#if C_DEBUG
+    // Check for debug socket commands
+    DEBUG_Socket_CheckCommands();
+#endif
+
     if (!menu.hidecycles || menu.showrt) { /* sdlmain.cpp/render.cpp doesn't even maintain the frames count when hiding cycles! */
         uint32_t ticksNew = GetTicks();
         if (ticksNew >= Ticks) {
@@ -509,7 +515,7 @@ static Bitu Normal_Loop(void) {
                 }
 #if C_DEBUG
                 if (DEBUG_ExitLoop())
-                    return 0;
+                    return 1;  // Return non-zero to exit DOSBOX_RunMachine
 #endif
             } else {
                 GFX_Events();

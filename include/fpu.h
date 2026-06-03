@@ -63,7 +63,7 @@ typedef union {
 #if defined(HAS_LONG_DOUBLE)
 static_assert( sizeof(FPU_Reg_80) >= 8, "FPU_Reg_80 error" );/*NTS: GCC can and often will define long double as 16 bytes or at least align by 16 bytes*/
 #else
-static_assert( sizeof(FPU_Reg_80) == 8, "FPU_Reg_80 error" );
+static_assert( sizeof(FPU_Reg_80) == 10, "FPU_Reg_80 error" ); // packed {uint64_t,uint16_t} = 10 bytes on all platforms without 80-bit long double
 #endif
 // ^ Remember that in 80-bit extended, the mantissa contains both the fraction and integer bit. There is no
 //   "implied bit" like 32-bit and 64-bit formats.

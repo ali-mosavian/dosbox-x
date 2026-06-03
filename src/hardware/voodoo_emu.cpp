@@ -1076,9 +1076,9 @@ void recompute_texture_params(tmu_state *t)
 	/* no longer dirty */
 	t->regdirty = false;
 
-	/* check for separate RGBA filtering */
+	/* Guest or reset can leave bit 21 set; we only use standard RGB detail. */
 	if (TEXDETAIL_SEPARATE_RGBA_FILTER(t->reg[tDetail].u))
-		E_Exit("Separate RGBA filters!");
+		t->reg[tDetail].u &= ~(UINT32)(1 << 21);
 }
 
 
@@ -3006,7 +3006,6 @@ void voodoo_init(int type) {
 			tmumem0 = 4;
 			tmumem1 = 4;
 			break;
-/*
 		case VOODOO_2:
 			v->regaccess = voodoo2_register_access;
 			fbmemsize = 4;
@@ -3014,7 +3013,7 @@ void voodoo_init(int type) {
 			tmumem1 = 4;
 			v->tmu_config |= 0x800;
 			break;
-*/
+
 		default:
 			E_Exit("Unsupported voodoo card in voodoo_start!");
 			break;

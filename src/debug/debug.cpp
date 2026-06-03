@@ -47,6 +47,7 @@ using namespace std;
 #include "paging.h"
 #include "shell.h"
 #include "debug_inc.h"
+#include "debug_socket.h"
 #include "../cpu/lazyflags.h"
 #include "keyboard.h"
 #include "control.h"
@@ -595,9 +596,13 @@ public:
 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
+	static CBreakpoint*		AddBreakpointByAddr	(PhysPt addr, bool once);
+	static bool				DeleteBreakpointByAddr(PhysPt addr);
+	static std::list<CBreakpoint*>& GetBreakpointList(void);
 	static bool				DeleteByIndex		(uint16_t index);
 	static void				DeleteAll			(void);
 	static void				ShowList			(void);
+	static std::string		ToJSON				(void);   // JSON array for debug socket
 
 
 private:
@@ -686,7 +691,10 @@ CBreakpoint* CBreakpoint::AddIntBreakpoint(uint8_t intNum, uint16_t ah, uint16_t
 	CBreakpoint* bp = new CBreakpoint();
 	bp->SetInt			(intNum,ah,al);
 	bp->SetOnce			(once);
+	bp->Activate		(true);  // Activate the breakpoint!
 	BPoints.push_front	(bp);
+	LOG_MSG("AddIntBreakpoint: Added interrupt BP for int %d (AH=%04X AL=%04X), BPoints.size()=%zu, active=%d", 
+		intNum, ah, al, BPoints.size(), bp->IsActive() ? 1 : 0);
 	return bp;
 }
 
@@ -797,28 +805,46 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue, uint16_t alValue)
 // Checks if interrupt breakpoint is valid and should stop execution
 {
-	if (BPoints.empty()) return false;
+	if (BPoints.empty()) {
+		LOG_MSG("CheckIntBreakpoint: BPoints is empty for int %d", intNr);
+		return false;
+	}
 
     // unused
     (void)adr;
 
 	// Search matching breakpoint
 	std::list<CBreakpoint*>::iterator i;
+	int interrupt_bp_count = 0;
 	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
 		CBreakpoint* bp = (*i);
-		if ((bp->GetType()==BKPNT_INTERRUPT) && bp->IsActive() && (bp->GetIntNr()==intNr)) {
-			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
-				// Ignore it once ?
-				// Found
-				if (bp->GetOnce()) {
-					// delete it, if it should only be used once
-					(BPoints.erase)(i);
-					bp->Activate(false);
-					delete bp;
+		if (bp->GetType()==BKPNT_INTERRUPT) {
+			interrupt_bp_count++;
+			LOG_MSG("CheckIntBreakpoint: Interrupt BP found: intNr=%d (looking for %d), active=%d", 
+				bp->GetIntNr(), intNr, bp->IsActive() ? 1 : 0);
+			if (bp->IsActive() && bp->GetIntNr()==intNr) {
+				uint16_t bp_ah = bp->GetValue();
+				uint16_t bp_al = bp->GetOther();
+				bool ah_match = ((bp_ah==BPINT_ALL) || (bp_ah==ahValue));
+				bool al_match = ((bp_al==BPINT_ALL) || (bp_al==alValue));
+				LOG_MSG("CheckIntBreakpoint: Found interrupt BP for %d: stored AH=%04X AL=%04X (BPINT_ALL=0x%04X), checking with AH=%04X AL=%04X, match=%d/%d", 
+					intNr, bp_ah, bp_al, BPINT_ALL, ahValue, alValue, ah_match ? 1 : 0, al_match ? 1 : 0);
+				if (ah_match && al_match) {
+					// Found
+					if (bp->GetOnce()) {
+						// delete it, if it should only be used once
+						(BPoints.erase)(i);
+						bp->Activate(false);
+						delete bp;
+					}
+					return true;
 				}
-				return true;
 			}
 		}
+	}
+	if (interrupt_bp_count > 0) {
+		LOG_MSG("CheckIntBreakpoint: Found %d interrupt BPs, but none matched int %d with AH=%04X AL=%04X", 
+			interrupt_bp_count, intNr, ahValue, alValue);
 	}
 	return false;
 }
@@ -909,6 +935,40 @@ bool CBreakpoint::DeleteBreakpoint(uint16_t seg, uint32_t off)
 	return false;
 }
 
+// Helper function to add breakpoint by physical address (for debug socket)
+CBreakpoint* CBreakpoint::AddBreakpointByAddr(PhysPt addr, bool once)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetAddress(addr);  // Use SetAddress(PhysPt) to set physical address directly
+	bp->SetOnce(once);
+	BPoints.push_front(bp);
+	return bp;
+}
+
+// Helper function to delete breakpoint by physical address (for debug socket)
+bool CBreakpoint::DeleteBreakpointByAddr(PhysPt addr)
+{
+	if (BPoints.empty()) return false;
+	
+	// Find breakpoint at this physical address
+	std::list<CBreakpoint*>::iterator i;
+	for (i = BPoints.begin(); i != BPoints.end(); ++i) {
+		CBreakpoint* bp = (*i);
+		if (bp->GetType() == BKPNT_PHYSICAL && bp->GetLocation() == addr) {
+			BPoints.erase(i);
+			bp->Activate(false);
+			delete bp;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Helper function to get breakpoint list (for debug socket)
+std::list<CBreakpoint*>& CBreakpoint::GetBreakpointList()
+{
+	return BPoints;
+}
 
 void CBreakpoint::ShowList(void)
 {
@@ -936,6 +996,72 @@ void CBreakpoint::ShowList(void)
 	}
 }
 
+// Build a JSON array of all breakpoints for the debug socket.
+// Lives here (not in debug_socket.cpp) so it has access to inline getters.
+std::string CBreakpoint::ToJSON(void)
+{
+    std::string arr = "[";
+    bool first = true;
+    int nr = 0;
+    for (CBreakpoint* bp : BPoints) {
+        if (!first) arr += ",";
+        first = false;
+
+        const char* tname = "unknown";
+        switch (bp->GetType()) {
+            case BKPNT_PHYSICAL:      tname = "physical";   break;
+            case BKPNT_INTERRUPT:     tname = "interrupt";  break;
+            case BKPNT_MEMORY:        tname = "memory";     break;
+            case BKPNT_MEMORY_PROT:   tname = "mem_prot";   break;
+            case BKPNT_MEMORY_LINEAR: tname = "mem_linear"; break;
+            case BKPNT_MEMORY_FREEZE: tname = "mem_freeze"; break;
+            default: break;
+        }
+
+        char buf[512];
+        if (bp->GetType() == BKPNT_INTERRUPT) {
+            uint16_t ah = bp->GetValue();
+            uint16_t al = bp->GetOther();
+            if (ah == BPINT_ALL && al == BPINT_ALL)
+                snprintf(buf, sizeof(buf),
+                    "{\"index\":%d,\"type\":\"interrupt\",\"int_num\":%d,"
+                    "\"active\":%s,\"once\":%s}",
+                    nr, (int)bp->GetIntNr(),
+                    bp->IsActive() ? "true" : "false",
+                    bp->GetOnce()  ? "true" : "false");
+            else if (al == BPINT_ALL)
+                snprintf(buf, sizeof(buf),
+                    "{\"index\":%d,\"type\":\"interrupt\",\"int_num\":%d,\"ah\":%d,"
+                    "\"active\":%s,\"once\":%s}",
+                    nr, (int)bp->GetIntNr(), (int)ah,
+                    bp->IsActive() ? "true" : "false",
+                    bp->GetOnce()  ? "true" : "false");
+            else
+                snprintf(buf, sizeof(buf),
+                    "{\"index\":%d,\"type\":\"interrupt\",\"int_num\":%d,\"ah\":%d,\"al\":%d,"
+                    "\"active\":%s,\"once\":%s}",
+                    nr, (int)bp->GetIntNr(), (int)ah, (int)al,
+                    bp->IsActive() ? "true" : "false",
+                    bp->GetOnce()  ? "true" : "false");
+        } else {
+            snprintf(buf, sizeof(buf),
+                "{\"index\":%d,\"type\":\"%s\","
+                "\"addr\":\"0x%08X\",\"seg\":%d,\"off\":\"0x%08X\","
+                "\"active\":%s,\"once\":%s}",
+                nr, tname,
+                (unsigned)bp->GetLocation(),
+                (int)bp->GetSegment(),
+                (unsigned)bp->GetOffset(),
+                bp->IsActive() ? "true" : "false",
+                bp->GetOnce()  ? "true" : "false");
+        }
+        arr += buf;
+        nr++;
+    }
+    arr += "]";
+    return arr;
+}
+
 bool DEBUG_Breakpoint(void)
 {
 	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
@@ -950,11 +1076,37 @@ bool DEBUG_Breakpoint(void)
 bool DEBUG_IntBreakpoint(uint8_t intNum)
 {
 	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+	
+	// INT 3 (0xCC) is the software breakpoint instruction - ALWAYS catch it when socket debugger is active
+	// This is standard debugger behavior - INT 3 should always trigger the debugger
+	if (intNum == 3 && DEBUG_Socket_IsActive()) {
+		CBreakpoint::DeactivateBreakpoints();
+		DEBUG_Socket_NotifyInterrupt(intNum, SegValue(cs), reg_eip);
+		// Skip past the INT 3 instruction (1 byte) so we don't re-execute it on continue
+		// This prevents DPMI hosts like CWSDPMI from catching it as a breakpoint exception
+		reg_eip++;
+		DEBUG_EnableDebugger();  // Actually stop execution!
+		return true;
+	}
+	
 	/* First get the physical address and check for a set Breakpoint */
 	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
-	if (!CBreakpoint::CheckIntBreakpoint(where,intNum,reg_ah,reg_al)) return false;
+	// Ensure breakpoints are active before checking (they might have been deactivated)
+	CBreakpoint::ActivateBreakpoints();
+	// Try with BPINT_ALL (0x100) first to match breakpoints set with default values
+	bool bp_hit = CBreakpoint::CheckIntBreakpoint(where, intNum, 0x100, 0x100);
+	if (!bp_hit) {
+		// If that didn't match, try with actual register values (for breakpoints set with specific AH/AL)
+		bp_hit = CBreakpoint::CheckIntBreakpoint(where, intNum, reg_ah, reg_al);
+	}
+	if (!bp_hit) return false;
 	// Found. Breakpoint is valid
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+	
+	// Notify socket debugger about interrupt breakpoint
+	if (DEBUG_Socket_IsActive()) {
+		DEBUG_Socket_NotifyInterrupt(intNum, SegValue(cs), reg_eip);
+	}
 	return true;
 }
 
@@ -2514,6 +2666,19 @@ bool ParseCommand(char* str) {
 			DEBUG_ShowMsg("DEBUG: Breakpoint on SYSEXIT set\n");
 		else
 			DEBUG_ShowMsg("DEBUG: Breakpoint on SYSEXIT cleared\n");
+		return true;
+	}
+
+	if (command == "DEBUGSOCKET") { // Start debug socket server
+		int port = 2159;
+		if (*found) port = (int)GetHexValue(found,found);
+		if (DEBUG_Socket_IsActive()) {
+			DEBUG_ShowMsg("DEBUG: Socket server already active on port %d\n", DEBUG_Socket_GetPort());
+		} else if (DEBUG_Socket_Init(port)) {
+			DEBUG_ShowMsg("DEBUG: Socket server started on port %d\n", port);
+		} else {
+			DEBUG_ShowMsg("DEBUG: Failed to start socket server on port %d\n", port);
+		}
 		return true;
 	}
 
@@ -4783,6 +4948,9 @@ void dyn_core_dh_debug_flush (void);
 #endif
 
 Bitu DEBUG_Loop(void) {
+    // Check for socket debug commands
+    DEBUG_Socket_CheckCommands();
+
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
@@ -4923,13 +5091,30 @@ void DEBUG_Enable_Handler(bool pressed) {
 #if defined(MACOSX) || defined(LINUX)
 	/* Mac OS X does not have a console for us to just allocate on a whim like Windows does.
 	   So the debugger interface is useless UNLESS the user has started us from a terminal
-	   (whether over SSH or from the Terminal app). */
+	   (whether over SSH or from the Terminal app).
+	   EXCEPTION: Socket debugging works without a terminal. */
     bool allow = true;
 
     if (!isatty(0) || !isatty(1) || !isatty(2))
 	    allow = false;
 
     if (!allow) {
+        // Check if socket debugging is active - if so, use socket debug loop instead
+        if (DEBUG_Socket_IsActive()) {
+            // Enter socket debug loop - this is what makes the CPU actually stop
+            CPU_CycleLeft+=CPU_Cycles;
+            CPU_Cycles=0;
+            
+            LoopHandler *ol = DOSBOX_GetLoop();
+            if (ol != DEBUG_Loop) old_loop = ol;
+            
+            debugging=true;
+            debug_running=false;
+            
+            // Switch to DEBUG_Loop which doesn't run the CPU when debug_running is false
+            DOSBOX_SetLoop(&DEBUG_Loop);
+            return;
+        }
 # if defined(MACOSX)
 	    LOG_MSG("Debugger in Mac OS X is not available unless you start DOSBox-X from a terminal or from the Terminal application");
 # else
@@ -5644,6 +5829,11 @@ extern bool debugger_break_on_exec;
 # endif
 #endif
 
+// Global flag set when bp_on_load triggers - signals dos_cmd to return early
+bool g_exec_breakpoint_pending = false;
+uint16_t g_exec_breakpoint_seg = 0;
+uint32_t g_exec_breakpoint_off = 0;
+
 void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 {
 #if !defined(OSFREE)
@@ -5652,6 +5842,13 @@ void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 		CBreakpoint::AddBreakpoint(seg,off,true);
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
         debugger_break_on_exec = false;
+        
+        // If socket debugging is active, set pending flag so dos_cmd can detect it
+        if (DEBUG_Socket_IsActive()) {
+            g_exec_breakpoint_pending = true;
+            g_exec_breakpoint_seg = seg;
+            g_exec_breakpoint_off = off;
+        }
     }
 # endif
 #endif
@@ -5759,6 +5956,17 @@ void DEBUG_Init() {
 
 	/* shutdown function */
 	AddExitFunction(AddExitFunctionFuncPair(DEBUG_ShutDown));
+
+	/* Initialize debug socket on port 2159 if environment variable is set */
+	const char* debug_port_env = getenv("DOSBOX_DEBUG_PORT");
+	if (debug_port_env) {
+		int port = atoi(debug_port_env);
+		if (port > 0 && port < 65536) {
+			if (DEBUG_Socket_Init(port)) {
+				LOG_MSG("DEBUG: Socket debug server started on port %d", port);
+			}
+		}
+	}
 }
 
 // DEBUGGING VAR STUFF
@@ -6124,7 +6332,9 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		skipFirstInstruction = false;
 		return false;
 	}
+	// Check for breakpoints
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
+		DEBUG_Socket_NotifyBreakpoint(SegValue(cs), reg_eip);
 		return true;
 	}
 	return false;

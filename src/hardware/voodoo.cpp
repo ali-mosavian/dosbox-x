@@ -109,7 +109,8 @@ public:
             emulation_type=0;
         }
 
-        Bits card_type = 1;
+        /* Voodoo2 setup triangles + PCI 0x0002 (vdemo.com); stock DOSBox-X used 1 (Voodoo1 only). */
+        Bits card_type = 2;
         bool max_voodoomem = true;
 		if (section->Get_bool("voodoo_maxmem"))
 			max_voodoomem = true;
