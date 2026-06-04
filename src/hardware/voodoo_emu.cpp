@@ -485,7 +485,6 @@ void raster_generic(UINT32 TMUS, UINT32 TEXMODE0, UINT32 TEXMODE1, void *destbas
 		if (FBZCP_CCA_INVERT_OUTPUT(v->reg[fbzColorPath].u))
 			a ^= 0xff;
 
-
 		/* pixel pipeline part 2 handles fog, alpha, and final output */
 		PIXEL_PIPELINE_MODIFY(v, dither, dither4, x,
 							v->reg[fbzMode].u, v->reg[fbzColorPath].u, v->reg[alphaMode].u, v->reg[fogMode].u,
@@ -1323,7 +1322,6 @@ void register_w(UINT32 offset, UINT32 data) {
 		return;
 	}
 
-	/* switch off the register */
 	switch (regnum)
 	{
 		/* Vertex data is 12.4 formatted fixed point */
@@ -3374,8 +3372,9 @@ static void setup_and_draw_triangle(voodoo_state *v)
 			culling_sign ^= (v->fbi.sverts - 3) & 1;
 
 		/* if our sign matches the culling sign, we're done for */
-		if (divisor_sign == culling_sign)
+		if (divisor_sign == culling_sign) {
 			return;
+		}
 	}
 
 	/* compute the dx/dy values */
