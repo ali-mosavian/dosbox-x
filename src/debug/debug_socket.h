@@ -39,6 +39,24 @@ void DEBUG_Socket_NotifyInterrupt(uint8_t intNum, uint16_t seg, uint32_t off);
 // Send a notification that execution stopped
 void DEBUG_Socket_NotifyStopped(const char* reason);
 
+// Record the most recent CPU exception so stop events can report vector/error.
+void DEBUG_Socket_RecordException(uint8_t intNum, uint32_t error);
+
+// Check socket-managed linear execution breakpoints before normal physical BPs.
+bool DEBUG_Socket_CheckLinearExecBreakpoint(uint16_t seg, uint32_t off);
+
+// Check DOSBox normal breakpoints using the socket freeze stop model.
+bool DEBUG_Socket_CheckNormalBreakpoint(uint16_t seg, uint32_t off);
+
+// Block in place inside the CPU core until the client continues. Transparent,
+// Bochs-style stop: no host-stack unwind, no loop swap, no cycle/flag changes.
+void DEBUG_Socket_FreezeWait(void);
+
+// Decrement the step-instruction arm counter; returns true when it reaches
+// zero (the pre-instruction guard should freeze and emit a "step" stop).
+// Returns false if the counter was already zero (no step pending).
+bool DEBUG_Socket_DecrStepArm(void);
+
 // Check if socket debugging is active
 bool DEBUG_Socket_IsActive(void);
 

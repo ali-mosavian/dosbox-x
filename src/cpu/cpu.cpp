@@ -907,6 +907,16 @@ enum TSwitchType {
 	TSwitch_JMP,TSwitch_CALL_INT,TSwitch_IRET
 };
 
+static const char *TaskSwitchTypeName(TSwitchType tstype)
+{
+	switch (tstype) {
+	case TSwitch_JMP:      return "jmp";
+	case TSwitch_CALL_INT: return "call/int";
+	case TSwitch_IRET:     return "iret";
+	default:               return "unknown";
+	}
+}
+
 bool CPU_SwitchTask(Bitu new_tss_selector,TSwitchType tstype,uint32_t old_eip) {
 	bool old_allow = dosbox_allow_nonrecursive_page_fault;
 
@@ -1056,8 +1066,74 @@ bool CPU_SwitchTask(Bitu new_tss_selector,TSwitchType tstype,uint32_t old_eip) {
 		/* Load the new CS*/
 		Descriptor cs_desc;
 		CPU_SetCPL(new_cs & 3);
-		if (!cpu.gdt.GetDescriptor(new_cs,cs_desc))
+		if (!cpu.gdt.GetDescriptor(new_cs,cs_desc)) {
+			LOG_MSG("Task switch CS beyond limits: type=%s new_tss=%04X old_tss=%04X old_eip=%08X cur=%04X:%08X",
+			        TaskSwitchTypeName(tstype),
+			        (unsigned int)new_tss_selector,
+			        (unsigned int)cpu_tss.selector,
+			        (unsigned int)old_eip,
+			        (unsigned int)SegValue(cs),
+			        (unsigned int)reg_eip);
+			LOG_MSG("Task switch new TSS desc: sel=%04X base=%08X limit=%08lX is386=%lu type=%02X busy=%lu raw=%08X:%08X",
+			        (unsigned int)new_tss.selector,
+			        (unsigned int)new_tss.base,
+			        (unsigned long)new_tss.limit,
+			        (unsigned long)new_tss.is386,
+			        (unsigned int)new_tss.desc.Type(),
+			        (unsigned long)new_tss.desc.IsBusy(),
+			        (unsigned int)new_tss.desc.saved.fill[1],
+			        (unsigned int)new_tss.desc.saved.fill[0]);
+			LOG_MSG("Task switch current TSS desc: sel=%04X base=%08X limit=%08lX is386=%lu type=%02X busy=%lu raw=%08X:%08X",
+			        (unsigned int)cpu_tss.selector,
+			        (unsigned int)cpu_tss.base,
+			        (unsigned long)cpu_tss.limit,
+			        (unsigned long)cpu_tss.is386,
+			        (unsigned int)cpu_tss.desc.Type(),
+			        (unsigned long)cpu_tss.desc.IsBusy(),
+			        (unsigned int)cpu_tss.desc.saved.fill[1],
+			        (unsigned int)cpu_tss.desc.saved.fill[0]);
+			if (new_tss.is386) {
+				LOG_MSG("Task switch new TSS ring stacks: back=%04X esp0=%08X ss0=%04X esp1=%08X ss1=%04X esp2=%08X ss2=%04X ldt=%04X",
+				        (unsigned int)mem_readw(new_tss.base + offsetof(TSS_32,back)),
+				        (unsigned int)mem_readd(new_tss.base + offsetof(TSS_32,esp0)),
+				        (unsigned int)mem_readw(new_tss.base + offsetof(TSS_32,ss0)),
+				        (unsigned int)mem_readd(new_tss.base + offsetof(TSS_32,esp1)),
+				        (unsigned int)mem_readw(new_tss.base + offsetof(TSS_32,ss1)),
+				        (unsigned int)mem_readd(new_tss.base + offsetof(TSS_32,esp2)),
+				        (unsigned int)mem_readw(new_tss.base + offsetof(TSS_32,ss2)),
+				        (unsigned int)new_ldt);
+				LOG_MSG("Task switch new TSS regs: eip=%08X eflags=%08lX cr3=%08lX eax=%08X ebx=%08X ecx=%08X edx=%08X",
+				        (unsigned int)new_eip,
+				        (unsigned long)new_eflags,
+				        (unsigned long)new_cr3,
+				        (unsigned int)new_eax,
+				        (unsigned int)new_ebx,
+				        (unsigned int)new_ecx,
+				        (unsigned int)new_edx);
+				LOG_MSG("Task switch new TSS regs2: esp=%08X ebp=%08X esi=%08X edi=%08X cs=%04X ss=%04X ds=%04X es=%04X fs=%04X gs=%04X",
+				        (unsigned int)new_esp,
+				        (unsigned int)new_ebp,
+				        (unsigned int)new_esi,
+				        (unsigned int)new_edi,
+				        (unsigned int)new_cs,
+				        (unsigned int)new_ss,
+				        (unsigned int)new_ds,
+				        (unsigned int)new_es,
+				        (unsigned int)new_fs,
+				        (unsigned int)new_gs);
+			}
+			LOG_MSG("Task switch current CPU: flags=%08X cr0=%08X cr2=%08X cr3=%08X cr4=%08X cpl=%lu mpl=%lu pmode=%d paging=%d",
+			        (unsigned int)reg_flags,
+			        (unsigned int)CPU_GET_CRX(0),
+			        (unsigned int)CPU_GET_CRX(2),
+			        (unsigned int)CPU_GET_CRX(3),
+			        (unsigned int)CPU_GET_CRX(4),
+			        (unsigned long)cpu.cpl,
+			        (unsigned long)cpu.mpl,
+			        cpu.pmode ? 1 : 0,
+			        paging.enabled ? 1 : 0);
 			E_Exit("Task switch with CS beyond limits");
+		}
 		if (!cs_desc.saved.seg.p)
 			E_Exit("Task switch with non present code-segment");
 		switch (cs_desc.Type()) {
@@ -1162,10 +1238,12 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	extern bool DEBUG_IntBreakpoint(uint8_t intNum);
 	extern Bitu DEBUG_EnableDebugger(void);
 	extern void DEBUG_Socket_NotifyBreakpoint(uint16_t seg, uint32_t off);
+	extern void DEBUG_Socket_RecordException(uint8_t intNum, uint32_t error);
 	// Temporarily disable inhibit_int_breakpoint to allow exception breakpoints
 	extern bool inhibit_int_breakpoint;
 	bool old_inhibit = inhibit_int_breakpoint;
 	inhibit_int_breakpoint = false;
+	DEBUG_Socket_RecordException((uint8_t)which, (uint32_t)error);
 	LOG_MSG("CPU_Exception: Checking interrupt breakpoint for exception %d (inhibit=%d)", (int)which, old_inhibit ? 1 : 0);
 	bool bp_hit = DEBUG_IntBreakpoint((uint8_t)which);
 	inhibit_int_breakpoint = old_inhibit;
@@ -1224,18 +1302,6 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	LOG_MSG("CPU_Exception: Calling CPU_Interrupt for exception %d", (int)which);
 	CPU_Interrupt(which,CPU_INT_EXCEPTION | ((which>=8) ? CPU_INT_HAS_ERROR : 0),reg_eip);
 	LOG_MSG("CPU_Exception: Returned from CPU_Interrupt for exception %d", (int)which);
-
-#if C_DEBUG
-# if C_HEAVY_DEBUG
-	// Check if debugger wants to stop (interrupt breakpoint was hit)
-	extern bool exitLoop;
-	if (exitLoop) {
-		LOG_MSG("CPU_Exception: exitLoop=true, stopping exception handling for exception %d", (int)which);
-		// Don't continue exception handling - stop here
-		return;
-	}
-# endif
-#endif
 
 	/* allow recursive page faults. required for multitasking OSes like Windows 95.
 	 * we set this AFTER CPU_Interrupt so that if CPU_Interrupt faults while starting
@@ -1847,6 +1913,7 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 		return;
 	}
 }
+
 
 
 void CPU_JMP(bool use32,Bitu selector,Bitu offset,uint32_t oldeip) {

@@ -172,6 +172,32 @@ Bits CPU_Core_Normal_Run(void) {
 		BaseSS=SegBase(ss);
 		core.base_val_ds=ds;
 #if C_DEBUG
+		extern bool DEBUG_Socket_DecrStepArm(void);
+		extern void DEBUG_Socket_NotifyStopped(const char* reason);
+		extern bool DEBUG_Socket_CheckLinearExecBreakpoint(uint16_t seg, uint32_t off);
+		extern bool DEBUG_Socket_CheckNormalBreakpoint(uint16_t seg, uint32_t off);
+		extern void DEBUG_Socket_FreezeWait(void);
+		// Step-arm: decrements each iteration; re-freezes when it reaches zero
+		// (exactly one instruction has been executed since the step was issued).
+		if (DEBUG_Socket_DecrStepArm()) {
+			FillFlags();
+			DEBUG_Socket_NotifyStopped("step");
+			DEBUG_Socket_FreezeWait();
+			continue;
+		}
+		if (DEBUG_Socket_CheckLinearExecBreakpoint(SegValue(cs), reg_eip)) {
+			FillFlags();
+			// In-place stop: block here until the client continues, then resume
+			// this same instruction transparently. suppress_current (set by the
+			// check) prevents an immediate re-hit on the next loop iteration.
+			DEBUG_Socket_FreezeWait();
+			continue;
+		}
+		if (DEBUG_Socket_CheckNormalBreakpoint(SegValue(cs), reg_eip)) {
+			FillFlags();
+			DEBUG_Socket_FreezeWait();
+			continue;
+		}
 #if C_HEAVY_DEBUG
 		if (DEBUG_HeavyIsBreakpoint()) {
 			FillFlags();

@@ -25,6 +25,7 @@ void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off);
 bool DEBUG_ExitLoop(void);
 void DEBUG_RefreshPage(char scroll);
 Bitu DEBUG_EnableDebugger(void);
+void DEBUG_ResumeNormalFromSocket(void);
 
 extern Bitu cycle_count;
 extern Bitu debugCallback;

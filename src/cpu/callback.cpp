@@ -227,28 +227,14 @@ void CALLBACK_RunRealInt_retcsip(uint8_t intnum,Bitu &rcs,Bitu &rip) {
 	SegSet16(cs,oldcs);
 }
 
-// Forward declaration for debugger state check
-#if C_DEBUG
-extern bool IsDebuggerActive(void);
-#endif
-
 void CALLBACK_RunRealInt(uint8_t intnum) {
 	uint32_t oldeip=reg_eip;
 	uint16_t oldcs=SegValue(cs);
 	reg_eip=CB_SOFFSET+(CB_MAX*CB_SIZE)+(intnum*6U);
 	SegSet16(cs,CB_SEG);
 	DOSBOX_RunMachine();
-#if C_DEBUG
-	// Don't restore CS:EIP if debugger is active - we may have stopped at a breakpoint
-	// and want to preserve the current CPU state
-	if (!IsDebuggerActive()) {
-		reg_eip=oldeip;
-		SegSet16(cs,oldcs);
-	}
-#else
 	reg_eip=oldeip;
 	SegSet16(cs,oldcs);
-#endif
 }
 
 namespace {

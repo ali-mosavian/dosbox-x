@@ -1521,6 +1521,14 @@ void CPU_Exception_Level_Reset();
 extern bool custom_bios;
 extern bool PC98_SHUT0,PC98_SHUT1;
 
+/* Set by the shutdown path before DOS/XMS/EMS teardown routines run.
+ * On_Software_CPU_Reset skips the throw when this is true: a triple fault
+ * during host-side shutdown is non-fatal and must not propagate as a C++
+ * exception (no run-loop catch exists at that point). */
+static bool dosbox_in_shutdown = false;
+void DOSBox_SetShutdownFlag() { dosbox_in_shutdown = true; }
+bool DOSBox_InShutdown() { return dosbox_in_shutdown; }
+
 void On_Software_CPU_Reset() {
     unsigned char c;
 
@@ -1591,6 +1599,7 @@ void On_Software_CPU_Reset() {
             LOG_MSG("PC-98 reset and continue: RETF to %04x:%04x",SegValue(cs),reg_ip);
 
             /* force execution change (FIXME: Is there a better way to do this?) */
+            if (dosbox_in_shutdown) { LOG_MSG("CPU RESET: clean exit during DOSBox shutdown"); exit(0); }
             if (CPU_DynamicCoreCannotUseCPPExceptions())
                 CPU_SetResetSignal(4);
             else
@@ -1614,6 +1623,15 @@ void On_Software_CPU_Reset() {
         }
     }
 
+    if (dosbox_in_shutdown) {
+        /* A triple fault during the DOS kernel teardown path means DPMI paging
+         * is still active and one of the cleanup routines touched an unmapped
+         * page.  The teardown is already past the point of no return, so the
+         * safest action is a clean process exit rather than throw (no catch) or
+         * silent return (breaks pf_queue, causing PF queue overrun). */
+        LOG_MSG("CPU RESET: clean exit during DOSBox shutdown (triple fault in teardown)");
+        exit(0);
+    }
     if (CPU_DynamicCoreCannotUseCPPExceptions())
         CPU_SetResetSignal(3);
     else

@@ -761,6 +761,7 @@ void DOS_GetMemory_unmap();
 void VFILE_Shutdown(void);
 void PROGRAMS_Shutdown(void);
 void DOS_UninstallMisc(void);
+void DOSBox_SetShutdownFlag(void);
 void CALLBACK_Shutdown(void);
 void DOS_ShutdownDrives();
 void VFILE_Shutdown(void);
@@ -7874,6 +7875,11 @@ bool VM_Boot_DOSBox_Kernel() {
         RemoveEMSPageFrame();
         RemoveUMBBlock();
 #endif
+        /* Signal shutdown: On_Software_CPU_Reset will not throw from this point on.
+         * DPMI paging left active after CWSDPMI exit makes RealSetVec and XMS/EMS
+         * teardown trigger triple page faults → CPU reset throws with no run-loop
+         * catch available.  Suppressing the throw is safe — we're tearing down. */
+        DOSBox_SetShutdownFlag();
         DisableINT33();
         DOS_GetMemory_unmap();
         VFILE_Shutdown();
@@ -10198,7 +10204,19 @@ fresh_boot:
 
                 LOG_MSG("Starting debugger.");
                 DEBUG_EnableDebugger();
-                DEBUG_WaitNoExecute();
+                // DEBUG_WaitNoExecute calls DOSBOX_RunMachine internally, which can
+                // throw integer or class exceptions (reset/shutdown signals).  Those
+                // must be caught here; otherwise std::terminate is called and the
+                // process crashes with SIGABRT.
+                try {
+                    DEBUG_WaitNoExecute();
+                } catch (int) {
+                    // Emulation threw a machine-level signal during debug wait;
+                    // fall through to the normal shutdown path below.
+                } catch (...) {
+                    // Catch anything else (e.g. Reset, ExitException) so we exit
+                    // cleanly rather than crashing.
+                }
 #endif
             }
 
@@ -10249,6 +10267,7 @@ fresh_boot:
             dos.loaded_codepage = cpbak;
 
             /* remove environment variables for some components */
+            DOSBox_SetShutdownFlag();
             DOS_UninstallMisc();
             SBLASTER_DOS_Shutdown();
             GUS_DOS_Shutdown();

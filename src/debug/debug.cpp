@@ -805,34 +805,23 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue, uint16_t alValue)
 // Checks if interrupt breakpoint is valid and should stop execution
 {
-	if (BPoints.empty()) {
-		LOG_MSG("CheckIntBreakpoint: BPoints is empty for int %d", intNr);
-		return false;
-	}
+	if (BPoints.empty()) return false;
 
     // unused
     (void)adr;
 
 	// Search matching breakpoint
 	std::list<CBreakpoint*>::iterator i;
-	int interrupt_bp_count = 0;
 	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
 		CBreakpoint* bp = (*i);
 		if (bp->GetType()==BKPNT_INTERRUPT) {
-			interrupt_bp_count++;
-			LOG_MSG("CheckIntBreakpoint: Interrupt BP found: intNr=%d (looking for %d), active=%d", 
-				bp->GetIntNr(), intNr, bp->IsActive() ? 1 : 0);
 			if (bp->IsActive() && bp->GetIntNr()==intNr) {
 				uint16_t bp_ah = bp->GetValue();
 				uint16_t bp_al = bp->GetOther();
 				bool ah_match = ((bp_ah==BPINT_ALL) || (bp_ah==ahValue));
 				bool al_match = ((bp_al==BPINT_ALL) || (bp_al==alValue));
-				LOG_MSG("CheckIntBreakpoint: Found interrupt BP for %d: stored AH=%04X AL=%04X (BPINT_ALL=0x%04X), checking with AH=%04X AL=%04X, match=%d/%d", 
-					intNr, bp_ah, bp_al, BPINT_ALL, ahValue, alValue, ah_match ? 1 : 0, al_match ? 1 : 0);
 				if (ah_match && al_match) {
-					// Found
 					if (bp->GetOnce()) {
-						// delete it, if it should only be used once
 						(BPoints.erase)(i);
 						bp->Activate(false);
 						delete bp;
@@ -841,10 +830,6 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 				}
 			}
 		}
-	}
-	if (interrupt_bp_count > 0) {
-		LOG_MSG("CheckIntBreakpoint: Found %d interrupt BPs, but none matched int %d with AH=%04X AL=%04X", 
-			interrupt_bp_count, intNr, ahValue, alValue);
 	}
 	return false;
 }
@@ -1065,6 +1050,10 @@ std::string CBreakpoint::ToJSON(void)
 bool DEBUG_Breakpoint(void)
 {
 	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+	if (DEBUG_Socket_CheckLinearExecBreakpoint(SegValue(cs), reg_eip)) {
+		CBreakpoint::DeactivateBreakpoints();
+		return true;
+	}
 	/* First get the physical address and check for a set Breakpoint */
 	if (!CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) return false;
 	// Found. Breakpoint is valid
@@ -1073,22 +1062,31 @@ bool DEBUG_Breakpoint(void)
 	return true;
 }
 
+bool DEBUG_Socket_CheckNormalBreakpoint(uint16_t seg, uint32_t off)
+{
+	if (!DEBUG_Socket_IsActive()) return false;
+	if (!CBreakpoint::CheckBreakpoint(seg, off)) return false;
+
+	CBreakpoint::DeactivateBreakpoints();
+	DEBUG_Socket_NotifyBreakpoint(seg, off);
+	return true;
+}
+
 bool DEBUG_IntBreakpoint(uint8_t intNum)
 {
 	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
-	
-	// INT 3 (0xCC) is the software breakpoint instruction - ALWAYS catch it when socket debugger is active
-	// This is standard debugger behavior - INT 3 should always trigger the debugger
+
+	// INT 3 (0xCC) is the software breakpoint instruction.
 	if (intNum == 3 && DEBUG_Socket_IsActive()) {
 		CBreakpoint::DeactivateBreakpoints();
-		DEBUG_Socket_NotifyInterrupt(intNum, SegValue(cs), reg_eip);
-		// Skip past the INT 3 instruction (1 byte) so we don't re-execute it on continue
-		// This prevents DPMI hosts like CWSDPMI from catching it as a breakpoint exception
+		// Skip past the 1-byte INT3 so the CPU re-executes cleanly on continue,
+		// then block in-place with the freeze model (transparent resume).
 		reg_eip++;
-		DEBUG_EnableDebugger();  // Actually stop execution!
-		return true;
+		DEBUG_Socket_NotifyInterrupt(intNum, SegValue(cs), reg_eip);
+		DEBUG_Socket_FreezeWait();
+		return false;  // Don't enter the legacy debug loop; INT was already handled.
 	}
-	
+
 	/* First get the physical address and check for a set Breakpoint */
 	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	// Ensure breakpoints are active before checking (they might have been deactivated)
@@ -1101,12 +1099,17 @@ bool DEBUG_IntBreakpoint(uint8_t intNum)
 	}
 	if (!bp_hit) return false;
 	// Found. Breakpoint is valid
-	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
-	
-	// Notify socket debugger about interrupt breakpoint
+	CBreakpoint::DeactivateBreakpoints();
+
 	if (DEBUG_Socket_IsActive()) {
+		// Freeze-model: block in place; the INT has not yet dispatched so
+		// continuing will re-execute the INT instruction transparently.
 		DEBUG_Socket_NotifyInterrupt(intNum, SegValue(cs), reg_eip);
+		DEBUG_Socket_FreezeWait();
+		return false;  // Don't enter the legacy debug loop.
 	}
+
+	// Non-socket path (GUI/terminal debugger): keep the original behaviour.
 	return true;
 }
 
@@ -1288,6 +1291,28 @@ void DrawRegistersUpdateOld(void) {
 	oldflags = reg_flags;
 
 	oldcpucpl=cpu.cpl;
+}
+
+void DEBUG_ResumeNormalFromSocket(void)
+{
+	DrawRegistersUpdateOld();
+	exitLoop = false;
+	debug_running = false;
+	debugging = false;
+	DrawCode();
+	DrawInput();
+	logBuffSuppressConsole = false;
+	if (logBuffSuppressConsoleNeedUpdate) {
+		logBuffSuppressConsoleNeedUpdate = false;
+		DEBUG_RefreshPage(0);
+	}
+
+	CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs) + reg_eip);
+	mainMenu.get_item("debugger_rundebug").check(false).refresh_item(mainMenu);
+	mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
+	mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
+	DOSBOX_SetNormalLoop();
+	GFX_SetTitle(-1, -1, -1, is_paused);
 }
 
 extern bool do_pse;
@@ -4968,7 +4993,9 @@ Bitu DEBUG_Loop(void) {
         // Interrupt started ? - then skip it
         uint16_t oldCS	= SegValue(cs);
         uint32_t oldEIP	= reg_eip;
-        PIC_runIRQs();
+        if (!DEBUG_Socket_IsActive()) {
+            PIC_runIRQs();
+        }
         SDL_Delay(1);
 
 #if (C_DYNAMIC_X86)
@@ -6333,6 +6360,9 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		return false;
 	}
 	// Check for breakpoints
+	if (DEBUG_Socket_CheckLinearExecBreakpoint(SegValue(cs), reg_eip)) {
+		return true;
+	}
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
 		DEBUG_Socket_NotifyBreakpoint(SegValue(cs), reg_eip);
 		return true;

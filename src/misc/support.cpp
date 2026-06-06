@@ -23,12 +23,20 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <algorithm>
 #include <cctype>
 #include <string>
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <execinfo.h>
+#endif
   
 #include "dosbox.h"
+#include "cpu.h"
+#include "paging.h"
 #include "debug.h"
 #include "logging.h"
 #include "dos_inc.h"
@@ -485,6 +493,251 @@ void DOSBox_ConsolePauseWait();
 #endif
 bool sdl_wait_on_error();
 
+static void WriteCrashSegment(FILE *f, const char *name, const SegNames seg)
+{
+	fprintf(f, "%-2s sel=%04X base=%08X limit=%08X expanddown=%d\n",
+	        name,
+	        (unsigned int)SegValue(seg),
+	        (unsigned int)SegPhys(seg),
+	        (unsigned int)SegLimit(seg),
+	        Segs.expanddown[seg] ? 1 : 0);
+}
+
+static void WriteCrashStack(FILE *f)
+{
+	const LinearPt stack_linear = (LinearPt)(SegPhys(ss) + reg_esp);
+
+	fprintf(f, "\nGuest stack near SS:ESP (linear %08X):\n", (unsigned int)stack_linear);
+	for (unsigned int row = 0; row < 8; row++) {
+		const LinearPt line = stack_linear + (row * 16);
+		fprintf(f, "%08X  ", (unsigned int)line);
+		for (unsigned int i = 0; i < 16; i++) {
+			uint8_t value = 0;
+			if (mem_readb_checked(line + i, &value))
+				fprintf(f, "?? ");
+			else
+				fprintf(f, "%02X ", (unsigned int)value);
+		}
+		fprintf(f, "\n");
+	}
+}
+
+static void WriteHostBacktrace(FILE *f)
+{
+#if defined(__APPLE__) || defined(__linux__)
+	fprintf(f, "\nHost stack trace:\n");
+	void *frames[64];
+	const int count = backtrace(frames, 64);
+	char **symbols = backtrace_symbols(frames, count);
+	if (symbols != nullptr) {
+		for (int i = 0; i < count; i++) {
+			fprintf(f, "%02d  %s\n", i, symbols[i]);
+		}
+		free(symbols);
+	} else {
+		fprintf(f, "(backtrace_symbols failed)\n");
+	}
+#else
+	fprintf(f, "\nHost stack trace unavailable on this platform.\n");
+#endif
+}
+
+static void WriteHostRegisters(FILE *f)
+{
+	fprintf(f, "\nHost registers:\n");
+#if defined(__aarch64__)
+	uint64_t regs[31] = {};
+	uint64_t sp = 0;
+	uint64_t fp = 0;
+	uint64_t lr = 0;
+
+#define READ_ARM64_REG(index) __asm__ volatile("mov %0, x" #index : "=r"(regs[index]))
+	READ_ARM64_REG(0);
+	READ_ARM64_REG(1);
+	READ_ARM64_REG(2);
+	READ_ARM64_REG(3);
+	READ_ARM64_REG(4);
+	READ_ARM64_REG(5);
+	READ_ARM64_REG(6);
+	READ_ARM64_REG(7);
+	READ_ARM64_REG(8);
+	READ_ARM64_REG(9);
+	READ_ARM64_REG(10);
+	READ_ARM64_REG(11);
+	READ_ARM64_REG(12);
+	READ_ARM64_REG(13);
+	READ_ARM64_REG(14);
+	READ_ARM64_REG(15);
+	READ_ARM64_REG(16);
+	READ_ARM64_REG(17);
+	READ_ARM64_REG(18);
+	READ_ARM64_REG(19);
+	READ_ARM64_REG(20);
+	READ_ARM64_REG(21);
+	READ_ARM64_REG(22);
+	READ_ARM64_REG(23);
+	READ_ARM64_REG(24);
+	READ_ARM64_REG(25);
+	READ_ARM64_REG(26);
+	READ_ARM64_REG(27);
+	READ_ARM64_REG(28);
+	READ_ARM64_REG(29);
+	READ_ARM64_REG(30);
+#undef READ_ARM64_REG
+	__asm__ volatile("mov %0, sp" : "=r"(sp));
+	__asm__ volatile("mov %0, x29" : "=r"(fp));
+	__asm__ volatile("mov %0, x30" : "=r"(lr));
+
+	for (unsigned int i = 0; i < 31; i += 2) {
+		if (i + 1 < 31) {
+			fprintf(f, "x%-2u=%016llX x%-2u=%016llX\n",
+			        i,
+			        (unsigned long long)regs[i],
+			        i + 1,
+			        (unsigned long long)regs[i + 1]);
+		} else {
+			fprintf(f, "x%-2u=%016llX\n", i, (unsigned long long)regs[i]);
+		}
+	}
+	fprintf(f, "sp =%016llX fp =%016llX lr =%016llX return=%p\n",
+	        (unsigned long long)sp,
+	        (unsigned long long)fp,
+	        (unsigned long long)lr,
+	        __builtin_return_address(0));
+#elif defined(__x86_64__)
+	uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0;
+	uint64_t rsi = 0, rdi = 0, rbp = 0, rsp = 0;
+	uint64_t r8 = 0, r9 = 0, r10 = 0, r11 = 0;
+	uint64_t r12 = 0, r13 = 0, r14 = 0, r15 = 0;
+	uint64_t flags = 0;
+	__asm__ volatile("mov %%rax, %0" : "=r"(rax));
+	__asm__ volatile("mov %%rbx, %0" : "=r"(rbx));
+	__asm__ volatile("mov %%rcx, %0" : "=r"(rcx));
+	__asm__ volatile("mov %%rdx, %0" : "=r"(rdx));
+	__asm__ volatile("mov %%rsi, %0" : "=r"(rsi));
+	__asm__ volatile("mov %%rdi, %0" : "=r"(rdi));
+	__asm__ volatile("mov %%rbp, %0" : "=r"(rbp));
+	__asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+	__asm__ volatile("mov %%r8, %0" : "=r"(r8));
+	__asm__ volatile("mov %%r9, %0" : "=r"(r9));
+	__asm__ volatile("mov %%r10, %0" : "=r"(r10));
+	__asm__ volatile("mov %%r11, %0" : "=r"(r11));
+	__asm__ volatile("mov %%r12, %0" : "=r"(r12));
+	__asm__ volatile("mov %%r13, %0" : "=r"(r13));
+	__asm__ volatile("mov %%r14, %0" : "=r"(r14));
+	__asm__ volatile("mov %%r15, %0" : "=r"(r15));
+	__asm__ volatile("pushfq; popq %0" : "=r"(flags));
+	fprintf(f, "RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
+	        (unsigned long long)rax,
+	        (unsigned long long)rbx,
+	        (unsigned long long)rcx,
+	        (unsigned long long)rdx);
+	fprintf(f, "RSI=%016llX RDI=%016llX RBP=%016llX RSP=%016llX\n",
+	        (unsigned long long)rsi,
+	        (unsigned long long)rdi,
+	        (unsigned long long)rbp,
+	        (unsigned long long)rsp);
+	fprintf(f, "R8 =%016llX R9 =%016llX R10=%016llX R11=%016llX\n",
+	        (unsigned long long)r8,
+	        (unsigned long long)r9,
+	        (unsigned long long)r10,
+	        (unsigned long long)r11);
+	fprintf(f, "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n",
+	        (unsigned long long)r12,
+	        (unsigned long long)r13,
+	        (unsigned long long)r14,
+	        (unsigned long long)r15);
+	fprintf(f, "RFLAGS=%016llX return=%p\n",
+	        (unsigned long long)flags,
+	        __builtin_return_address(0));
+#else
+	fprintf(f, "Unavailable for this host architecture.\n");
+#endif
+	fprintf(f, "note: captured inside E_Exit crash-report generation, not from a host signal context.\n");
+}
+
+static void WriteCrashReport(const char *message)
+{
+	char path[256];
+	time_t now = time(nullptr);
+	snprintf(path, sizeof(path), "build/dosbox-crash-%ld.log", (long)now);
+
+	FILE *f = fopen(path, "w");
+	if (f == nullptr) {
+		f = fopen("dosbox-crash.log", "w");
+	}
+	if (f == nullptr) return;
+
+	fprintf(f, "DOSBox-X crash report\n");
+	fprintf(f, "timestamp_unix: %ld\n", (long)now);
+	fprintf(f, "fatal: %s\n", message != nullptr ? message : "(null)");
+
+	fprintf(f, "\n[guest]\n");
+	fprintf(f, "mode: pmode=%d vm86=%d cpl=%lu mpl=%lu paging=%d wp=%d code_big=%d stack_big=%d\n",
+	        cpu.pmode ? 1 : 0,
+	        GETFLAG(VM) ? 1 : 0,
+	        (unsigned long)cpu.cpl,
+	        (unsigned long)cpu.mpl,
+	        paging.enabled ? 1 : 0,
+	        paging.wp ? 1 : 0,
+	        cpu.code.big ? 1 : 0,
+	        cpu.stack.big ? 1 : 0);
+	fprintf(f, "control: CR0=%08X CR2=%08X CR3=%08X CR4=%08X\n",
+	        (unsigned int)CPU_GET_CRX(0),
+	        (unsigned int)CPU_GET_CRX(2),
+	        (unsigned int)CPU_GET_CRX(3),
+	        (unsigned int)CPU_GET_CRX(4));
+	fprintf(f, "tables: GDTR base=%08X limit=%08lX IDTR base=%08X limit=%08lX LDTR=%04lX TR=%04lX\n",
+	        (unsigned int)CPU_SGDT_base(),
+	        (unsigned long)CPU_SGDT_limit(),
+	        (unsigned int)CPU_SIDT_base(),
+	        (unsigned long)CPU_SIDT_limit(),
+	        (unsigned long)CPU_SLDT(),
+	        (unsigned long)CPU_STR());
+
+	fprintf(f, "\nGuest registers:\n");
+	fprintf(f, "EAX=%08X EBX=%08X ECX=%08X EDX=%08X\n",
+	        (unsigned int)reg_eax,
+	        (unsigned int)reg_ebx,
+	        (unsigned int)reg_ecx,
+	        (unsigned int)reg_edx);
+	fprintf(f, "ESI=%08X EDI=%08X EBP=%08X ESP=%08X\n",
+	        (unsigned int)reg_esi,
+	        (unsigned int)reg_edi,
+	        (unsigned int)reg_ebp,
+	        (unsigned int)reg_esp);
+	fprintf(f, "CS=%04X DS=%04X ES=%04X SS=%04X FS=%04X GS=%04X EIP=%08X FLAGS=%08X\n",
+	        (unsigned int)SegValue(cs),
+	        (unsigned int)SegValue(ds),
+	        (unsigned int)SegValue(es),
+	        (unsigned int)SegValue(ss),
+	        (unsigned int)SegValue(fs),
+	        (unsigned int)SegValue(gs),
+	        (unsigned int)reg_eip,
+	        (unsigned int)reg_flags);
+
+	fprintf(f, "\nGuest segment caches:\n");
+	WriteCrashSegment(f, "CS", cs);
+	WriteCrashSegment(f, "DS", ds);
+	WriteCrashSegment(f, "ES", es);
+	WriteCrashSegment(f, "SS", ss);
+	WriteCrashSegment(f, "FS", fs);
+	WriteCrashSegment(f, "GS", gs);
+	WriteCrashStack(f);
+
+	fprintf(f, "\n[host]\n");
+	fprintf(f, "core=%s cycles=%lld cycle_left=%lld cycle_max=%lld\n",
+	        core_mode,
+	        (long long)CPU_Cycles,
+	        (long long)CPU_CycleLeft,
+	        (long long)CPU_CycleMax);
+	WriteHostRegisters(f);
+	WriteHostBacktrace(f);
+
+	fclose(f);
+	LOG_MSG("Crash report written to %s", path);
+}
+
 static char buf[1024];           //greater scope as else it doesn't always gets thrown right (linux/gcc2.95)
 void E_Exit(const char * format,...) {
 #if C_DEBUG && C_HEAVY_DEBUG
@@ -497,6 +750,7 @@ void E_Exit(const char * format,...) {
 	buf[sizeof(buf) - 1] = '\0';
 	strcat(buf,"\n");
 	LOG_MSG("E_Exit: %s\n",buf);
+	WriteCrashReport(buf);
 #if defined(WIN32)
 	/* Most Windows users DON'T run DOSBox-X from the command line! */
 	MessageBox(GetHWND(), buf, "E_Exit", MB_OK | MB_ICONEXCLAMATION);

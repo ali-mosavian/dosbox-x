@@ -72,12 +72,24 @@ public:
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "keyboard.h"
 #include <errno.h>
 #include <string.h>
 #include <string>
 #include <sstream>
 #include <vector>
 #include <cstdio>
+
+struct LinearExecBreakpoint {
+    uint32_t linear = 0;
+    bool once = false;
+    bool active = true;
+    bool suppress_current = false;
+    bool has_match_seg = false;
+    uint16_t match_seg = 0;
+    bool has_match_off = false;
+    uint32_t match_off = 0;
+};
 
 // External declarations from debug.cpp
 extern bool exitLoop;
@@ -86,6 +98,27 @@ extern bool mustCompleteInstruction;
 extern bool inhibit_int_breakpoint;
 extern int32_t DEBUG_Run(int32_t amount, bool quickexit);
 extern uint64_t GetAddress(uint16_t seg, uint32_t offset);
+
+// Host event pump (defined in the SDL frontend)
+void GFX_Events(void);
+
+// In-place "frozen" stop state.
+//
+// Unlike the GUI/terminal debugger, a socket stop must NOT unwind the host C++
+// stack: doing so corrupts re-entrant DOSBOX_RunMachine() invocations and the
+// PM/DPMI task state that CWSDPMI relies on. Instead, when a socket breakpoint
+// matches, we block in place inside the CPU core (DEBUG_Socket_FreezeWait),
+// servicing only socket commands + host events, never running the CPU and never
+// touching the loop handler / cycle counters / flags. "continue" clears this
+// flag and the original CPU-core invocation resumes from the exact same
+// instruction boundary -- a transparent, Bochs-style stop/resume.
+static volatile bool socket_freeze_wait = false;
+
+// Single-step countdown. Set to 2 by the "step" command; the pre-instruction
+// guard in CPU_Core_Normal_Run decrements it each pass. When it reaches 1 the
+// current instruction executes normally; when it reaches 0 the guard emits a
+// "step" stopped event and calls FreezeWait — so exactly one instruction runs.
+static volatile int socket_step_arm = 0;
 
 // Forward declarations
 bool ParseCommand(char* str);
@@ -98,6 +131,11 @@ static int client_socket = -1;
 static int socket_port = 0;
 static std::string recv_buffer;
 static bool gdb_mode = false;  // true = GDB RSP, false = JSON
+static uint8_t last_exception_num = 0xFF;
+static uint32_t last_exception_error = 0;
+static std::vector<LinearExecBreakpoint> linear_exec_breakpoints;
+static std::string last_stop_event_json;
+static std::string current_response_id_json;
 
 // Simple JSON helpers (no external dependencies)
 static std::string json_escape(const std::string& s) {
@@ -174,6 +212,32 @@ static bool json_get_int(const std::string& json, const char* key, long long& ou
     return true;
 }
 
+static bool json_get_id_field(const std::string& json, std::string& out) {
+    std::string search = "\"id\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos += search.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos >= json.length()) return false;
+
+    if (json[pos] == '"') {
+        pos++;
+        size_t end = json.find("\"", pos);
+        if (end == std::string::npos) return false;
+        out = json_str("id", json.substr(pos, end - pos));
+        return true;
+    }
+
+    size_t end = pos;
+    while (end < json.length() && json[end] != ',' && json[end] != '}' &&
+           json[end] != ' ' && json[end] != '\t' && json[end] != '\r' && json[end] != '\n') {
+        end++;
+    }
+    if (end == pos) return false;
+    out = "\"id\":" + json.substr(pos, end - pos);
+    return true;
+}
+
 // GDB RSP checksum calculation
 static uint8_t gdb_checksum(const std::string& data) {
     uint8_t sum = 0;
@@ -208,7 +272,11 @@ static void send_response(const std::string& json) {
         // But if it is, send as GDB packet
         send_gdb_packet(json);
     } else {
-        std::string msg = json + "\n";
+        std::string out = json;
+        if (!current_response_id_json.empty() && out.size() > 1 && out[0] == '{') {
+            out.insert(1, current_response_id_json + ",");
+        }
+        std::string msg = out + "\n";
         send(client_socket, msg.c_str(), msg.length(), 0);
     }
 }
@@ -224,6 +292,11 @@ static void send_ok(const std::string& extra = "") {
     if (!extra.empty()) resp += "," + extra;
     resp += "}";
     send_response(resp);
+}
+
+static void send_and_latch_stop(const std::string& json) {
+    last_stop_event_json = json;
+    send_response(json);
 }
 
 // Get all registers as JSON
@@ -274,6 +347,159 @@ static bool LinearToPhysical(uint32_t linear, uint32_t& physical) {
     return true;
 }
 
+static std::string selector_descriptor_json(const char* key, uint16_t sel) {
+    Descriptor desc;
+    if (!cpu.gdt.GetDescriptor((Bitu)sel, desc)) {
+        return "\"" + std::string(key) + "\":{" +
+               json_hex("sel", sel) + "," +
+               json_bool("valid", false) + "}";
+    }
+
+    uint8_t type_byte = desc.saved.seg.type;
+    bool is_system = !(type_byte & 0x10);
+    bool is_code = !is_system && (type_byte & 0x08);
+    const char* seg_type = is_system ? "system" : (is_code ? "code" : "data");
+    bool is_ldt_sel = (sel & 0x04u) != 0;
+
+    return "\"" + std::string(key) + "\":{" +
+           json_hex("sel", sel) + "," +
+           json_bool("valid", true) + "," +
+           json_str("table", is_ldt_sel ? "ldt" : "gdt") + "," +
+           json_hex("base", (uint32_t)desc.GetBase()) + "," +
+           json_hex("limit", (uint32_t)desc.GetLimit()) + "," +
+           json_num("dpl", desc.saved.seg.dpl) + "," +
+           json_str("seg_type", seg_type) + "," +
+           json_num("type_byte", type_byte) + "," +
+           json_bool("present", desc.saved.seg.p != 0) + "," +
+           json_bool("big", desc.saved.seg.big != 0) + "," +
+           json_bool("granularity", desc.saved.seg.g != 0) +
+           "}";
+}
+
+static bool selector_decode_info(uint16_t sel, uint32_t off, uint32_t& linear, bool& bit32) {
+    linear = (uint32_t)GetAddress(sel, off);
+
+    if (!cpu.pmode) {
+        bit32 = false;
+        return true;
+    }
+
+    Descriptor desc;
+    if (!cpu.gdt.GetDescriptor((Bitu)sel, desc)) {
+        return false;
+    }
+
+    const uint8_t type_byte = desc.saved.seg.type;
+    const bool is_system = (type_byte & 0x10) == 0;
+    const bool is_code = !is_system && (type_byte & 0x08) != 0;
+    if (!is_code || desc.saved.seg.p == 0) {
+        return false;
+    }
+
+    bit32 = desc.saved.seg.big != 0;
+    return true;
+}
+
+static std::string stop_reason_name(const char* reason, int int_num) {
+    if (int_num == 0x0E) return "page_fault";
+    if (int_num == 0x0D) return "gpf";
+    if (int_num >= 0) return "interrupt";
+    return reason ? reason : "stopped";
+}
+
+static std::string stop_context_json(const char* reason, uint16_t seg, uint32_t off, int int_num = -1) {
+    uint32_t linear = (uint32_t)GetAddress(seg, off);
+    uint32_t physical = 0;
+    bool physical_present = LinearToPhysical(linear, physical);
+
+    std::ostringstream ss;
+    ss << json_str("reason", stop_reason_name(reason, int_num)) << ","
+       << json_hex("linear", linear) << ","
+       << json_bool("physical_present", physical_present) << ",";
+
+    if (physical_present) {
+        ss << json_hex("physical", physical) << ",";
+    }
+
+    ss << json_hex("CR2", (uint32_t)paging.cr2) << ","
+       << json_hex("CR3", (uint32_t)paging.cr3) << ","
+       << json_bool("paging", paging.enabled) << ","
+       << selector_descriptor_json("cs_desc", seg);
+
+    if (int_num >= 0) {
+        ss << "," << json_num("int", int_num);
+    }
+    if (int_num == last_exception_num) {
+        ss << "," << json_hex("exception_error", last_exception_error);
+    }
+
+    return ss.str();
+}
+
+static std::string linear_exec_breakpoints_json() {
+    std::string arr = "[";
+    bool first = true;
+    int nr = 0;
+    for (const auto& bp : linear_exec_breakpoints) {
+        if (!first) arr += ",";
+        first = false;
+        arr += "{" +
+               json_num("index", nr) + "," +
+               json_str("type", "exec_linear") + "," +
+               json_hex("linear", bp.linear) + "," +
+               json_bool("has_match_seg", bp.has_match_seg) + "," +
+               json_hex("match_seg", bp.match_seg) + "," +
+               json_bool("has_match_off", bp.has_match_off) + "," +
+               json_hex("match_off", bp.match_off) + "," +
+               json_bool("active", bp.active) + "," +
+               json_bool("once", bp.once) +
+               "}";
+        nr++;
+    }
+    arr += "]";
+    return arr;
+}
+
+static void add_linear_exec_breakpoint(
+    uint32_t linear,
+    bool once,
+    bool has_match_seg = false,
+    uint16_t match_seg = 0,
+    bool has_match_off = false,
+    uint32_t match_off = 0
+) {
+    for (auto& bp : linear_exec_breakpoints) {
+        if (bp.linear == linear) {
+            bp.once = once;
+            bp.active = true;
+            bp.has_match_seg = has_match_seg;
+            bp.match_seg = match_seg;
+            bp.has_match_off = has_match_off;
+            bp.match_off = match_off;
+            return;
+        }
+    }
+    LinearExecBreakpoint bp;
+    bp.linear = linear;
+    bp.once = once;
+    bp.active = true;
+    bp.has_match_seg = has_match_seg;
+    bp.match_seg = match_seg;
+    bp.has_match_off = has_match_off;
+    bp.match_off = match_off;
+    linear_exec_breakpoints.push_back(bp);
+}
+
+static bool clear_linear_exec_breakpoint(uint32_t linear) {
+    for (auto it = linear_exec_breakpoints.begin(); it != linear_exec_breakpoints.end(); ++it) {
+        if (it->linear == linear) {
+            linear_exec_breakpoints.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 // Helper function to implement StepOver logic
 static bool DoStepOver() {
     exitLoop = false;
@@ -291,6 +517,21 @@ static bool DoStepOver() {
         return true;
     }
     return false;
+}
+
+// Freeze-safe variant of DoStepOver: returns the linear address of the first
+// instruction past the current one when stepping over a call/int/loop/rep,
+// or 0 when a plain single-step is correct. Does NOT add a physical breakpoint
+// (which would use the crash-prone legacy resume path).
+static uint32_t GetStepOverLinear() {
+    uint16_t cs_val = SegValue(SegNames::cs);
+    PhysPt start = (PhysPt)GetAddress(cs_val, reg_eip);
+    char dline[200];
+    Bitu size = DasmI386(dline, start, reg_eip, cpu.code.big);
+    if (strstr(dline, "call") || strstr(dline, "int") || strstr(dline, "loop") || strstr(dline, "rep")) {
+        return (uint32_t)GetAddress(cs_val, (uint32_t)(reg_eip + size));
+    }
+    return 0;
 }
 
 // Get all registers in GDB RSP format (little-endian hex, 32-bit each)
@@ -676,6 +917,15 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    if (cmd == "last_stop") {
+        if (!last_stop_event_json.empty()) {
+            send_response(last_stop_event_json);
+        } else {
+            send_error("No latched stop event");
+        }
+        return;
+    }
+
     if (cmd == "break") {
         if (IsDebuggerRunwatch()) {
             exitLoop = true;
@@ -687,7 +937,15 @@ static void process_command(const std::string& json) {
     }
 
     if (cmd == "continue" || cmd == "run") {
-        if (!IsDebuggerRunwatch()) {
+        if (socket_freeze_wait) {
+            // We are blocked in-place inside the CPU core. Just release the
+            // freeze; the original core invocation resumes transparently. Do
+            // NOT run the RUN trampoline / swap loops / touch cycles.
+            last_stop_event_json.clear();
+            socket_freeze_wait = false;
+            send_ok(json_str("msg", "Continuing"));
+        } else if (!IsDebuggerRunwatch()) {
+            last_stop_event_json.clear();
             char runcmd[] = "RUN";
             ParseCommand(runcmd);
             send_ok(json_str("msg", "Continuing"));
@@ -698,11 +956,19 @@ static void process_command(const std::string& json) {
     }
 
     if (cmd == "step") {
-        if (!IsDebuggerRunwatch()) {
-            // Actually execute one instruction
+        if (socket_freeze_wait) {
+            // Freeze-model path: arm one-instruction step and release the freeze.
+            // The pre-instruction guard in CPU_Core_Normal_Run decrements the
+            // counter each iteration: arm=2→1 (execute), 1→0 (re-freeze "step").
+            socket_step_arm = 2;
+            last_stop_event_json.clear();
+            socket_freeze_wait = false;
+            send_ok(json_str("msg", "Stepping"));
+        } else if (!IsDebuggerRunwatch()) {
+            // Legacy path (GUI/terminal debug loop stopped state).
             exitLoop = false;
             mustCompleteInstruction = true;
-            DEBUG_Run(1, true);  // Execute 1 cycle with stepping enabled
+            DEBUG_Run(1, true);
             mustCompleteInstruction = false;
             send_ok(json_str("msg", "Stepped"));
         } else {
@@ -712,16 +978,33 @@ static void process_command(const std::string& json) {
     }
 
     if (cmd == "step_over") {
-        if (!IsDebuggerRunwatch()) {
+        if (socket_freeze_wait) {
+            // Freeze-model path: for call/int/loop/rep set a one-shot linear_exec
+            // breakpoint at the return point (freeze-safe resume), otherwise single-step.
+            uint32_t next_lin = GetStepOverLinear();
+            if (next_lin != 0) {
+                LinearExecBreakpoint bp;
+                bp.linear = next_lin;
+                bp.once = true;
+                bp.active = true;
+                bp.suppress_current = false;
+                linear_exec_breakpoints.push_back(bp);
+                socket_freeze_wait = false;
+                send_ok(json_str("msg", "Stepping over"));
+            } else {
+                socket_step_arm = 2;
+                socket_freeze_wait = false;
+                send_ok(json_str("msg", "Stepping over"));
+            }
+        } else if (!IsDebuggerRunwatch()) {
+            // Legacy path.
             if (DoStepOver()) {
-                // Step over call/int/loop/rep - set temp breakpoint and run
                 mustCompleteInstruction = true;
                 inhibit_int_breakpoint = true;
                 DEBUG_Run(1, false);
                 inhibit_int_breakpoint = false;
                 mustCompleteInstruction = false;
             } else {
-                // Normal step
                 exitLoop = false;
                 mustCompleteInstruction = true;
                 DEBUG_Run(1, true);
@@ -799,6 +1082,53 @@ static void process_command(const std::string& json) {
         }
     }
 
+    if (cmd == "bp_set_linear_exec") {
+        long long linear = -1;
+        long long once_val = 0;
+        long long match_seg_val = -1;
+        long long match_off_val = -1;
+        if (!json_get_int(json, "linear", linear)) {
+            send_error("Missing 'linear' address");
+            return;
+        }
+        json_get_int(json, "once", once_val);
+        const bool has_match_seg = json_get_int(json, "match_seg", match_seg_val);
+        const bool has_match_off = json_get_int(json, "match_off", match_off_val);
+        uint32_t linear_u32 = (uint32_t)linear;
+        add_linear_exec_breakpoint(
+            linear_u32,
+            once_val != 0,
+            has_match_seg,
+            (uint16_t)match_seg_val,
+            has_match_off,
+            (uint32_t)match_off_val
+        );
+        send_ok(json_str("msg", "Linear execution breakpoint set") + "," +
+                json_hex("linear", linear_u32) + "," +
+                json_bool("has_match_seg", has_match_seg) + "," +
+                json_hex("match_seg", (uint16_t)match_seg_val) + "," +
+                json_bool("has_match_off", has_match_off) + "," +
+                json_hex("match_off", (uint32_t)match_off_val) + "," +
+                json_bool("once", once_val != 0));
+        return;
+    }
+
+    if (cmd == "bp_clear_linear_exec") {
+        long long linear = -1;
+        if (!json_get_int(json, "linear", linear)) {
+            send_error("Missing 'linear' address");
+            return;
+        }
+        uint32_t linear_u32 = (uint32_t)linear;
+        if (clear_linear_exec_breakpoint(linear_u32)) {
+            send_ok(json_str("msg", "Linear execution breakpoint cleared") + "," +
+                    json_hex("linear", linear_u32));
+        } else {
+            send_error("Linear execution breakpoint not found");
+        }
+        return;
+    }
+
     if (cmd == "bp_clear") {
         long long seg = -1, off = -1, addr_linear = -1;
         
@@ -832,12 +1162,15 @@ static void process_command(const std::string& json) {
         long long count = 0;
         for (size_t i = 0; i < arr.size(); i++)
             if (arr[i] == '{') count++;
-        send_ok("\"breakpoints\":" + arr + "," + json_num("count", count));
+        send_ok("\"breakpoints\":" + arr + "," +
+                "\"linear_exec_breakpoints\":" + linear_exec_breakpoints_json() + "," +
+                json_num("count", count + (long long)linear_exec_breakpoints.size()));
         return;
     }
 
     if (cmd == "bp_clear_all") {
         CBreakpoint::DeleteAll();
+        linear_exec_breakpoints.clear();
         send_ok(json_str("msg", "All breakpoints cleared"));
         return;
     }
@@ -955,7 +1288,7 @@ static void process_command(const std::string& json) {
         
         for (size_t i = 0; i + 1 < data.length(); i += 2) {
             uint8_t val = (uint8_t)strtol(data.substr(i, 2).c_str(), nullptr, 16);
-            mem_writeb(addr + i/2, val);
+            phys_writeb(addr + i/2, val);
         }
         send_ok();
         return;
@@ -966,17 +1299,20 @@ static void process_command(const std::string& json) {
         if (!json_get_int(json, "count", count)) count = 10;
         if (count > 100) count = 100;
 
-        PhysPt addr;
-        PhysPt start_addr;
+        uint32_t linear;
+        uint32_t current_off = 0;
         bool use_linear = false;
+        bool bit32 = cpu.code.big;
         
         if (json_get_int(json, "addr", addr_linear)) {
-            addr = (PhysPt)addr_linear;
-            start_addr = addr;
+            linear = (uint32_t)addr_linear;
             use_linear = true;
         } else if (json_get_int(json, "seg", seg) && json_get_int(json, "off", off)) {
-            addr = ((uint32_t)seg << 4) + (uint32_t)off;
-            start_addr = addr;
+            if (!selector_decode_info((uint16_t)seg, (uint32_t)off, linear, bit32)) {
+                send_error("Invalid, non-present, or non-code selector");
+                return;
+            }
+            current_off = (uint32_t)off;
         } else {
             send_error("Need 'addr' (linear) or 'seg'+'off'");
             return;
@@ -987,35 +1323,147 @@ static void process_command(const std::string& json) {
         
         for (int i = 0; i < count; i++) {
             char buffer[256];
-            Bitu inst_len = DasmI386(buffer, addr, addr, cpu.code.big);
+            const uint32_t shown_ip = use_linear ? linear : current_off;
+            Bitu inst_len = DasmI386(buffer, (PhysPt)linear, shown_ip, bit32);
+            if (inst_len == 0) inst_len = 1;
             
             if (!first) result += ",";
             first = false;
             
             char addrstr[32];
             if (use_linear) {
-                snprintf(addrstr, sizeof(addrstr), "%08X", (uint32_t)addr);
+                snprintf(addrstr, sizeof(addrstr), "%08X", linear);
             } else {
-                snprintf(addrstr, sizeof(addrstr), "%04X:%08X", (uint16_t)seg, (uint32_t)(off + (addr - start_addr)));
+                snprintf(addrstr, sizeof(addrstr), "%04X:%08X", (uint16_t)seg, current_off);
             }
             
             // Read instruction bytes
-            char bytes_hex[64];
-            bytes_hex[0] = '\0';
+            std::string bytes_hex;
             for (Bitu b = 0; b < inst_len && b < 15; b++) {
-                char byte_str[4];
-                snprintf(byte_str, sizeof(byte_str), "%02X", mem_readb(addr + b));
-                strcat(bytes_hex, byte_str);
+                uint8_t value;
+                if (mem_readb_checked((LinearPt)(linear + b), &value)) {
+                    bytes_hex += "??";
+                } else {
+                    char byte_str[4];
+                    snprintf(byte_str, sizeof(byte_str), "%02X", value);
+                    bytes_hex += byte_str;
+                }
             }
             
             result += "{" + json_str("addr", addrstr) + "," + 
-                      json_str("bytes", bytes_hex) + "," +
+                      json_str("bytes", bytes_hex.c_str()) + "," +
                       json_num("len", (long long)inst_len) + "," +
                       json_str("mnemonic", buffer) + "}";
-            addr += inst_len;
+            linear += (uint32_t)inst_len;
+            if (!use_linear) current_off += (uint32_t)inst_len;
         }
         result += "]";
         send_ok(result);
+        return;
+    }
+
+    if (cmd == "disasm_context") {
+        // Disassemble N before + M after a linear address using back-disassembly.
+        // Response: {"status":"ok","lines":[...],"current_idx":N}
+        // lines[current_idx] is the instruction at `addr`.
+        long long addr_linear, before_ll, after_ll;
+        if (!json_get_int(json, "addr", addr_linear)) {
+            send_error("Need 'addr' (linear)");
+            return;
+        }
+        if (!json_get_int(json, "before", before_ll)) before_ll = 3;
+        if (!json_get_int(json, "after",  after_ll))  after_ll  = 10;
+        if (before_ll > 20) before_ll = 20;
+        if (after_ll  > 50) after_ll  = 50;
+        int before_count = (int)before_ll;
+        int after_count  = (int)after_ll;
+
+        PhysPt pc = (PhysPt)(uint32_t)addr_linear;
+
+        // Back-disassembly: scan forward from pc-64, recording each instruction.
+        // Find the rightmost instruction that ends exactly at pc.
+        const uint32_t LOOKBACK = 64;
+        PhysPt scan_start = (pc > LOOKBACK) ? pc - LOOKBACK : 0;
+        const uint16_t cur_cs = SegValue(SegNames::cs);
+        const PhysPt cur_pc = (PhysPt)GetAddress(cur_cs, reg_eip);
+        if (!cpu.pmode && pc == cur_pc && cur_cs < 0xF000 && reg_eip >= 0x100) {
+            // DOS .COM programs begin at CS:0100; bytes before that are the PSP,
+            // not code. Clamping avoids bogus back-disassembly through PSP zeros.
+            const PhysPt com_start = (PhysPt)GetAddress(cur_cs, 0x100);
+            if (scan_start < com_start) scan_start = com_start;
+        }
+
+        struct InsnRecord { PhysPt addr; Bitu len; char mnemonic[256]; };
+        std::vector<InsnRecord> scan;
+        scan.reserve(32);
+
+        PhysPt cur = scan_start;
+        while (cur < pc) {
+            InsnRecord rec;
+            rec.addr = cur;
+            rec.len  = DasmI386(rec.mnemonic, cur, cur, cpu.code.big);
+            if (rec.len == 0) rec.len = 1;
+            scan.push_back(rec);
+            cur += rec.len;
+        }
+
+        // Find the last record whose end == pc.
+        int aligned_idx = -1;
+        for (int i = (int)scan.size() - 1; i >= 0; i--) {
+            if (scan[i].addr + scan[i].len == pc) {
+                aligned_idx = i;
+                break;
+            }
+        }
+
+        int slice_start = (aligned_idx >= 0)
+            ? std::max(0, aligned_idx - before_count + 1)
+            : (int)scan.size();
+        int slice_end = (aligned_idx >= 0) ? aligned_idx + 1 : (int)scan.size();
+
+        // Helper: serialize one instruction to JSON object.
+        auto insn_json = [&](PhysPt a, const char* mnem) -> std::string {
+            char addrstr[32];
+            snprintf(addrstr, sizeof(addrstr), "%08X", (uint32_t)a);
+            char buf[256];
+            Bitu len = DasmI386(buf, a, a, cpu.code.big);
+            if (len == 0) len = 1;
+            char bytes_hex[64]; bytes_hex[0] = '\0';
+            for (Bitu b = 0; b < len && b < 15; b++) {
+                char bs[4];
+                snprintf(bs, sizeof(bs), "%02X", mem_readb(a + b));
+                strcat(bytes_hex, bs);
+            }
+            return "{" + json_str("addr", addrstr) + "," +
+                         json_str("bytes", bytes_hex) + "," +
+                         json_num("len", (long long)len) + "," +
+                         json_str("mnemonic", mnem) + "}";
+        };
+
+        std::string lines_json = "\"lines\":[";
+        bool first = true;
+        int current_idx = 0;
+
+        for (int i = slice_start; i < slice_end; i++) {
+            if (!first) lines_json += ",";
+            first = false;
+            lines_json += insn_json(scan[i].addr, scan[i].mnemonic);
+            current_idx++;
+        }
+
+        PhysPt a = pc;
+        for (int i = 0; i < after_count; i++) {
+            if (!first) lines_json += ",";
+            first = false;
+            char mnem[256];
+            Bitu len = DasmI386(mnem, a, a, cpu.code.big);
+            if (len == 0) len = 1;
+            lines_json += insn_json(a, mnem);
+            a += len;
+        }
+        lines_json += "]";
+
+        send_ok(lines_json + "," + json_num("current_idx", current_idx));
         return;
     }
 
@@ -1481,7 +1929,18 @@ static void process_command(const std::string& json) {
             }
             
             if (keycode != 0) {
-                BIOS_AddKeyToBuffer(keycode);
+                // Use phys_read/write to bypass guest page tables (DPMI write-
+                // protects low memory; mem_writew would trigger a page fault).
+                const PhysPt tail_addr = 0x41C;  // BIOS_KEYBOARD_BUFFER_TAIL
+                const PhysPt head_addr = 0x41A;  // BIOS_KEYBOARD_BUFFER_HEAD
+                uint16_t tail = phys_readw(tail_addr);
+                uint16_t head = phys_readw(head_addr);
+                uint16_t ttail = tail + 2;
+                if (ttail >= 0x3e) ttail = 0x1e;
+                if (ttail != head) {
+                    phys_writew(0x400 + tail, keycode);   // write into ring buffer
+                    phys_writew(tail_addr, ttail);         // advance tail
+                }
                 send_ok(json_str("msg", "Key injected") + "," + json_str("key", key));
             } else {
                 send_error("Unknown key name");
@@ -1498,6 +1957,35 @@ static void process_command(const std::string& json) {
         }
         
         send_error("Need 'key' name or 'scancode'+'ascii'");
+        return;
+    }
+
+    if (cmd == "key_hw") {
+        // Inject a key via the hardware 8042 keyboard controller simulation.
+        // Unlike "key" (which writes to BIOS buffer), this goes through
+        // KEYBOARD_AddKey → sets the 8042 OBF bit so port-0x64 polling detects it.
+        std::string key;
+        if (!json_get_string(json, "key", key)) {
+            send_error("Need 'key' field");
+            return;
+        }
+        KBD_KEYS kbd_key = KBD_NONE;
+        if (key == "enter" || key == "return") kbd_key = KBD_enter;
+        else if (key == "esc" || key == "escape") kbd_key = KBD_esc;
+        else if (key == "space") kbd_key = KBD_space;
+        else if (key == "a") kbd_key = KBD_a;
+        else if (key == "b") kbd_key = KBD_b;
+        else if (key == "c") kbd_key = KBD_c;
+        else if (key == "y") kbd_key = KBD_y;
+        else if (key == "n") kbd_key = KBD_n;
+        if (kbd_key == KBD_NONE) {
+            send_error("Unknown key name for key_hw");
+            return;
+        }
+        // Simulate press then release
+        KEYBOARD_AddKey(kbd_key, true);
+        KEYBOARD_AddKey(kbd_key, false);
+        send_ok(json_str("msg", "HW key injected") + "," + json_str("key", key));
         return;
     }
 
@@ -1725,14 +2213,10 @@ static void process_command(const std::string& json) {
             if (!LinearToPhysical((uint32_t)(lin_addr + i), phys)) {
                 hex += "PF";  // Page fault — not present
             } else {
-                uint8_t val;
-                if (mem_readb_checked((PhysPt)phys, &val)) {
-                    hex += "??";
-                } else {
-                    char buf[4];
-                    snprintf(buf, sizeof(buf), "%02X", val);
-                    hex += buf;
-                }
+                const uint8_t val = physdev_readb((PhysPt64)phys);
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02X", val);
+                hex += buf;
             }
         }
         send_ok(json_str("data", hex) + "," +
@@ -1885,7 +2369,9 @@ bool DEBUG_Socket_CheckCommands(void) {
                 recv_buffer.erase(0, pos + 1);
                 
                 if (!line.empty()) {
+                    json_get_id_field(line, current_response_id_json);
                     process_command(line);
+                    current_response_id_json.clear();
                     processed = true;
                 }
             }
@@ -1907,7 +2393,9 @@ void DEBUG_Socket_NotifyBreakpoint(uint16_t seg, uint32_t off) {
         // JSON mode
         char addr[32];
         snprintf(addr, sizeof(addr), "%04X:%08X", seg, off);
-        send_response("{" + json_str("event", "stopped") + "," + json_str("reason", "breakpoint") + "," + json_str("addr", addr) + "," + get_registers_json() + "}");
+        send_and_latch_stop("{" + json_str("event", "stopped") + "," +
+                            stop_context_json("breakpoint", seg, off) + "," +
+                            json_str("addr", addr) + "," + get_registers_json() + "}");
     }
 }
 
@@ -1923,10 +2411,9 @@ void DEBUG_Socket_NotifyInterrupt(uint8_t intNum, uint16_t seg, uint32_t off) {
         // JSON mode - include interrupt number
         char addr[32];
         snprintf(addr, sizeof(addr), "%04X:%08X", seg, off);
-        send_response("{" + json_str("event", "stopped") + "," + 
-                     json_str("reason", "interrupt") + "," + 
-                     json_num("int", intNum) + "," +
-                     json_str("addr", addr) + "," + get_registers_json() + "}");
+        send_and_latch_stop("{" + json_str("event", "stopped") + "," +
+                            stop_context_json("interrupt", seg, off, intNum) + "," +
+                            json_str("addr", addr) + "," + get_registers_json() + "}");
     }
 }
 
@@ -1940,7 +2427,83 @@ void DEBUG_Socket_NotifyStopped(const char* reason) {
         send_gdb_packet(stop_packet);
     } else {
         // JSON mode
-        send_response("{" + json_str("event", "stopped") + "," + json_str("reason", reason) + "," + get_registers_json() + "}");
+        uint16_t seg = SegValue(SegNames::cs);
+        uint32_t off = reg_eip;
+        send_and_latch_stop("{" + json_str("event", "stopped") + "," +
+                            stop_context_json(reason, seg, off) + "," +
+                            get_registers_json() + "}");
+    }
+}
+
+void DEBUG_Socket_RecordException(uint8_t intNum, uint32_t error) {
+    last_exception_num = intNum;
+    last_exception_error = error;
+}
+
+bool DEBUG_Socket_DecrStepArm(void) {
+    if (socket_step_arm == 0) return false;
+    return (--socket_step_arm == 0);
+}
+
+bool DEBUG_Socket_CheckLinearExecBreakpoint(uint16_t seg, uint32_t off) {
+    if (linear_exec_breakpoints.empty()) return false;
+
+    uint32_t linear = (uint32_t)GetAddress(seg, off);
+    for (auto it = linear_exec_breakpoints.begin(); it != linear_exec_breakpoints.end(); ++it) {
+        if (it->linear != linear) {
+            it->suppress_current = false;
+            continue;
+        }
+        if (!it->active) continue;
+        if (it->has_match_seg && it->match_seg != seg) continue;
+        if (it->has_match_off && it->match_off != off) continue;
+        if (it->suppress_current) continue;
+
+        if (client_socket >= 0 && !gdb_mode) {
+            char addr[32];
+            snprintf(addr, sizeof(addr), "%04X:%08X", seg, off);
+            send_and_latch_stop("{" + json_str("event", "stopped") + "," +
+                                stop_context_json("linear_exec_breakpoint", seg, off) + "," +
+                                json_hex("requested_linear", it->linear) + "," +
+                                json_str("addr", addr) + "," + get_registers_json() + "}");
+        } else if (client_socket >= 0 && gdb_mode) {
+            char stop_packet[64];
+            snprintf(stop_packet, sizeof(stop_packet), "S05;thread:1;core:%08x", linear);
+            send_gdb_packet(stop_packet);
+        }
+
+        if (it->once) {
+            linear_exec_breakpoints.erase(it);
+        } else {
+            it->suppress_current = true;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// Block in place until the client issues "continue" (or "break" handling
+// clears the flag). Services only socket commands and host events. The caller
+// (a CPU-core breakpoint guard) has already emitted the "stopped" event, so the
+// client can react. On return, the CPU core resumes from the identical
+// instruction boundary with all guest/host state untouched.
+//
+// Note: we intentionally do NOT exit on client disconnect. The MCP layer opens
+// a fresh TCP connection per command, so a disconnect after delivering the
+// "stopped" event is normal -- we must keep waiting for an explicit continue
+// that may arrive on a subsequent connection.
+void DEBUG_Socket_FreezeWait(void) {
+    if (server_socket < 0) return;  // socket debugger not active: never block
+
+    // We deliberately do NOT touch the debugger's `debugging`/`debug_running`
+    // globals or the loop handler. The CPU core is simply parked here; all
+    // socket read commands operate on the live guest state directly.
+    socket_freeze_wait = true;
+    while (socket_freeze_wait) {
+        DEBUG_Socket_CheckCommands();
+        GFX_Events();
+        usleep(1000);  // 1ms; keeps host responsive without busy-spinning
     }
 }
 

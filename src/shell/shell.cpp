@@ -322,34 +322,32 @@ AutoexecObject::~AutoexecObject(){
 }
 
 DOS_Shell::~DOS_Shell() {
-	/* DOS subsystem routines (DOS_FreeProcessMemory, CloseFiles, etc.) can throw int(N)
-	 * via DOS_Mem_E_Exit / similar when MCB chain corruption or other non-fatal errors are
-	 * detected during teardown.  Destructors are implicitly noexcept in C++11, so any
-	 * uncaught exception propagating out calls std::terminate().  Wrap the entire body. */
-	try {
-		if (bf != NULL) delete bf; /* free batch file */
+	if (bf != NULL) delete bf; /* free batch file */
 
-		/* shell termination is not handled like a normal program.
-		 * memory allocated by the shell is not automatically freed on termination.
-		 * files are not automatically closed */
-		if (psp->GetSegment()) {
-			/* BOOT will set the first MCB chain to zero to signal that low memory has been overwritten
-			 * by the guest OS boot code */
-			if (!dos_kernel_shutdown_mcb) {
-				DOS_FreeProcessMemory(psp->GetSegment());
-
-				/* NTS: DOS_PSP would ideally allow JFT handle operations regardless of whatever the
-				 *      current PSP segment is, but that's not how the code is written */
+	/* shell termination is not handled like a normal program.
+	 * memory allocated by the shell is not automatically freed on termination.
+	 * files are not automatically closed.
+	 *
+	 * Avoid DOS_FreeProcessMemory here: it can throw int(N) via DOS_Mem_E_Exit, and if
+	 * PAGING_NewPageFault fires during the resulting stack unwind it throws a second
+	 * int(reset_decode_signal).  Two live exceptions → std::terminate().  The DOS memory
+	 * manager reclaims everything during dos_done() shutdown anyway, so skipping this
+	 * call is safe. */
+	if (psp->GetSegment()) {
+		if (!dos_kernel_shutdown_mcb) {
+			/* NTS: DOS_PSP would ideally allow JFT handle operations regardless of whatever the
+			 *      current PSP segment is, but that's not how the code is written */
+			try {
 				const uint16_t o_psp = dos.psp();
 				dos.psp(psp->GetSegment());
 				psp->CloseFiles();
 				dos.psp(o_psp);
-			}
+			} catch (...) {}
 		}
+	}
 
-		if (psp->GetSegment() == shell_psp)
-			shell_psp = 0;
-	} catch (...) {}
+	if (psp->GetSegment() == shell_psp)
+		shell_psp = 0;
 }
 
 DOS_Shell::DOS_Shell():Program(){
