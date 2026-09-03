@@ -1236,16 +1236,23 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	// Check for interrupt breakpoints BEFORE handling the exception
 	// This allows us to catch page faults and GPFs before they're handled
 	extern bool DEBUG_IntBreakpoint(uint8_t intNum);
+	extern bool DEBUG_HasIntBreakpoint(uint8_t intNum);
 	extern Bitu DEBUG_EnableDebugger(void);
 	extern void DEBUG_Socket_NotifyBreakpoint(uint16_t seg, uint32_t off);
 	extern void DEBUG_Socket_RecordException(uint8_t intNum, uint32_t error);
 	// Temporarily disable inhibit_int_breakpoint to allow exception breakpoints
 	extern bool inhibit_int_breakpoint;
 	bool old_inhibit = inhibit_int_breakpoint;
-	inhibit_int_breakpoint = false;
 	DEBUG_Socket_RecordException((uint8_t)which, (uint32_t)error);
-	LOG_MSG("CPU_Exception: Checking interrupt breakpoint for exception %d (inhibit=%d)", (int)which, old_inhibit ? 1 : 0);
-	bool bp_hit = DEBUG_IntBreakpoint((uint8_t)which);
+	bool bp_hit = false;
+	if (DEBUG_HasIntBreakpoint((uint8_t)which)) {
+		inhibit_int_breakpoint = false;
+		LOG_MSG("CPU_Exception: Checking interrupt breakpoint for exception %d (inhibit=%d)", (int)which, old_inhibit ? 1 : 0);
+		bp_hit = DEBUG_IntBreakpoint((uint8_t)which);
+		inhibit_int_breakpoint = old_inhibit;
+	} else {
+		LOG_MSG("CPU_Exception: No interrupt breakpoint for exception %d", (int)which);
+	}
 	inhibit_int_breakpoint = old_inhibit;
 	LOG_MSG("CPU_Exception: Breakpoint check result for exception %d: %d", (int)which, bp_hit ? 1 : 0);
 	if (bp_hit) {
@@ -1262,6 +1269,18 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	}
 	// Note: If breakpoint wasn't hit, DEBUG_IntBreakpoint already logged why (or we can add logging here if needed)
 # endif
+	// Socket-armed first-chance exception filter (zero cost when disarmed).
+	// Runs before the IDT handler so the guest fault handler has not yet
+	// run when the freeze occurs.
+	{
+		extern bool DEBUG_Socket_CheckException(uint8_t, uint32_t, bool);
+		bool is_nested = !CPU_Exception_In_Progress.empty();
+		if (DEBUG_Socket_CheckException((uint8_t)which, (uint32_t)error, is_nested)) {
+			extern void DEBUG_Socket_FreezeWait(void);
+			FillFlags();
+			DEBUG_Socket_FreezeWait();
+		}
+	}
 #endif
 
 	if (CPU_Exception_Level[which] != 0) {
@@ -1321,6 +1340,11 @@ void CPU_Exception(Bitu which,Bitu error ) {
 
 uint8_t lastint;
 void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
+    /* Allocation trace: software INTs never reach the C_HEAVY_DEBUG block
+       further down (the cores handle those themselves), and INT 21h/67h
+       are exactly what we want to see. Filtered inside; a no-op when the
+       trace is off. */
+    { extern void DEBUG_Socket_TraceAlloc(uint8_t); DEBUG_Socket_TraceAlloc((uint8_t)num); }
 #if C_DEBUG
 # if C_HEAVY_DEBUG
 	// Log all interrupts, especially exceptions
@@ -1342,7 +1366,7 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
     bool DEBUG_IntBreakpoint(uint8_t intNum);
     Bitu DEBUG_EnableDebugger(void);
 
-    if (type != CPU_INT_SOFTWARE) { /* CPU core already takes care of SW interrupts */
+    if (type != CPU_INT_SOFTWARE && !(type & CPU_INT_EXCEPTION)) { /* CPU core already takes care of SW interrupts and CPU_Exception handles exception breakpoints */
 #if !defined(HX_DOS)
         if (DEBUG_IntBreakpoint((uint8_t)num))
             DEBUG_EnableDebugger();

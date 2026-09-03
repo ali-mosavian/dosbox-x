@@ -11,12 +11,24 @@
  *   {"cmd":"bp_set","seg":X,"off":Y}  - Set breakpoint
  *   {"cmd":"bp_clear","seg":X,"off":Y} - Clear breakpoint
  *   {"cmd":"bp_list"}         - List breakpoints
+ *   {"cmd":"get_load_info"}   - Get latest DOS EXEC COM/EXE load metadata
  *   {"cmd":"regs"}            - Get registers
  *   {"cmd":"regs_set","reg":"EAX","val":X} - Set register
  *   {"cmd":"mem_read","seg":X,"off":Y,"len":Z} - Read memory
+ *   {"cmd":"alloc_trace","op":"start","file":"/host/path"} - log every DOS
+ *     (INT 21h AH=48/49/4A) and EMS (INT 67h AH=43/45/47/48) memory call
+ *     with its size and calling CS:IP. {"op":"stop"} closes it.
+ *   {"cmd":"mem_dump","seg":X,"off":Y,"len":Z,"file":"/host/path"} - Read memory
+ *     straight to a host file (binary). No hex, no response-size limit: for
+ *     dumps far larger than mem_read's practical reply size.
  *   {"cmd":"mem_write","seg":X,"off":Y,"data":"hex"} - Write memory
  *   {"cmd":"disasm","seg":X,"off":Y,"count":Z} - Disassemble
  *   {"cmd":"status"}          - Get debugger status
+ *   {"cmd":"floppy_swap","drive":"A"} - Cycle to next disk image in swap list
+ *   {"cmd":"floppy_swap","drive":"A","image":"/path"} - Replace active image with new file
+ *   {"cmd":"floppy_load_list","drive":"A","images":["/abs/Disk01.img","/abs/Disk02.img",...]}
+ *     Pre-load a list of images into the drive's swap list (replicates imgmount multi-image
+ *     behaviour). First image becomes active. Subsequent floppy_swap (no image) cycles through.
  *
  * Responses (JSON):
  *   {"status":"ok",...}       - Success with optional data
@@ -24,6 +36,19 @@
  *
  * Notifications (async):
  *   {"event":"stopped","reason":"breakpoint","seg":X,"off":Y}
+ *   {"event":"stopped","reason":"breakpoint",...,"loadInfo":{...}}
+ *     loadInfo is present on bp_on_load entry stops when DOS EXEC metadata is
+ *     available. Numeric fields are decimal JSON numbers:
+ *     program,isCom,pspSeg,loadSeg,loadLinear,entryCS,entryIP,entryLinear,
+ *     initialSS,initialSP,initialStackLinear,imageSizeBytes,imageEndLinear,
+ *     and for EXE files raw MZ/load facts including mzSignature,mzExtraBytes,
+ *     mzPages,headerParagraphs,headerBytes,relocationCount,
+ *     relocationTableOffset,initCS,initIP,initSS,initSP,checksum,overlay,
+ *     minAlloc,maxAlloc.
+ *     Note: DOSBox-X reports the MZ image base and raw MZ loader facts, not
+ *     Microsoft LINK segment names. MCP/debug tools should parse the .MAP file
+ *     and add each MAP segment start to loadSeg/loadLinear for per-segment
+ *     runtime bases.
  *   {"event":"stopped","reason":"step"}
  */
 
@@ -38,17 +63,31 @@
 #include "paging.h"
 #include "mem.h"
 #include "bios.h"
+#include "bios_disk.h"
 #include "shell.h"
 #include "dos_inc.h"
+#include "../dos/drives.h"
 
 // Forward declarations for CPU functions
 extern Bitu CPU_SIDT_base(void);
 extern Bitu CPU_SIDT_limit(void);
 
+// Forward declaration for bios_disk.cpp swap helper
+extern void swapInDrive(int drive, unsigned int position);
+extern int swapInDisksSpecificDrive;
+
 // Forward declarations
 extern void DEBUG_ShowMsg(const char *format,...);
 Bitu DasmI386(char* buffer, PhysPt pc, uint32_t cur_ip, bool bit32);
 #define LOG_MSG DEBUG_ShowMsg
+extern bool DOS_Shell_QueueCommandFromDebugger(const char* command);
+extern bool DOS_Shell_HasQueuedCommandFromDebugger(void);
+extern uint64_t DOS_Shell_DebuggerCommandsQueued(void);
+extern uint64_t DOS_Shell_DebuggerCommandsWoken(void);
+extern uint64_t DOS_Shell_DebuggerCommandsConsumed(void);
+extern uint64_t DOS_Shell_DebuggerCommandsSubmitted(void);
+extern const char* DOS_Shell_DebuggerLastConsumedCommand(void);
+extern const char* DOS_Shell_DebuggerLastSubmittedCommand(void);
 
 // CBreakpoint is defined in debug.cpp - we can access it since we're in the same library
 // Define the enum (must match debug.cpp) and forward declare the class with needed methods
@@ -74,11 +113,34 @@ public:
 #include <fcntl.h>
 #include "keyboard.h"
 #include <errno.h>
+
+// On macOS, MSG_NOSIGNAL is not available; use SO_NOSIGPIPE on the socket instead.
+// On Linux we pass MSG_NOSIGNAL to every send() so SIGPIPE is never raised.
+#if defined(__APPLE__) || defined(__MACH__)
+#define DEBUG_SOCKET_SEND_FLAGS 0
+#else
+#define DEBUG_SOCKET_SEND_FLAGS MSG_NOSIGNAL
+#endif
+
+// Move an fd to a number >= 100 so that it doesn't collide with the low-numbered
+// file descriptors opened by disk-image code (imgmount / floppy_load_list).
+// On systems where F_DUPFD is unavailable this is a no-op.
+static int socket_bump_fd(int fd) {
+#if defined(F_DUPFD)
+    int high = fcntl(fd, F_DUPFD, 100);
+    if (high >= 0) {
+        close(fd);
+        return high;
+    }
+#endif
+    return fd;
+}
 #include <string.h>
 #include <string>
 #include <sstream>
 #include <vector>
 #include <cstdio>
+#include <algorithm>
 
 struct LinearExecBreakpoint {
     uint32_t linear = 0;
@@ -97,6 +159,7 @@ extern bool debugging;
 extern bool mustCompleteInstruction;
 extern bool inhibit_int_breakpoint;
 extern int32_t DEBUG_Run(int32_t amount, bool quickexit);
+extern void DEBUG_ResumeNormalFromSocket(void);
 extern uint64_t GetAddress(uint16_t seg, uint32_t offset);
 
 // Host event pump (defined in the SDL frontend)
@@ -113,6 +176,8 @@ void GFX_Events(void);
 // flag and the original CPU-core invocation resumes from the exact same
 // instruction boundary -- a transparent, Bochs-style stop/resume.
 static volatile bool socket_freeze_wait = false;
+static volatile bool socket_freeze_loop_active = false;
+uint32_t debug_socket_normal_core_hooks_active = 0; // set by core_normal.cpp when socket hooks are executing
 
 // Single-step countdown. Set to 2 by the "step" command; the pre-instruction
 // guard in CPU_Core_Normal_Run decrements it each pass. When it reaches 1 the
@@ -123,7 +188,9 @@ static volatile int socket_step_arm = 0;
 // Forward declarations
 bool ParseCommand(char* str);
 bool IsDebuggerRunwatch(void);
+bool IsDebuggerRunNormal(void);
 Bitu DasmI386(char* buffer, PhysPt pc, uint32_t cur_ip, bool bit32);
+void On_Software_CPU_Reset(void);
 
 // Socket state
 static int server_socket = -1;
@@ -135,7 +202,196 @@ static uint8_t last_exception_num = 0xFF;
 static uint32_t last_exception_error = 0;
 static std::vector<LinearExecBreakpoint> linear_exec_breakpoints;
 static std::string last_stop_event_json;
+static std::string last_fault_stop_event_json;
 static std::string current_response_id_json;
+
+// -----------------------------------------------------------------------
+// Write watchpoints
+// -----------------------------------------------------------------------
+struct DebugWatchpoint {
+    uint32_t start  = 0;
+    uint32_t end    = 0;  // exclusive (start + len)
+    bool     active = false;
+    uint32_t hit_count = 0;
+};
+static const int MAX_WATCHPOINTS = 16;
+static DebugWatchpoint watchpoints[MAX_WATCHPOINTS];
+uint32_t debug_watchpoint_count = 0;  // extern'd in paging.h; checked per write
+
+struct WatchpointHit {
+    uint32_t watch_linear = 0;
+    uint32_t old_val      = 0;
+    uint32_t new_val      = 0;
+    uint32_t culprit_cs   = 0;
+    uint32_t culprit_eip  = 0;
+    uint32_t size         = 0;
+};
+static volatile bool watchpoint_pending_freeze = false;
+static WatchpointHit  watchpoint_hit_context;
+
+// -----------------------------------------------------------------------
+// First-chance exception catching
+// -----------------------------------------------------------------------
+struct ExceptionSkip {
+    uint8_t  vec        = 0;
+    int      remaining  = 0;   // skips left; -1 = never
+};
+struct CR2IgnoreRange {
+    uint32_t start = 0;
+    uint32_t end   = 0;  // inclusive
+};
+static bool catch_exceptions_armed = false;
+static bool catch_exceptions_vectors[32] = {};
+static ExceptionSkip catch_exceptions_skip_list[32];
+static int  catch_exceptions_skip_count = 0;
+static std::vector<CR2IgnoreRange> catch_exceptions_cr2_ignore;
+// "nested fault always stops" is implemented by checking is_nested arg
+
+// Latched exception context for the stop event
+struct ExceptionHitCtx {
+    uint8_t  vec       = 0;
+    uint32_t error     = 0;
+    uint32_t cr2       = 0;
+    uint16_t fault_cs  = 0;
+    uint32_t fault_eip = 0;
+};
+static ExceptionHitCtx exception_hit_ctx;
+
+// -----------------------------------------------------------------------
+// Process exit events
+// -----------------------------------------------------------------------
+struct ProcessExitInfo {
+    uint16_t psp       = 0;
+    uint8_t  exit_code = 0;
+    bool     tsr       = false;
+    bool     abnormal  = false;
+    bool     valid     = false;
+};
+static ProcessExitInfo last_process_exit;
+static bool break_on_exit = false;
+
+// -----------------------------------------------------------------------
+// Branch trace ring buffer
+// -----------------------------------------------------------------------
+struct BranchEntry {
+    uint32_t from_cs;
+    uint32_t from_linear;
+    uint32_t to_cs;
+    uint32_t to_linear;
+};
+static const int BRANCH_RING_SIZE = 8192;
+static BranchEntry branch_ring[BRANCH_RING_SIZE];
+static uint32_t branch_ring_head  = 0;   // next write index (mod BRANCH_RING_SIZE)
+static uint32_t branch_ring_count = 0;   // total entries ever written (capped at RING_SIZE)
+static bool branch_trace_enabled = false;
+
+// -----------------------------------------------------------------------
+// Reverse checkpoint ring ("time travel lite")
+// -----------------------------------------------------------------------
+enum ReverseCheckpointMode {
+    REVERSE_CHECKPOINT_BRANCH = 0,
+    REVERSE_CHECKPOINT_INSTRUCTION = 1,
+};
+
+struct ReverseCpuState {
+    uint32_t eax = 0;
+    uint32_t ebx = 0;
+    uint32_t ecx = 0;
+    uint32_t edx = 0;
+    uint32_t esi = 0;
+    uint32_t edi = 0;
+    uint32_t ebp = 0;
+    uint32_t esp = 0;
+    uint32_t eip = 0;
+    uint32_t flags = 0;
+    Bitu seg_val[8] = {};
+    PhysPt seg_phys[8] = {};
+    PhysPt seg_limit[8] = {};
+    bool seg_expanddown[8] = {};
+    Bitu cpl = 0;
+    Bitu mpl = 0;
+    Bitu cr0 = 0;
+    Bitu cr4 = 0;
+    bool pmode = false;
+    bool code_big = false;
+    bool stack_big = false;
+    uint32_t stack_mask = 0;
+    uint32_t stack_notmask = 0;
+    Bits direction = 0;
+    bool trap_skip = false;
+    bool paging_enabled = false;
+    bool paging_wp = false;
+    uint32_t paging_cr2 = 0;
+    uint32_t paging_cr3 = 0;
+    PageNum paging_base_page = 0;
+    PhysPt paging_base_addr = 0;
+};
+
+struct ReverseMemDelta {
+    uint32_t linear = 0;
+    uint32_t physical = 0;
+    uint8_t old_value = 0;
+    uint8_t new_value = 0;
+};
+
+struct ReverseCheckpoint {
+    uint64_t id = 0;
+    ReverseCpuState cpu;
+    uint32_t cs = 0;
+    uint32_t eip = 0;
+    uint32_t linear = 0;
+    uint32_t from_cs = 0;
+    uint32_t from_linear = 0;
+    std::vector<ReverseMemDelta> deltas; // writes from this checkpoint to the next
+    bool delta_overflow = false;
+    uint64_t dropped_writes = 0;
+};
+
+static const size_t REVERSE_DEFAULT_MAX_CHECKPOINTS = 512;
+static const size_t REVERSE_MIN_CHECKPOINTS = 2;
+static const size_t REVERSE_MAX_CHECKPOINTS = 8192;
+static const size_t REVERSE_MAX_DELTAS_PER_INTERVAL = 1024 * 1024;
+static std::vector<ReverseCheckpoint> reverse_checkpoints;
+static size_t reverse_cursor = 0;
+static size_t reverse_max_checkpoints = REVERSE_DEFAULT_MAX_CHECKPOINTS;
+static uint64_t reverse_next_checkpoint_id = 1;
+static ReverseCheckpointMode reverse_mode = REVERSE_CHECKPOINT_BRANCH;
+static bool reverse_trace_enabled = false;
+static bool reverse_applying_delta = false;
+static uint64_t reverse_total_dropped_writes = 0;
+uint32_t debug_reverse_trace_active = 0; // extern'd in paging.h; checked per write
+
+static bool LinearToPhysical(uint32_t linear, uint32_t& physical);
+extern Bitu FillFlags(void);
+
+struct DebugSocketLoadInfo {
+    bool valid = false;
+    std::string program;
+    bool is_com = false;
+    uint16_t psp_seg = 0;
+    uint16_t load_seg = 0;
+    uint16_t entry_cs = 0;
+    uint16_t entry_ip = 0;
+    uint16_t initial_ss = 0;
+    uint16_t initial_sp = 0;
+    uint32_t image_size_bytes = 0;
+    uint16_t mz_signature = 0;
+    uint16_t mz_extra_bytes = 0;
+    uint16_t mz_pages = 0;
+    uint16_t header_paragraphs = 0;
+    uint16_t relocation_count = 0;
+    uint16_t relocation_table_offset = 0;
+    uint16_t init_cs = 0;
+    uint16_t init_ip = 0;
+    uint16_t init_ss = 0;
+    uint16_t init_sp = 0;
+    uint16_t checksum = 0;
+    uint16_t overlay = 0;
+    uint16_t min_alloc = 0;
+    uint16_t max_alloc = 0;
+};
+
+static DebugSocketLoadInfo last_load_info;
 
 // Simple JSON helpers (no external dependencies)
 static std::string json_escape(const std::string& s) {
@@ -153,8 +409,6 @@ static std::string json_escape(const std::string& s) {
     return result;
 }
 
-static std::string json_obj_start() { return "{"; }
-static std::string json_obj_end() { return "}"; }
 static std::string json_str(const char* key, const char* val) {
     return "\"" + std::string(key) + "\":\"" + json_escape(val) + "\"";
 }
@@ -209,6 +463,32 @@ static bool json_get_int(const std::string& json, const char* key, long long& ou
     }
     // Handle number
     out = strtoll(json.c_str() + pos, nullptr, 0);
+    return true;
+}
+
+// Parse a JSON array of strings: "key": ["str1","str2",...]
+static bool json_get_string_array(const std::string& json, const char* key, std::vector<std::string>& out) {
+    std::string search = "\"" + std::string(key) + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos += search.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos >= json.length() || json[pos] != '[') return false;
+    pos++; // skip '['
+    out.clear();
+    while (pos < json.length()) {
+        while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t' ||
+               json[pos] == '\n' || json[pos] == '\r')) pos++;
+        if (pos >= json.length()) break;
+        if (json[pos] == ']') break;
+        if (json[pos] == ',') { pos++; continue; }
+        if (json[pos] != '"') return false;
+        pos++;
+        size_t end = json.find('"', pos);
+        if (end == std::string::npos) return false;
+        out.push_back(json.substr(pos, end - pos));
+        pos = end + 1;
+    }
     return true;
 }
 
@@ -277,7 +557,14 @@ static void send_response(const std::string& json) {
             out.insert(1, current_response_id_json + ",");
         }
         std::string msg = out + "\n";
-        send(client_socket, msg.c_str(), msg.length(), 0);
+        ssize_t sent = send(client_socket, msg.c_str(), msg.length(),
+                            DEBUG_SOCKET_SEND_FLAGS);
+        if (sent < 0) {
+            // Socket is broken (EPIPE, EBADF, etc.) — close and wait for reconnect.
+            LOG_MSG("DEBUG_Socket: send failed (errno %d): %s", errno, strerror(errno));
+            close(client_socket);
+            client_socket = -1;
+        }
     }
 }
 
@@ -287,6 +574,9 @@ static void send_error(const char* msg) {
 }
 
 // Send OK response with optional data
+static FILE*    alloc_trace_fp   = NULL;
+static uint32_t alloc_trace_n    = 0;
+
 static void send_ok(const std::string& extra = "") {
     std::string resp = "{" + json_str("status", "ok");
     if (!extra.empty()) resp += "," + extra;
@@ -294,9 +584,771 @@ static void send_ok(const std::string& extra = "") {
     send_response(resp);
 }
 
+static void execute_dos_command_and_respond(const std::string& command) {
+    // Clear error state before execution
+    dos.errorcode = 0;
+
+    // Clear pending breakpoint flag - if bp_on_load triggers,
+    // DEBUG_Socket_NotifyBreakpoint will send the event
+    g_exec_breakpoint_pending = false;
+
+    // Copy command to mutable buffer (DoCommand modifies it)
+    char cmd_buffer[CMD_MAXLINE];
+    strncpy(cmd_buffer, command.c_str(), CMD_MAXLINE - 1);
+    cmd_buffer[CMD_MAXLINE - 1] = 0;
+
+    // Execute through the same shell parser used by the interactive prompt so
+    // redirection, piping, batch files, and external programs all follow normal
+    // DOS shell semantics. If bp_on_load is active and an external program is
+    // loaded, DEBUG_Socket_NotifyBreakpoint will be called before this returns.
+    first_shell->ParseLine(cmd_buffer);
+
+    // If a bp_on_load breakpoint was hit, the notification was already sent
+    // and execution stopped. Don't send a duplicate response.
+    if (g_exec_breakpoint_pending) {
+        g_exec_breakpoint_pending = false;
+        // Response already sent by DEBUG_Socket_NotifyBreakpoint
+        return;
+    }
+
+    // Capture results
+    uint16_t errorcode = dos.errorcode;
+    uint8_t return_code = dos.return_code;
+
+    // Build response
+    send_ok(json_str("msg", "Command executed") + "," +
+            json_num("errorcode", errorcode) + "," +
+            json_num("return_code", return_code) + "," +
+            json_str("command", command));
+}
+
+static uint16_t bios_keycode_for_ascii(char c) {
+    static const uint8_t scancodes[128] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0E, 0x0F, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x39, 0x02, 0x28, 0x04, 0x05, 0x06, 0x08, 0x28,
+        0x0A, 0x0B, 0x09, 0x0D, 0x33, 0x0C, 0x34, 0x35,
+        0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x27, 0x27, 0x33, 0x0D, 0x34, 0x35,
+        0x03, 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22,
+        0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
+        0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11,
+        0x2D, 0x15, 0x2C, 0x1A, 0x2B, 0x1B, 0x07, 0x0C,
+        0x29, 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22,
+        0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
+        0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11,
+        0x2D, 0x15, 0x2C, 0x1A, 0x2B, 0x1B, 0x29, 0x00
+    };
+
+    const uint8_t ascii = (uint8_t)c;
+    if (ascii < 128 && scancodes[ascii] != 0) {
+        return ((uint16_t)scancodes[ascii] << 8) | ascii;
+    }
+
+    return ascii;
+}
+
+static bool socket_cpu_running(void) {
+    return !socket_freeze_loop_active && (IsDebuggerRunNormal() || IsDebuggerRunwatch());
+}
+
+static std::string socket_state_fields(void) {
+    const bool debugger_runwatch = IsDebuggerRunwatch();
+    const bool debugger_runnormal = IsDebuggerRunNormal();
+    const bool frozen = socket_freeze_loop_active;
+    const bool cpu_running = socket_cpu_running();
+    std::string state = cpu_running ? "running" : "stopped";
+    return json_str("state", state) + "," +
+           json_bool("cpuRunning", cpu_running) + "," +
+           json_bool("socketFrozen", frozen) + "," +
+           json_bool("socketFreezeRequested", socket_freeze_wait) + "," +
+           json_bool("debuggerFrozen", frozen || (!debugger_runwatch && !debugger_runnormal)) + "," +
+           json_bool("debuggerRunwatch", debugger_runwatch) + "," +
+           json_bool("debuggerRunnormal", debugger_runnormal) + "," +
+           json_bool("normalCoreHooksActive", debug_socket_normal_core_hooks_active != 0) + "," +
+           json_bool("shellReady", first_shell != nullptr);
+}
+
 static void send_and_latch_stop(const std::string& json) {
     last_stop_event_json = json;
     send_response(json);
+}
+
+static void send_and_latch_fault_stop(const std::string& json) {
+    last_stop_event_json = json;
+    last_fault_stop_event_json = json;
+    send_response(json);
+}
+
+static bool latched_stop_blocks_dos_command(void) {
+    if (!last_fault_stop_event_json.empty()) return true;
+    if (last_stop_event_json.empty()) return false;
+
+    // With breakOnExit disabled, process_exit is an async notification latched
+    // for clients to poll; it is not a sticky debugger stop and must not block
+    // issuing the next shell command from an idle prompt.
+    return last_stop_event_json.find("\"event\":\"process_exit\"") == std::string::npos;
+}
+
+static std::string load_info_json_value() {
+    std::ostringstream ss;
+    ss << "{"
+       << json_str("program", last_load_info.program) << ","
+       << json_bool("isCom", last_load_info.is_com) << ","
+       << json_num("pspSeg", last_load_info.psp_seg) << ","
+       << json_num("loadSeg", last_load_info.load_seg) << ","
+       << json_num("loadLinear", (uint32_t)last_load_info.load_seg << 4u) << ","
+       << json_num("entryCS", last_load_info.entry_cs) << ","
+       << json_num("entryIP", last_load_info.entry_ip) << ","
+       << json_num("entryLinear", ((uint32_t)last_load_info.entry_cs << 4u) + last_load_info.entry_ip) << ","
+       << json_num("initialSS", last_load_info.initial_ss) << ","
+       << json_num("initialSP", last_load_info.initial_sp) << ","
+       << json_num("initialStackLinear", ((uint32_t)last_load_info.initial_ss << 4u) + last_load_info.initial_sp) << ","
+       << json_num("imageSizeBytes", last_load_info.image_size_bytes) << ","
+       << json_num("imageEndLinear", ((uint32_t)last_load_info.load_seg << 4u) + last_load_info.image_size_bytes);
+
+    if (!last_load_info.is_com) {
+        ss << ","
+           << json_num("mzSignature", last_load_info.mz_signature) << ","
+           << json_num("mzExtraBytes", last_load_info.mz_extra_bytes) << ","
+           << json_num("mzPages", last_load_info.mz_pages) << ","
+           << json_num("headerParagraphs", last_load_info.header_paragraphs) << ","
+           << json_num("headerBytes", (uint32_t)last_load_info.header_paragraphs << 4u) << ","
+           << json_num("relocationCount", last_load_info.relocation_count) << ","
+           << json_num("relocationTableOffset", last_load_info.relocation_table_offset) << ","
+           << json_num("initCS", last_load_info.init_cs) << ","
+           << json_num("initIP", last_load_info.init_ip) << ","
+           << json_num("initSS", last_load_info.init_ss) << ","
+           << json_num("initSP", last_load_info.init_sp) << ","
+           << json_num("checksum", last_load_info.checksum) << ","
+           << json_num("overlay", last_load_info.overlay) << ","
+           << json_num("minAlloc", last_load_info.min_alloc) << ","
+           << json_num("maxAlloc", last_load_info.max_alloc);
+    }
+
+    ss << "}";
+    return ss.str();
+}
+
+static std::string load_info_json_field() {
+    return "\"loadInfo\":" + load_info_json_value();
+}
+
+static uint32_t current_linear_pc(void) {
+    return (uint32_t)(SegPhys(SegNames::cs) + reg_eip);
+}
+
+static ReverseCpuState reverse_capture_cpu(void) {
+    FillFlags();
+    ReverseCpuState state;
+    state.eax = reg_eax;
+    state.ebx = reg_ebx;
+    state.ecx = reg_ecx;
+    state.edx = reg_edx;
+    state.esi = reg_esi;
+    state.edi = reg_edi;
+    state.ebp = reg_ebp;
+    state.esp = reg_esp;
+    state.eip = reg_eip;
+    state.flags = reg_flags;
+    for (int i = 0; i < 8; i++) {
+        state.seg_val[i] = Segs.val[i];
+        state.seg_phys[i] = Segs.phys[i];
+        state.seg_limit[i] = Segs.limit[i];
+        state.seg_expanddown[i] = Segs.expanddown[i];
+    }
+    state.cpl = cpu.cpl;
+    state.mpl = cpu.mpl;
+    state.cr0 = cpu.cr0;
+    state.cr4 = cpu.cr4;
+    state.pmode = cpu.pmode;
+    state.code_big = cpu.code.big;
+    state.stack_big = cpu.stack.big;
+    state.stack_mask = cpu.stack.mask;
+    state.stack_notmask = cpu.stack.notmask;
+    state.direction = cpu.direction;
+    state.trap_skip = cpu.trap_skip;
+    state.paging_enabled = paging.enabled;
+    state.paging_wp = paging.wp;
+    state.paging_cr2 = paging.cr2;
+    state.paging_cr3 = paging.cr3;
+    state.paging_base_page = paging.base.page;
+    state.paging_base_addr = paging.base.addr;
+    return state;
+}
+
+static void reverse_restore_cpu(const ReverseCpuState& state) {
+    reg_eax = state.eax;
+    reg_ebx = state.ebx;
+    reg_ecx = state.ecx;
+    reg_edx = state.edx;
+    reg_esi = state.esi;
+    reg_edi = state.edi;
+    reg_ebp = state.ebp;
+    reg_esp = state.esp;
+    reg_eip = state.eip;
+    reg_flags = state.flags | 2u;
+    for (int i = 0; i < 8; i++) {
+        Segs.val[i] = state.seg_val[i];
+        Segs.phys[i] = state.seg_phys[i];
+        Segs.limit[i] = state.seg_limit[i];
+        Segs.expanddown[i] = state.seg_expanddown[i];
+    }
+    cpu.cpl = state.cpl;
+    cpu.mpl = state.mpl;
+    cpu.cr0 = state.cr0;
+    cpu.cr4 = state.cr4;
+    cpu.pmode = state.pmode;
+    cpu.code.big = state.code_big;
+    cpu.stack.big = state.stack_big;
+    cpu.stack.mask = state.stack_mask;
+    cpu.stack.notmask = state.stack_notmask;
+    cpu.direction = state.direction;
+    cpu.trap_skip = state.trap_skip;
+    paging.enabled = state.paging_enabled;
+    paging.wp = state.paging_wp;
+    paging.cr2 = state.paging_cr2;
+    paging.cr3 = state.paging_cr3;
+    paging.base.page = state.paging_base_page;
+    paging.base.addr = state.paging_base_addr;
+    PAGING_ClearTLB();
+}
+
+static ReverseCheckpoint reverse_make_checkpoint(uint32_t from_cs = 0, uint32_t from_linear = 0) {
+    ReverseCheckpoint checkpoint;
+    checkpoint.id = reverse_next_checkpoint_id++;
+    checkpoint.cpu = reverse_capture_cpu();
+    checkpoint.cs = SegValue(SegNames::cs);
+    checkpoint.eip = reg_eip;
+    checkpoint.linear = current_linear_pc();
+    checkpoint.from_cs = from_cs;
+    checkpoint.from_linear = from_linear;
+    return checkpoint;
+}
+
+static void reverse_discard_future_if_needed(void) {
+    if (!reverse_trace_enabled || reverse_checkpoints.empty()) return;
+    if (reverse_cursor + 1 >= reverse_checkpoints.size()) return;
+    reverse_checkpoints[reverse_cursor].deltas.clear();
+    reverse_checkpoints[reverse_cursor].delta_overflow = false;
+    reverse_checkpoints[reverse_cursor].dropped_writes = 0;
+    reverse_checkpoints.erase(reverse_checkpoints.begin() + (long)(reverse_cursor + 1), reverse_checkpoints.end());
+}
+
+static void reverse_prune_old_checkpoints(void) {
+    while (reverse_checkpoints.size() > reverse_max_checkpoints) {
+        reverse_checkpoints.erase(reverse_checkpoints.begin());
+        if (reverse_cursor > 0) reverse_cursor--;
+    }
+}
+
+static void reverse_reset(size_t max_checkpoints) {
+    reverse_trace_enabled = false;
+    debug_reverse_trace_active = 0;
+    reverse_applying_delta = false;
+    reverse_total_dropped_writes = 0;
+    reverse_next_checkpoint_id = 1;
+    reverse_max_checkpoints = std::max(REVERSE_MIN_CHECKPOINTS,
+        std::min(max_checkpoints, REVERSE_MAX_CHECKPOINTS));
+    reverse_cursor = 0;
+    reverse_checkpoints.clear();
+}
+
+static void clear_socket_debug_session_state(bool preserve_exit_policy) {
+    socket_freeze_wait = false;
+    socket_freeze_loop_active = false;
+    socket_step_arm = 0;
+    linear_exec_breakpoints.clear();
+    last_stop_event_json.clear();
+    last_fault_stop_event_json.clear();
+    last_exception_num = 0xFF;
+    last_exception_error = 0;
+    last_load_info = DebugSocketLoadInfo();
+
+    for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+        watchpoints[i] = DebugWatchpoint();
+    }
+    debug_watchpoint_count = 0;
+    watchpoint_pending_freeze = false;
+    watchpoint_hit_context = WatchpointHit();
+
+    catch_exceptions_armed = false;
+    for (int i = 0; i < 32; i++) catch_exceptions_vectors[i] = false;
+    catch_exceptions_skip_count = 0;
+    catch_exceptions_cr2_ignore.clear();
+
+    branch_trace_enabled = false;
+    branch_ring_head = 0;
+    branch_ring_count = 0;
+    reverse_reset(reverse_max_checkpoints);
+
+    CBreakpoint::DeleteAll();
+
+    if (!preserve_exit_policy) {
+        break_on_exit = false;
+    }
+    last_process_exit = ProcessExitInfo();
+}
+
+static void reverse_record_checkpoint(uint32_t from_cs, uint32_t from_linear) {
+    if (!reverse_trace_enabled || reverse_mode != REVERSE_CHECKPOINT_BRANCH) return;
+    reverse_discard_future_if_needed();
+    reverse_checkpoints.push_back(reverse_make_checkpoint(from_cs, from_linear));
+    reverse_cursor = reverse_checkpoints.empty() ? 0 : reverse_checkpoints.size() - 1;
+    reverse_prune_old_checkpoints();
+}
+
+void DEBUG_Socket_ReverseInstructionCheckpoint(void) {
+    if (!reverse_trace_enabled || reverse_mode != REVERSE_CHECKPOINT_INSTRUCTION) return;
+    reverse_discard_future_if_needed();
+    if (!reverse_checkpoints.empty() &&
+        reverse_checkpoints[reverse_cursor].linear == current_linear_pc() &&
+        reverse_checkpoints[reverse_cursor].cs == SegValue(SegNames::cs) &&
+        reverse_checkpoints[reverse_cursor].eip == reg_eip) {
+        return;
+    }
+    reverse_checkpoints.push_back(reverse_make_checkpoint(SegValue(SegNames::cs), current_linear_pc()));
+    reverse_cursor = reverse_checkpoints.empty() ? 0 : reverse_checkpoints.size() - 1;
+    reverse_prune_old_checkpoints();
+}
+
+static std::string reverse_checkpoint_json(const ReverseCheckpoint& checkpoint,
+                                           size_t index,
+                                           bool current,
+                                           bool newest) {
+    std::ostringstream ss;
+    ss << "{"
+       << json_num("index", (long long)index) << ","
+       << json_num("checkpoint_id", (long long)checkpoint.id) << ","
+       << json_bool("current", current) << ","
+       << json_bool("newest", newest) << ","
+       << json_num("CS", checkpoint.cs) << ","
+       << json_hex("EIP", checkpoint.eip) << ","
+       << json_hex("linear", checkpoint.linear) << ","
+       << json_num("deltaBytesToNext", (long long)checkpoint.deltas.size()) << ","
+       << json_bool("deltaOverflowToNext", checkpoint.delta_overflow) << ","
+       << json_num("droppedWritesToNext", (long long)checkpoint.dropped_writes) << ","
+       << json_hex("firstDeltaLinear", checkpoint.deltas.empty() ? 0 : checkpoint.deltas.front().linear) << ","
+       << json_hex("lastDeltaLinear", checkpoint.deltas.empty() ? 0 : checkpoint.deltas.back().linear) << ","
+       << json_num("from_cs", checkpoint.from_cs) << ","
+       << json_hex("from_linear", checkpoint.from_linear)
+       << "}";
+    return ss.str();
+}
+
+static std::string reverse_status_fields(void) {
+    std::ostringstream ss;
+    const bool has_current = reverse_trace_enabled && !reverse_checkpoints.empty();
+    ss << json_bool("enabled", reverse_trace_enabled) << ","
+       << json_str("mode", reverse_mode == REVERSE_CHECKPOINT_BRANCH ? "branch" : "instruction") << ","
+       << json_num("max_checkpoints", (long long)reverse_max_checkpoints) << ","
+       << json_num("count", (long long)reverse_checkpoints.size()) << ","
+       << json_num("cursor_index", has_current ? (long long)reverse_cursor : -1) << ","
+       << json_bool("hasForwardHistory", has_current && reverse_cursor + 1 < reverse_checkpoints.size()) << ","
+       << json_num("newest_index", reverse_checkpoints.empty() ? -1 : (long long)(reverse_checkpoints.size() - 1)) << ","
+       << json_num("totalDroppedWrites", (long long)reverse_total_dropped_writes) << ","
+       << json_str("limitations",
+                   "Best-effort CPU + RAM rollback. Device/DMA/direct physical writes, timers, PIC/PIT/audio/video device state, host I/O, and non-memory side effects are not rolled back.");
+    if (has_current) {
+        const ReverseCheckpoint& cur = reverse_checkpoints[reverse_cursor];
+        const ReverseCheckpoint& newest = reverse_checkpoints.back();
+        ss << ","
+           << json_num("checkpoint_id", (long long)cur.id) << ","
+           << json_num("newest_checkpoint_id", (long long)newest.id) << ","
+           << json_num("CS", cur.cs) << ","
+           << json_hex("EIP", cur.eip) << ","
+           << json_hex("linear", cur.linear);
+    }
+    return ss.str();
+}
+
+static bool reverse_interval_is_reversible(size_t interval, std::string& error) {
+    if (interval >= reverse_checkpoints.size()) {
+        error = "Invalid checkpoint interval";
+        return false;
+    }
+    const ReverseCheckpoint& checkpoint = reverse_checkpoints[interval];
+    if (checkpoint.delta_overflow) {
+        std::ostringstream ss;
+        ss << "Checkpoint interval " << (long long)checkpoint.id
+           << " overflowed; rollback/forward would be incomplete";
+        error = ss.str();
+        return false;
+    }
+    return true;
+}
+
+static bool reverse_can_navigate_to(size_t target, std::string& error) {
+    if (reverse_checkpoints.empty()) {
+        error = "Reverse trace has no checkpoints";
+        return false;
+    }
+    if (target >= reverse_checkpoints.size()) {
+        error = "Target checkpoint is outside retained history";
+        return false;
+    }
+    if (target < reverse_cursor) {
+        for (size_t i = target; i < reverse_cursor; i++) {
+            if (!reverse_interval_is_reversible(i, error)) return false;
+        }
+    } else {
+        for (size_t i = reverse_cursor; i < target; i++) {
+            if (!reverse_interval_is_reversible(i, error)) return false;
+        }
+    }
+    return true;
+}
+
+static bool reverse_require_navigation_stopped(void) {
+    if (socket_freeze_loop_active) return true;
+    send_error("CPU must be stopped in the socket freeze loop before reverse navigation; set a socket breakpoint/watchpoint or break at program entry first");
+    return false;
+}
+
+static void reverse_apply_interval(size_t interval, bool forward) {
+    const std::vector<ReverseMemDelta>& deltas = reverse_checkpoints[interval].deltas;
+    reverse_applying_delta = true;
+    if (forward) {
+        for (const ReverseMemDelta& delta : deltas) {
+            physdev_writeb((PhysPt64)delta.physical, delta.new_value);
+        }
+    } else {
+        for (auto it = deltas.rbegin(); it != deltas.rend(); ++it) {
+            physdev_writeb((PhysPt64)it->physical, it->old_value);
+        }
+    }
+    reverse_applying_delta = false;
+}
+
+static std::string reverse_navigation_fields(const char* op, size_t old_cursor) {
+    const ReverseCheckpoint& cur = reverse_checkpoints[reverse_cursor];
+    const ReverseCheckpoint& newest = reverse_checkpoints.back();
+    std::ostringstream ss;
+    ss << json_str("op", op) << ","
+       << json_num("checkpoint_id", (long long)cur.id) << ","
+       << json_num("cursor_index", (long long)reverse_cursor) << ","
+       << json_num("previous_cursor_index", (long long)old_cursor) << ","
+       << json_num("newest_index", (long long)(reverse_checkpoints.size() - 1)) << ","
+       << json_num("newest_checkpoint_id", (long long)newest.id) << ","
+       << json_bool("hasForwardHistory", reverse_cursor + 1 < reverse_checkpoints.size()) << ","
+       << json_num("CS", cur.cs) << ","
+       << json_hex("EIP", cur.eip) << ","
+       << json_hex("linear", cur.linear);
+    return ss.str();
+}
+
+static bool reverse_navigate_to(size_t target, const char* op) {
+    if (!reverse_trace_enabled) {
+        send_error("reverse_trace is not enabled");
+        return false;
+    }
+    std::string error;
+    if (!reverse_can_navigate_to(target, error)) {
+        send_error(error.c_str());
+        return false;
+    }
+    const size_t old_cursor = reverse_cursor;
+    while (reverse_cursor > target) {
+        reverse_apply_interval(reverse_cursor - 1, false);
+        reverse_cursor--;
+    }
+    while (reverse_cursor < target) {
+        reverse_apply_interval(reverse_cursor, true);
+        reverse_cursor++;
+    }
+    reverse_restore_cpu(reverse_checkpoints[reverse_cursor].cpu);
+    send_ok(reverse_navigation_fields(op, old_cursor));
+    return true;
+}
+
+static bool load_info_matches_entry(uint16_t seg, uint32_t off) {
+    return last_load_info.valid &&
+           last_load_info.entry_cs == seg &&
+           last_load_info.entry_ip == (off & 0xFFFFu);
+}
+
+void DEBUG_Socket_RecordLoadInfo(const char* program,
+                                 bool isCom,
+                                 uint16_t pspSeg,
+                                 uint16_t loadSeg,
+                                 uint16_t entryCS,
+                                 uint16_t entryIP,
+                                 uint16_t initialSS,
+                                 uint16_t initialSP,
+                                 uint32_t imageSizeBytes,
+                                 uint16_t mzSignature,
+                                 uint16_t mzExtraBytes,
+                                 uint16_t mzPages,
+                                 uint16_t headerParagraphs,
+                                 uint16_t relocationCount,
+                                 uint16_t relocationTableOffset,
+                                 uint16_t initCS,
+                                 uint16_t initIP,
+                                 uint16_t initSS,
+                                 uint16_t initSP,
+                                 uint16_t checksum,
+                                 uint16_t overlay,
+                                 uint16_t minAlloc,
+                                 uint16_t maxAlloc) {
+    last_load_info.valid = true;
+    // DOS_Execute receives the path string DOS used. It may be relative or a
+    // shell-resolved fallback, so clients should treat it as a display hint.
+    last_load_info.program = program ? program : "";
+    last_load_info.is_com = isCom;
+    last_load_info.psp_seg = pspSeg;
+    last_load_info.load_seg = loadSeg;
+    last_load_info.entry_cs = entryCS;
+    last_load_info.entry_ip = entryIP;
+    last_load_info.initial_ss = initialSS;
+    last_load_info.initial_sp = initialSP;
+    last_load_info.image_size_bytes = imageSizeBytes;
+    last_load_info.mz_signature = mzSignature;
+    last_load_info.mz_extra_bytes = mzExtraBytes;
+    last_load_info.mz_pages = mzPages;
+    last_load_info.header_paragraphs = headerParagraphs;
+    last_load_info.relocation_count = relocationCount;
+    last_load_info.relocation_table_offset = relocationTableOffset;
+    last_load_info.init_cs = initCS;
+    last_load_info.init_ip = initIP;
+    last_load_info.init_ss = initSS;
+    last_load_info.init_sp = initSP;
+    last_load_info.checksum = checksum;
+    last_load_info.overlay = overlay;
+    last_load_info.min_alloc = minAlloc;
+    last_load_info.max_alloc = maxAlloc;
+}
+
+// Forward declaration needed by watchpoint/exception implementations below
+static std::string get_registers_json();
+
+// -----------------------------------------------------------------------
+// Watchpoint implementation
+// -----------------------------------------------------------------------
+
+void DEBUG_RecordReverseWrite(uint32_t address, uint32_t size, uint32_t val) {
+    if (!reverse_trace_enabled || reverse_applying_delta || reverse_checkpoints.empty()) return;
+    reverse_discard_future_if_needed();
+
+    ReverseCheckpoint& checkpoint = reverse_checkpoints[reverse_cursor];
+    if (checkpoint.delta_overflow) {
+        checkpoint.dropped_writes += size;
+        reverse_total_dropped_writes += size;
+        return;
+    }
+
+    for (uint32_t i = 0; i < size; i++) {
+        if (checkpoint.deltas.size() >= REVERSE_MAX_DELTAS_PER_INTERVAL) {
+            checkpoint.delta_overflow = true;
+            checkpoint.dropped_writes++;
+            reverse_total_dropped_writes++;
+            continue;
+        }
+
+        const uint32_t linear = address + i;
+        uint32_t physical = 0;
+        uint8_t old_value = 0;
+        if (LinearToPhysical(linear, physical)) {
+            old_value = physdev_readb((PhysPt64)physical);
+        } else {
+            old_value = mem_readb_inline((LinearPt)linear);
+            physical = linear;
+        }
+        const uint8_t new_value = (uint8_t)((val >> (i * 8u)) & 0xFFu);
+
+        auto existing = std::find_if(checkpoint.deltas.begin(), checkpoint.deltas.end(),
+            [linear](const ReverseMemDelta& delta) {
+                return delta.linear == linear;
+            });
+        if (existing != checkpoint.deltas.end()) {
+            existing->new_value = new_value;
+            existing->physical = physical;
+            continue;
+        }
+
+        ReverseMemDelta delta;
+        delta.linear = linear;
+        delta.physical = physical;
+        delta.old_value = old_value;
+        delta.new_value = new_value;
+        checkpoint.deltas.push_back(delta);
+    }
+}
+
+// Called from paging.h mem_writeb/w/d_checked; address=linear, size=1/2/4.
+// Runs inline-hot path — returns immediately when no watchpoints armed.
+void DEBUG_CheckWriteWatch(uint32_t address, uint32_t size, uint32_t val) {
+    for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+        if (!watchpoints[i].active) continue;
+        // Overlap check: [address, address+size) vs [start, end)
+        if (address >= watchpoints[i].end) continue;
+        if ((address + size) <= watchpoints[i].start) continue;
+        // Hit!
+        watchpoints[i].hit_count++;
+        // Read old value before the write completes (read path doesn't go through watchpoint hook)
+        uint32_t old_val = 0;
+        uint8_t  bv = 0;
+        uint16_t wv = 0;
+        uint32_t dv = 0;
+        if (size == 1) {
+            if (!mem_readb_checked(address, &bv)) old_val = bv;
+        } else if (size == 2) {
+            if (!mem_readw_checked(address, &wv)) old_val = wv;
+        } else {
+            if (!mem_readd_checked(address, &dv)) old_val = dv;
+        }
+        watchpoint_hit_context.watch_linear = address;
+        watchpoint_hit_context.old_val      = old_val;
+        watchpoint_hit_context.new_val      = val;
+        watchpoint_hit_context.culprit_cs   = SegValue(cs);
+        watchpoint_hit_context.culprit_eip  = reg_eip;
+        watchpoint_hit_context.size         = size;
+        watchpoint_pending_freeze = true;
+        return;  // only latch the first hit per write
+    }
+}
+
+// Called from core_normal.cpp per-instruction guard; returns true = freeze needed.
+bool DEBUG_Socket_CheckWatchpointFreeze(void) {
+    if (!watchpoint_pending_freeze) return false;
+    watchpoint_pending_freeze = false;
+    if (client_socket >= 0 && !gdb_mode) {
+        uint16_t seg = SegValue(SegNames::cs);
+        uint32_t off = reg_eip;
+        std::ostringstream ss;
+        ss << "{" << json_str("event", "stopped") << ","
+           << json_str("reason", "watchpoint") << ","
+           << json_hex("watch_linear", watchpoint_hit_context.watch_linear) << ","
+           << json_num("watch_size",   (long long)watchpoint_hit_context.size) << ","
+           << json_num("old",          (long long)watchpoint_hit_context.old_val) << ","
+           << json_num("new",          (long long)watchpoint_hit_context.new_val) << ","
+           << json_num("culprit_cs",   (long long)watchpoint_hit_context.culprit_cs) << ","
+           << json_hex("culprit_eip",  watchpoint_hit_context.culprit_eip) << ","
+           << json_hex("linear",       (uint32_t)GetAddress(seg, off)) << ","
+           << get_registers_json() << "}";
+        send_and_latch_stop(ss.str());
+    }
+    return true;
+}
+
+static void rebuild_watchpoint_count() {
+    uint32_t n = 0;
+    for (int i = 0; i < MAX_WATCHPOINTS; i++)
+        if (watchpoints[i].active) n++;
+    debug_watchpoint_count = n;
+}
+
+// -----------------------------------------------------------------------
+// First-chance exception implementation
+// -----------------------------------------------------------------------
+
+bool DEBUG_Socket_IsExceptionVectorCaught(uint8_t which) {
+    if (which >= 32) return false;
+    return catch_exceptions_armed && catch_exceptions_vectors[which];
+}
+
+bool DEBUG_Socket_CheckException(uint8_t which, uint32_t error, bool is_nested) {
+    if (!DEBUG_Socket_IsExceptionVectorCaught(which)) return false;
+
+    // Nested faults for requested vectors always stop (never skip).
+    if (!is_nested) {
+        // Check CR2 ignore ranges for #PF (vec 14)
+        if (which == 14) {
+            uint32_t cr2 = (uint32_t)paging.cr2;
+            for (const auto& r : catch_exceptions_cr2_ignore) {
+                if (cr2 >= r.start && cr2 <= r.end) return false;
+            }
+        }
+
+        // Check skip list
+        for (int i = 0; i < catch_exceptions_skip_count; i++) {
+            if (catch_exceptions_skip_list[i].vec == which &&
+                catch_exceptions_skip_list[i].remaining > 0) {
+                catch_exceptions_skip_list[i].remaining--;
+                return false;
+            }
+        }
+    }
+
+    // Latch context (at write time reg_eip is the faulting EIP)
+    exception_hit_ctx.vec       = which;
+    exception_hit_ctx.error     = error;
+    exception_hit_ctx.cr2       = (uint32_t)paging.cr2;
+    exception_hit_ctx.fault_cs  = SegValue(cs);
+    exception_hit_ctx.fault_eip = reg_eip;
+
+    if (client_socket >= 0 && !gdb_mode) {
+        std::ostringstream ss;
+        ss << "{" << json_str("event", "stopped") << ","
+           << json_str("reason", "exception") << ","
+           << json_num("vector",       (long long)which) << ","
+           << json_num("error_code",   (long long)error) << ","
+           << json_hex("CR2",          exception_hit_ctx.cr2) << ","
+           << json_num("fault_cs",     (long long)exception_hit_ctx.fault_cs) << ","
+           << json_hex("fault_eip",    exception_hit_ctx.fault_eip) << ","
+           << json_bool("is_nested",   is_nested) << ","
+           << json_hex("linear",       (uint32_t)GetAddress(
+                                           exception_hit_ctx.fault_cs,
+                                           exception_hit_ctx.fault_eip)) << ","
+           << get_registers_json() << "}";
+        send_and_latch_stop(ss.str());
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------
+// Process exit events
+// -----------------------------------------------------------------------
+
+void DEBUG_Socket_NotifyProcessExit(uint16_t pspseg, uint8_t exitcode, bool tsr) {
+    last_process_exit.psp       = pspseg;
+    last_process_exit.exit_code = exitcode;
+    last_process_exit.tsr       = tsr;
+    last_process_exit.abnormal  = false;
+    last_process_exit.valid     = true;
+
+    if (client_socket < 0 || gdb_mode) return;
+
+    std::string evt = "{" +
+        json_str("event",     "process_exit") + "," +
+        json_num("exit_code", exitcode) + "," +
+        json_num("psp",       pspseg) + "," +
+        json_bool("tsr",      tsr) + "," +
+        json_bool("abnormal", false) + "}";
+
+    if (break_on_exit) {
+        send_and_latch_stop(evt);
+        DEBUG_Socket_FreezeWait();
+    } else {
+        // Async notification; also latch so MCP can poll
+        last_stop_event_json = evt;
+        send_response(evt);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Branch trace ring
+// -----------------------------------------------------------------------
+
+bool DEBUG_Socket_TraceIsEnabled(void) {
+    return branch_trace_enabled || reverse_trace_enabled;
+}
+
+void DEBUG_Socket_TraceRecordBranch(uint32_t from_cs, uint32_t from_linear,
+                                    uint32_t to_cs,   uint32_t to_linear) {
+    if (branch_trace_enabled) {
+        uint32_t idx = branch_ring_head % BRANCH_RING_SIZE;
+        branch_ring[idx].from_cs     = from_cs;
+        branch_ring[idx].from_linear = from_linear;
+        branch_ring[idx].to_cs       = to_cs;
+        branch_ring[idx].to_linear   = to_linear;
+        branch_ring_head++;
+        if (branch_ring_count < (uint32_t)BRANCH_RING_SIZE) branch_ring_count++;
+    }
+    if (reverse_trace_enabled) {
+        reverse_record_checkpoint(from_cs, from_linear);
+    }
 }
 
 // Get all registers as JSON
@@ -795,9 +1847,6 @@ static void process_gdb_command(const std::string& cmd) {
                     } else if (first_shell == nullptr) {
                         send_gdb_packet("E02");  // Shell not initialized
                     } else {
-                        // Save error state
-                        uint16_t old_errorcode = dos.errorcode;
-                        uint8_t old_return_code = dos.return_code;
                         dos.errorcode = 0;
                         
                         // Execute command
@@ -912,16 +1961,73 @@ static void process_command(const std::string& json) {
     }
 
     if (cmd == "status") {
-        std::string state = IsDebuggerRunwatch() ? "running" : "stopped";
-        send_ok(json_str("state", state) + "," + json_num("port", socket_port));
+        std::string extra = socket_state_fields() + "," +
+                json_num("port", socket_port) + "," +
+                json_bool("hasLastStop", !last_stop_event_json.empty()) + "," +
+                json_bool("hasLastFaultStop", !last_fault_stop_event_json.empty()) + "," +
+                json_bool("hasLastExit", last_process_exit.valid) + "," +
+                json_bool("shellCommandPending", DOS_Shell_HasQueuedCommandFromDebugger()) + "," +
+                json_num("shellCommandsQueued", DOS_Shell_DebuggerCommandsQueued()) + "," +
+                json_num("shellCommandWakes", DOS_Shell_DebuggerCommandsWoken()) + "," +
+                json_num("shellCommandsConsumed", DOS_Shell_DebuggerCommandsConsumed()) + "," +
+                json_num("shellCommandsSubmitted", DOS_Shell_DebuggerCommandsSubmitted()) + "," +
+                json_str("shellLastConsumedCommand", DOS_Shell_DebuggerLastConsumedCommand()) + "," +
+                json_str("shellLastSubmittedCommand", DOS_Shell_DebuggerLastSubmittedCommand()) + "," +
+                json_bool("catchExceptionsArmed", catch_exceptions_armed) + "," +
+                json_bool("traceEnabled", branch_trace_enabled) + "," +
+                json_bool("reverseTraceEnabled", reverse_trace_enabled) + "," +
+                json_num("reverseCheckpointCount", (long long)reverse_checkpoints.size()) + "," +
+                json_num("reverseCursorIndex", reverse_trace_enabled && !reverse_checkpoints.empty() ? (long long)reverse_cursor : -1) + "," +
+                json_bool("reverseHasForwardHistory", reverse_trace_enabled && !reverse_checkpoints.empty() && reverse_cursor + 1 < reverse_checkpoints.size()) + "," +
+                json_num("watchpointCount", (long long)debug_watchpoint_count) + "," +
+                json_bool("breakOnExit", break_on_exit);
+        if (last_process_exit.valid) {
+            extra += "," +
+                json_num("lastExitCode", last_process_exit.exit_code) + "," +
+                json_num("lastExitPsp",  last_process_exit.psp);
+        }
+        send_ok(extra);
+        return;
+    }
+
+    if (cmd == "reset" || cmd == "machine_reset") {
+        long long preserve_exit_policy = 0;
+        json_get_int(json, "preserveExitPolicy", preserve_exit_policy);
+        send_ok(json_str("msg", "Machine reset requested") + "," +
+                json_str("method", "On_Software_CPU_Reset") + "," +
+                json_bool("socketPreserved", true) + "," +
+                json_bool("debugStateCleared", true));
+        clear_socket_debug_session_state(preserve_exit_policy != 0);
+        On_Software_CPU_Reset();
+        return;
+    }
+
+    if (cmd == "clear_debug_state") {
+        long long preserve_exit_policy = 0;
+        json_get_int(json, "preserveExitPolicy", preserve_exit_policy);
+        clear_socket_debug_session_state(preserve_exit_policy != 0);
+        send_ok(json_str("msg", "Socket debug state cleared") + "," +
+                json_bool("debugStateCleared", true) + "," +
+                socket_state_fields());
         return;
     }
 
     if (cmd == "last_stop") {
         if (!last_stop_event_json.empty()) {
             send_response(last_stop_event_json);
+        } else if (!last_fault_stop_event_json.empty()) {
+            send_response(last_fault_stop_event_json);
         } else {
             send_error("No latched stop event");
+        }
+        return;
+    }
+
+    if (cmd == "get_load_info") {
+        if (last_load_info.valid) {
+            send_ok(json_bool("available", true) + "," + load_info_json_field());
+        } else {
+            send_ok(json_bool("available", false));
         }
         return;
     }
@@ -942,12 +2048,13 @@ static void process_command(const std::string& json) {
             // freeze; the original core invocation resumes transparently. Do
             // NOT run the RUN trampoline / swap loops / touch cycles.
             last_stop_event_json.clear();
+            last_fault_stop_event_json.clear();
             socket_freeze_wait = false;
             send_ok(json_str("msg", "Continuing"));
         } else if (!IsDebuggerRunwatch()) {
             last_stop_event_json.clear();
-            char runcmd[] = "RUN";
-            ParseCommand(runcmd);
+            last_fault_stop_event_json.clear();
+            DEBUG_ResumeNormalFromSocket();
             send_ok(json_str("msg", "Continuing"));
         } else {
             send_ok(json_str("msg", "Already running"));
@@ -1240,7 +2347,7 @@ static void process_command(const std::string& json) {
             send_error("Missing 'len'");
             return;
         }
-        if (len > 4096) len = 4096; // Limit
+        if (len > 65536) len = 65536; // Limit
         
         PhysPt addr;
         // Check for linear address first, then seg:off
@@ -1265,6 +2372,72 @@ static void process_command(const std::string& json) {
             }
         }
         send_ok(json_str("data", hex));
+        return;
+    }
+
+    if (cmd == "alloc_trace") {
+        std::string op, path;
+        json_get_string(json, "op", op);
+        if (op == "stop") {
+            if (alloc_trace_fp) { fclose(alloc_trace_fp); alloc_trace_fp = NULL; }
+            send_ok(json_num("events", alloc_trace_n));
+            return;
+        }
+        if (!json_get_string(json, "file", path) || path.empty()) {
+            send_error("Missing 'file'");
+            return;
+        }
+        if (alloc_trace_fp) { fclose(alloc_trace_fp); alloc_trace_fp = NULL; }
+        alloc_trace_fp = fopen(path.c_str(), "w");
+        if (!alloc_trace_fp) { send_error("Could not open 'file' for writing"); return; }
+        alloc_trace_n = 0;
+        send_ok(json_str("file", path));
+        return;
+    }
+
+    if (cmd == "mem_dump") {
+        long long seg, off, len, addr_linear;
+        std::string path;
+        if (!json_get_int(json, "len", len) || len <= 0) {
+            send_error("Missing or bad 'len'");
+            return;
+        }
+        if (!json_get_string(json, "file", path) || path.empty()) {
+            send_error("Missing 'file'");
+            return;
+        }
+
+        PhysPt addr;
+        if (json_get_int(json, "addr", addr_linear)) {
+            addr = (PhysPt)addr_linear;
+        } else if (json_get_int(json, "seg", seg) && json_get_int(json, "off", off)) {
+            addr = ((uint32_t)seg << 4) + (uint32_t)off;
+        } else {
+            send_error("Need 'addr' (linear) or 'seg'+'off'");
+            return;
+        }
+
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+            send_error("Could not open 'file' for writing");
+            return;
+        }
+
+        /* Unreadable bytes are written as 0x00 and counted, rather than
+           aborting: a dump straddling an unmapped page is still worth
+           having, and the count says how much of it to distrust. */
+        long long unreadable = 0;
+        for (long long i = 0; i < len; i++) {
+            uint8_t val;
+            if (mem_readb_checked(addr + (PhysPt)i, &val)) { val = 0; unreadable++; }
+            fputc(val, f);
+        }
+        fclose(f);
+
+        send_ok(json_str("file", path) + "," +
+                json_num("bytes", len) + "," +
+                json_num("unreadable", unreadable) + "," +
+                json_hex("linear", (uint32_t)addr));
         return;
     }
 
@@ -1470,8 +2643,17 @@ static void process_command(const std::string& json) {
     if (cmd == "screenshot") {
         // Trigger screenshot capture
         extern void CAPTURE_ScreenShotEvent(bool pressed);
+        extern std::string capture_screenshot_override_path;
+        extern std::string GetCaptureFilePath(const char * type,const char * ext);
+        std::string path;
+        if (json_get_string(json, "path", path)) {
+            capture_screenshot_override_path = path;
+        } else {
+            path = GetCaptureFilePath("Screenshot", ".png");
+        }
         CAPTURE_ScreenShotEvent(true);
-        send_ok(json_str("msg", "Screenshot triggered - check capture folder"));
+        send_ok(json_str("msg", "Screenshot triggered") + "," +
+                json_str("path", path));
         return;
     }
 
@@ -1524,9 +2706,11 @@ static void process_command(const std::string& json) {
         //   addr: start linear address
         //   len: length to search
         //   pattern: hex string of bytes to find (e.g., "CD21" for INT 21h)
+        //   mask: optional hex string same length as pattern; "00" byte = wildcard
+        //   align: optional alignment (1=any, 2=word, 4=dword, etc.)
         //   max_results: optional, default 100
-        long long start_addr, search_len, max_results;
-        std::string pattern;
+        long long start_addr, search_len, max_results, align;
+        std::string pattern, mask_str;
         
         if (!json_get_int(json, "addr", start_addr)) {
             send_error("Missing 'addr' (start address)");
@@ -1541,6 +2725,7 @@ static void process_command(const std::string& json) {
             return;
         }
         if (!json_get_int(json, "max_results", max_results)) max_results = 100;
+        if (!json_get_int(json, "align", align) || align < 1) align = 1;
         if (max_results > 1000) max_results = 1000;
         if (search_len > 0x10000000) search_len = 0x10000000; // Max 256MB
         
@@ -1561,13 +2746,43 @@ static void process_command(const std::string& json) {
             send_error("Empty pattern");
             return;
         }
+
+        // Parse optional mask
+        std::vector<uint8_t> mask_bytes;
+        bool has_mask = json_get_string(json, "mask", mask_str) && !mask_str.empty();
+        if (has_mask) {
+            if (mask_str.length() != pattern.length()) {
+                send_error("'mask' must be same length as 'pattern'");
+                return;
+            }
+            for (size_t i = 0; i + 1 < mask_str.length(); i += 2) {
+                char hex[3] = {mask_str[i], mask_str[i+1], 0};
+                char* end;
+                unsigned long val = strtoul(hex, &end, 16);
+                if (*end != 0) {
+                    send_error("Invalid hex mask");
+                    return;
+                }
+                mask_bytes.push_back((uint8_t)val);
+            }
+        }
         
         // Search for pattern
         std::string results = "\"matches\":[";
         bool first = true;
         long long found_count = 0;
         PhysPt addr = (PhysPt)start_addr;
-        PhysPt end_addr = addr + (PhysPt)search_len - pattern_bytes.size();
+        // Align start address if requested
+        if (align > 1) {
+            addr = (addr + (PhysPt)(align - 1)) & ~(PhysPt)(align - 1);
+        }
+        PhysPt end_addr = (PhysPt)start_addr + (PhysPt)search_len;
+        if (pattern_bytes.size() <= (size_t)search_len)
+            end_addr = (PhysPt)start_addr + (PhysPt)search_len - pattern_bytes.size();
+        else
+            end_addr = addr - 1; // empty range
+
+        PhysPt step = (align > 1) ? (PhysPt)align : 1;
         
         while (addr <= end_addr && found_count < max_results) {
             bool match = true;
@@ -1575,8 +2790,15 @@ static void process_command(const std::string& json) {
                 uint8_t val;
                 if (mem_readb_checked(addr + i, &val)) {
                     match = false;
-                } else if (val != pattern_bytes[i]) {
-                    match = false;
+                } else {
+                    uint8_t effective_val     = val;
+                    uint8_t effective_pattern = pattern_bytes[i];
+                    if (has_mask && i < mask_bytes.size()) {
+                        uint8_t m = mask_bytes[i];
+                        effective_val     &= m;
+                        effective_pattern &= m;
+                    }
+                    if (effective_val != effective_pattern) match = false;
                 }
             }
             
@@ -1588,9 +2810,10 @@ static void process_command(const std::string& json) {
                 snprintf(addr_str, sizeof(addr_str), "%08X", (uint32_t)addr);
                 results += "\"" + std::string(addr_str) + "\"";
                 found_count++;
-                addr += pattern_bytes.size(); // Skip past this match
+                addr += (PhysPt)(pattern_bytes.size() > (size_t)step
+                                  ? pattern_bytes.size() : (size_t)step);
             } else {
-                addr++;
+                addr += step;
             }
         }
         results += "]";
@@ -1599,7 +2822,9 @@ static void process_command(const std::string& json) {
                 json_num("count", found_count) + "," +
                 json_hex("start", (uint32_t)start_addr) + "," +
                 json_num("searched", search_len) + "," +
-                json_str("pattern", pattern));
+                json_str("pattern", pattern) + "," +
+                json_bool("has_mask", has_mask) + "," +
+                json_num("align", align));
         return;
     }
 
@@ -1801,6 +3026,29 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    if (cmd == "wait_for_shell") {
+        long long timeout_ms = 0;
+        json_get_int(json, "timeoutMs", timeout_ms);
+        if (timeout_ms < 0) timeout_ms = 0;
+        if (timeout_ms > 5000) timeout_ms = 5000;
+
+        const long long sleep_us = 10000;
+        long long waited_ms = 0;
+        while (first_shell == nullptr && waited_ms < timeout_ms) {
+            GFX_Events();
+            usleep((useconds_t)sleep_us);
+            waited_ms += sleep_us / 1000;
+        }
+
+        if (first_shell == nullptr) {
+            send_error("Shell not initialized; retry wait_for_shell or poll status.shellReady before dos_cmd");
+            return;
+        }
+
+        send_ok(json_bool("shellReady", true) + "," + json_num("waitedMs", waited_ms));
+        return;
+    }
+
     if (cmd == "dos_cmd" || cmd == "exec") {
         // Execute a DOS command directly via the shell
         // This bypasses keyboard buffer and executes immediately
@@ -1821,49 +3069,35 @@ static void process_command(const std::string& json) {
         
         // Check if shell is available
         if (first_shell == nullptr) {
-            send_error("Shell not initialized");
+            send_error("Shell not initialized; call wait_for_shell or poll status.shellReady before dos_cmd");
             return;
         }
-        
-        // Save current error state
-        uint16_t old_errorcode = dos.errorcode;
-        uint8_t old_return_code = dos.return_code;
-        
-        // Clear error state before execution
-        dos.errorcode = 0;
-        
-        // Clear pending breakpoint flag - if bp_on_load triggers,
-        // DEBUG_Socket_NotifyBreakpoint will send the event
-        g_exec_breakpoint_pending = false;
-        
-        // Copy command to mutable buffer (DoCommand modifies it)
-        char cmd_buffer[CMD_MAXLINE];
-        strncpy(cmd_buffer, command.c_str(), CMD_MAXLINE - 1);
-        cmd_buffer[CMD_MAXLINE - 1] = 0;
-        
-        // Execute via shell - this is what DOSBox uses internally for -c option
-        // If bp_on_load is active and an external program is loaded,
-        // DEBUG_Socket_NotifyBreakpoint will be called and the breakpoint
-        // event will be sent BEFORE this function returns.
-        first_shell->DoCommand(cmd_buffer);
-        
-        // If a bp_on_load breakpoint was hit, the notification was already sent
-        // and execution stopped. Don't send a duplicate response.
-        if (g_exec_breakpoint_pending) {
-            g_exec_breakpoint_pending = false;
-            // Response already sent by DEBUG_Socket_NotifyBreakpoint
+
+        if (!IsDebuggerRunwatch() && !IsDebuggerRunNormal()) {
+            if (socket_freeze_wait || socket_freeze_loop_active ||
+                latched_stop_blocks_dos_command()) {
+                send_error("Cannot run DOS command while stopped at a debugger event; continue first");
+                return;
+            }
+
+            // The socket-only debugger parks an otherwise idle DOS prompt in
+            // DEBUG_Loop. Feeding the BIOS keyboard buffer from that state is
+            // not reliable, and re-entering ParseLine from here is unsafe for
+            // external EXE execution. Hand the line to the active InputCommand
+            // call and resume the prompt so the shell executes it in-context.
+            if (!DOS_Shell_QueueCommandFromDebugger(command.c_str())) {
+                send_error("A queued DOS command is still pending");
+                return;
+            }
+            BIOS_AddKeyToBuffer(0x1C0D);
+            DEBUG_ResumeNormalFromSocket();
+            send_ok(json_str("msg", "Command queued for shell execution") + "," +
+                    json_str("command", command) + "," +
+                    json_bool("queuedShellCommand", true));
             return;
         }
-        
-        // Capture results
-        uint16_t errorcode = dos.errorcode;
-        uint8_t return_code = dos.return_code;
-        
-        // Build response
-        send_ok(json_str("msg", "Command executed") + "," +
-                json_num("errorcode", errorcode) + "," +
-                json_num("return_code", return_code) + "," +
-                json_str("command", command));
+
+        execute_dos_command_and_respond(command);
         return;
     }
 
@@ -1903,29 +3137,7 @@ static void process_command(const std::string& json) {
             else if (key == "y") keycode = 0x1579;  // For Y/N prompts
             else if (key == "n") keycode = 0x316E;  // For Y/N prompts
             else if (key.length() == 1) {
-                // Single character
-                char c = key[0];
-                static const uint8_t scancodes[128] = {
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x0E, 0x0F, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-                    0x39, 0x02, 0x28, 0x04, 0x05, 0x06, 0x08, 0x28,
-                    0x0A, 0x0B, 0x09, 0x0D, 0x33, 0x0C, 0x34, 0x35,
-                    0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                    0x09, 0x0A, 0x27, 0x27, 0x33, 0x0D, 0x34, 0x35,
-                    0x03, 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22,
-                    0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
-                    0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11,
-                    0x2D, 0x15, 0x2C, 0x1A, 0x2B, 0x1B, 0x07, 0x0C,
-                    0x29, 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22,
-                    0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
-                    0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11,
-                    0x2D, 0x15, 0x2C, 0x1A, 0x2B, 0x1B, 0x29, 0x00
-                };
-                if (c >= 0 && c < 128) {
-                    keycode = ((uint16_t)scancodes[(int)c] << 8) | (uint8_t)c;
-                }
+                keycode = bios_keycode_for_ascii(key[0]);
             }
             
             if (keycode != 0) {
@@ -1973,13 +3185,21 @@ static void process_command(const std::string& json) {
         if (key == "enter" || key == "return") kbd_key = KBD_enter;
         else if (key == "esc" || key == "escape") kbd_key = KBD_esc;
         else if (key == "space") kbd_key = KBD_space;
-        else if (key == "a") kbd_key = KBD_a;
-        else if (key == "b") kbd_key = KBD_b;
-        else if (key == "c") kbd_key = KBD_c;
-        else if (key == "y") kbd_key = KBD_y;
-        else if (key == "n") kbd_key = KBD_n;
+        else if (key.length() == 1) {
+            static const KBD_KEYS letter_keys[26] = {
+                KBD_a, KBD_b, KBD_c, KBD_d, KBD_e, KBD_f, KBD_g, KBD_h, KBD_i,
+                KBD_j, KBD_k, KBD_l, KBD_m, KBD_n, KBD_o, KBD_p, KBD_q, KBD_r,
+                KBD_s, KBD_t, KBD_u, KBD_v, KBD_w, KBD_x, KBD_y, KBD_z
+            };
+            static const KBD_KEYS digit_keys[10] = {
+                KBD_0, KBD_1, KBD_2, KBD_3, KBD_4, KBD_5, KBD_6, KBD_7, KBD_8, KBD_9
+            };
+            const char c = key[0];
+            if (c >= 'a' && c <= 'z') kbd_key = letter_keys[c - 'a'];
+            else if (c >= '0' && c <= '9') kbd_key = digit_keys[c - '0'];
+        }
         if (kbd_key == KBD_NONE) {
-            send_error("Unknown key name for key_hw");
+            send_error("Unknown key name for key_hw; use enter, esc, space, a-z, or 0-9");
             return;
         }
         // Simulate press then release
@@ -2205,7 +3425,7 @@ static void process_command(const std::string& json) {
             send_error("Missing 'len'");
             return;
         }
-        if (len > 4096) len = 4096;
+        if (len > 65536) len = 65536;
 
         std::string hex;
         for (long long i = 0; i < len; i++) {
@@ -2226,6 +3446,656 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    if (cmd == "mem_write_linear") {
+        // Write to a linear (virtual) address via page-walk + physdev_writeb.
+        // Mirrors mem_read_linear. Raises an error if any page is not present.
+        long long lin_addr;
+        std::string data_hex;
+        if (!json_get_int(json, "addr", lin_addr)) {
+            send_error("Missing 'addr' (linear address)");
+            return;
+        }
+        if (!json_get_string(json, "data", data_hex)) {
+            send_error("Missing 'data' (hex string)");
+            return;
+        }
+        if (data_hex.length() % 2 != 0) {
+            send_error("'data' must be an even-length hex string");
+            return;
+        }
+        long long byte_count = (long long)data_hex.length() / 2;
+        if (byte_count > 65536) {
+            send_error("'data' too long (max 65536 bytes)");
+            return;
+        }
+        for (long long i = 0; i < byte_count; i++) {
+            char hex[3] = {data_hex[i*2], data_hex[i*2+1], 0};
+            char* endp;
+            uint8_t bval = (uint8_t)strtoul(hex, &endp, 16);
+            if (*endp != 0) {
+                send_error("Invalid hex in 'data'");
+                return;
+            }
+            uint32_t phys = 0;
+            if (!LinearToPhysical((uint32_t)(lin_addr + i), phys)) {
+                send_error("Page not present");
+                return;
+            }
+            physdev_writeb((PhysPt64)phys, bval);
+        }
+        send_ok(json_hex("linear_addr", (uint32_t)lin_addr) + "," +
+                json_num("bytes_written", byte_count) + "," +
+                json_bool("paging", paging.enabled));
+        return;
+    }
+
+    if (cmd == "wp_set") {
+        // Set a write watchpoint on a linear address range.
+        // {"cmd":"wp_set","linear":ADDR,"len":N}
+        // Hits are delivered by the normal-core socket hooks; setting the
+        // watchpoint must not depend on the current decoder pointer because
+        // cycles=max can swap decoders after the CPU starts.
+        long long linear, len;
+        if (!json_get_int(json, "linear", linear)) {
+            send_error("Missing 'linear'");
+            return;
+        }
+        if (!json_get_int(json, "len", len) || len <= 0) {
+            send_error("Missing or invalid 'len'");
+            return;
+        }
+        int slot = -1;
+        for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+            if (!watchpoints[i].active) { slot = i; break; }
+        }
+        if (slot < 0) {
+            send_error("No free watchpoint slots (max 16)");
+            return;
+        }
+        watchpoints[slot].start     = (uint32_t)linear;
+        watchpoints[slot].end       = (uint32_t)(linear + len);
+        watchpoints[slot].active    = true;
+        watchpoints[slot].hit_count = 0;
+        rebuild_watchpoint_count();
+        send_ok(json_num("slot", slot) + "," +
+                json_hex("linear", (uint32_t)linear) + "," +
+                json_num("len", len) + "," +
+                json_bool("normalCoreHooksActive", debug_socket_normal_core_hooks_active != 0) + "," +
+                json_str("note", "Watchpoint armed; hits require active core=normal socket hooks."));
+        return;
+    }
+
+    if (cmd == "wp_clear") {
+        // Clear watchpoints.  With "slot":N clears that slot; without, clears all.
+        long long slot_val;
+        if (json_get_int(json, "slot", slot_val)) {
+            int slot = (int)slot_val;
+            if (slot < 0 || slot >= MAX_WATCHPOINTS || !watchpoints[slot].active) {
+                send_error("Invalid or inactive slot");
+                return;
+            }
+            watchpoints[slot].active = false;
+            rebuild_watchpoint_count();
+            send_ok(json_num("slot", slot));
+        } else {
+            for (int i = 0; i < MAX_WATCHPOINTS; i++) watchpoints[i].active = false;
+            rebuild_watchpoint_count();
+            send_ok(json_str("msg", "All watchpoints cleared"));
+        }
+        return;
+    }
+
+    if (cmd == "wp_list") {
+        std::string arr = "[";
+        bool first = true;
+        for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+            if (!watchpoints[i].active) continue;
+            if (!first) arr += ",";
+            first = false;
+            arr += "{" +
+                   json_num("slot",      i) + "," +
+                   json_hex("linear",    watchpoints[i].start) + "," +
+                   json_num("len",       (long long)(watchpoints[i].end - watchpoints[i].start)) + "," +
+                   json_num("hit_count", (long long)watchpoints[i].hit_count) +
+                   "}";
+        }
+        arr += "]";
+        send_ok("\"watchpoints\":" + arr + "," + json_num("count", (long long)debug_watchpoint_count));
+        return;
+    }
+
+    if (cmd == "catch_exceptions") {
+        // Arm/disarm first-chance exception catching.
+        // {"cmd":"catch_exceptions","vectors":[6,13,14],
+        //  "skip":[{"vec":14,"count":1}],
+        //  "cr2_ignore":[{"start":0,"end":65535}]}
+        // Pass vectors:[] to disarm.
+        std::string op;
+        if (json_get_string(json, "op", op) && op == "status") {
+            std::string vectors = "[";
+            bool first = true;
+            for (int i = 0; i < 32; i++) {
+                if (!catch_exceptions_vectors[i]) continue;
+                if (!first) vectors += ",";
+                first = false;
+                vectors += std::to_string(i);
+            }
+            vectors += "]";
+            send_ok(json_bool("armed", catch_exceptions_armed) + "," +
+                    "\"vectors\":" + vectors + "," +
+                    json_num("skip_count", catch_exceptions_skip_count) + "," +
+                    json_num("cr2_ignore_count", (long long)catch_exceptions_cr2_ignore.size()));
+            return;
+        }
+        std::string vec_key_search = "\"vectors\":";
+        if (json.find(vec_key_search) == std::string::npos) {
+            send_error("Missing 'vectors' array");
+            return;
+        }
+        // Parse vectors array (hand-rolled: look for numbers between [ and ])
+        size_t vec_start = json.find('[', json.find(vec_key_search));
+        size_t vec_end   = (vec_start != std::string::npos) ? json.find(']', vec_start) : std::string::npos;
+        if (vec_start == std::string::npos || vec_end == std::string::npos) {
+            send_error("Invalid 'vectors' array");
+            return;
+        }
+        // Reset
+        for (int i = 0; i < 32; i++) catch_exceptions_vectors[i] = false;
+        catch_exceptions_skip_count = 0;
+        catch_exceptions_cr2_ignore.clear();
+
+        // Parse vector numbers
+        std::string vec_str = json.substr(vec_start + 1, vec_end - vec_start - 1);
+        size_t p = 0;
+        while (p < vec_str.size()) {
+            while (p < vec_str.size() && (vec_str[p] == ' ' || vec_str[p] == ',')) p++;
+            if (p >= vec_str.size()) break;
+            char* endp;
+            long v = strtol(vec_str.c_str() + p, &endp, 0);
+            if (endp == vec_str.c_str() + p) break;
+            p = (size_t)(endp - vec_str.c_str());
+            if (v >= 0 && v < 32) catch_exceptions_vectors[v] = true;
+        }
+
+        // Parse optional skip list: [{"vec":14,"count":1},...]
+        size_t skip_key = json.find("\"skip\":");
+        if (skip_key != std::string::npos) {
+            size_t arr_s = json.find('[', skip_key);
+            size_t arr_e = (arr_s != std::string::npos) ? json.find(']', arr_s) : std::string::npos;
+            if (arr_s != std::string::npos && arr_e != std::string::npos) {
+                std::string sub = json.substr(arr_s, arr_e - arr_s + 1);
+                size_t obj = 0;
+                while (catch_exceptions_skip_count < 32) {
+                    obj = sub.find('{', obj);
+                    if (obj == std::string::npos) break;
+                    size_t obj_e = sub.find('}', obj);
+                    if (obj_e == std::string::npos) break;
+                    std::string entry = sub.substr(obj, obj_e - obj + 1);
+                    long long vec_n = -1, cnt_n = 0;
+                    json_get_int(entry, "vec",   vec_n);
+                    json_get_int(entry, "count", cnt_n);
+                    if (vec_n >= 0 && vec_n < 32) {
+                        catch_exceptions_skip_list[catch_exceptions_skip_count].vec       = (uint8_t)vec_n;
+                        catch_exceptions_skip_list[catch_exceptions_skip_count].remaining = (int)cnt_n;
+                        catch_exceptions_skip_count++;
+                    }
+                    obj = obj_e + 1;
+                }
+            }
+        }
+
+        // Parse optional cr2_ignore list: [{"start":X,"end":Y},...]
+        size_t cr2_key = json.find("\"cr2_ignore\":");
+        if (cr2_key != std::string::npos) {
+            size_t arr_s = json.find('[', cr2_key);
+            size_t arr_e = (arr_s != std::string::npos) ? json.find(']', arr_s) : std::string::npos;
+            if (arr_s != std::string::npos && arr_e != std::string::npos) {
+                std::string sub = json.substr(arr_s, arr_e - arr_s + 1);
+                size_t obj = 0;
+                while (true) {
+                    obj = sub.find('{', obj);
+                    if (obj == std::string::npos) break;
+                    size_t obj_e = sub.find('}', obj);
+                    if (obj_e == std::string::npos) break;
+                    std::string entry = sub.substr(obj, obj_e - obj + 1);
+                    long long s_val = 0, e_val = 0;
+                    json_get_int(entry, "start", s_val);
+                    json_get_int(entry, "end",   e_val);
+                    CR2IgnoreRange r;
+                    r.start = (uint32_t)s_val;
+                    r.end   = (uint32_t)e_val;
+                    catch_exceptions_cr2_ignore.push_back(r);
+                    obj = obj_e + 1;
+                }
+            }
+        }
+
+        // Arm if any vector is set
+        catch_exceptions_armed = false;
+        for (int i = 0; i < 32; i++) {
+            if (catch_exceptions_vectors[i]) { catch_exceptions_armed = true; break; }
+        }
+
+        send_ok(json_bool("armed", catch_exceptions_armed) + "," +
+                json_num("skip_count", catch_exceptions_skip_count) + "," +
+                json_num("cr2_ignore_count", (long long)catch_exceptions_cr2_ignore.size()));
+        return;
+    }
+
+    if (cmd == "break_on_exit") {
+        // {"cmd":"break_on_exit","enable":true/false}
+        long long en = 1;
+        json_get_int(json, "enable", en);
+        break_on_exit = (en != 0);
+        send_ok(json_bool("break_on_exit", break_on_exit));
+        return;
+    }
+
+    if (cmd == "get_last_exit") {
+        if (!last_process_exit.valid) {
+            send_ok(json_bool("available", false));
+        } else {
+            send_ok(json_bool("available", true) + "," +
+                    json_num("exit_code", last_process_exit.exit_code) + "," +
+                    json_num("psp",       last_process_exit.psp) + "," +
+                    json_bool("tsr",      last_process_exit.tsr) + "," +
+                    json_bool("abnormal", last_process_exit.abnormal));
+        }
+        return;
+    }
+
+    if (cmd == "reverse_trace") {
+        // Bidirectional best-effort reverse checkpoints.
+        // {"cmd":"reverse_trace","op":"start","max_checkpoints":512,"checkpoint":"branch"}
+        // {"cmd":"reverse_trace","op":"stop"|"status"|"list"}
+        // {"cmd":"reverse_trace","op":"back"|"forward","steps":N}
+        // {"cmd":"reverse_trace","op":"goto","checkpoint_id":ID}
+        std::string op;
+        if (!json_get_string(json, "op", op)) {
+            send_error("Missing 'op'");
+            return;
+        }
+
+        if (op == "start") {
+            std::string checkpoint_mode = "branch";
+            std::string checkpoint_value;
+            std::string mode_value;
+            const bool has_checkpoint = json_get_string(json, "checkpoint", checkpoint_value);
+            const bool has_mode = json_get_string(json, "mode", mode_value);
+            if (has_checkpoint && has_mode && checkpoint_value != mode_value) {
+                send_error("reverse_trace checkpoint and mode disagree");
+                return;
+            }
+            if (has_checkpoint) {
+                checkpoint_mode = checkpoint_value;
+            } else if (has_mode) {
+                checkpoint_mode = mode_value;
+            }
+            if (checkpoint_mode != "branch" && checkpoint_mode != "instruction") {
+                send_error("reverse_trace checkpoint/mode must be 'branch' or 'instruction'");
+                return;
+            }
+
+            long long max_val = (long long)REVERSE_DEFAULT_MAX_CHECKPOINTS;
+            json_get_int(json, "max_checkpoints", max_val);
+            if (max_val < (long long)REVERSE_MIN_CHECKPOINTS) max_val = (long long)REVERSE_MIN_CHECKPOINTS;
+            if (max_val > (long long)REVERSE_MAX_CHECKPOINTS) max_val = (long long)REVERSE_MAX_CHECKPOINTS;
+
+            reverse_reset((size_t)max_val);
+            reverse_mode = checkpoint_mode == "instruction" ? REVERSE_CHECKPOINT_INSTRUCTION : REVERSE_CHECKPOINT_BRANCH;
+            reverse_trace_enabled = true;
+            debug_reverse_trace_active = 1;
+            reverse_checkpoints.push_back(reverse_make_checkpoint());
+            reverse_cursor = 0;
+            send_ok(json_str("msg", "Reverse trace started") + "," +
+                    json_bool("normalCoreHooksActive", debug_socket_normal_core_hooks_active != 0) + "," +
+                    json_str("note", "Reverse checkpoints require active core=normal socket hooks.") + "," +
+                    reverse_status_fields());
+            return;
+        }
+
+        if (op == "stop") {
+            const size_t old_count = reverse_checkpoints.size();
+            reverse_reset(reverse_max_checkpoints);
+            send_ok(json_str("msg", "Reverse trace stopped") + "," +
+                    json_num("cleared_checkpoints", (long long)old_count));
+            return;
+        }
+
+        if (op == "status") {
+            send_ok(reverse_status_fields());
+            return;
+        }
+
+        if (op == "list") {
+            long long last_n = (long long)reverse_checkpoints.size();
+            json_get_int(json, "last", last_n);
+            if (last_n < 0) last_n = 0;
+            if (last_n > (long long)reverse_checkpoints.size()) last_n = (long long)reverse_checkpoints.size();
+            const size_t start = reverse_checkpoints.size() - (size_t)last_n;
+            std::string arr = "[";
+            bool first = true;
+            for (size_t i = start; i < reverse_checkpoints.size(); i++) {
+                if (!first) arr += ",";
+                first = false;
+                arr += reverse_checkpoint_json(reverse_checkpoints[i],
+                                               i,
+                                               reverse_trace_enabled && i == reverse_cursor,
+                                               i + 1 == reverse_checkpoints.size());
+            }
+            arr += "]";
+            send_ok(reverse_status_fields() + "," +
+                    "\"checkpoints\":" + arr + "," +
+                    json_num("returned", last_n));
+            return;
+        }
+
+        if (op == "back" || op == "forward") {
+            if (!reverse_trace_enabled || reverse_checkpoints.empty()) {
+                send_error("reverse_trace is not enabled");
+                return;
+            }
+            if (!reverse_require_navigation_stopped()) return;
+            long long steps = 1;
+            json_get_int(json, "steps", steps);
+            if (steps < 1) {
+                send_error("'steps' must be >= 1");
+                return;
+            }
+            const size_t old_cursor = reverse_cursor;
+            if (op == "back") {
+                if (reverse_cursor == 0) {
+                    send_ok(json_bool("noOp", true) + "," +
+                            json_str("msg", "Already at oldest retained checkpoint") + "," +
+                            reverse_navigation_fields("back", old_cursor));
+                    return;
+                }
+                if ((uint64_t)steps > (uint64_t)reverse_cursor) {
+                    send_error("Cannot move back that many checkpoints; request exceeds retained history");
+                    return;
+                }
+                reverse_navigate_to(reverse_cursor - (size_t)steps, "back");
+            } else {
+                const size_t newest = reverse_checkpoints.size() - 1;
+                if (reverse_cursor >= newest) {
+                    send_ok(json_bool("noOp", true) + "," +
+                            json_str("msg", "Already at newest checkpoint") + "," +
+                            reverse_navigation_fields("forward", old_cursor));
+                    return;
+                }
+                if ((uint64_t)steps > (uint64_t)(newest - reverse_cursor)) {
+                    send_error("Cannot move forward that many checkpoints; request exceeds forward history");
+                    return;
+                }
+                reverse_navigate_to(reverse_cursor + (size_t)steps, "forward");
+            }
+            return;
+        }
+
+        if (op == "goto") {
+            if (!reverse_trace_enabled || reverse_checkpoints.empty()) {
+                send_error("reverse_trace is not enabled");
+                return;
+            }
+            if (!reverse_require_navigation_stopped()) return;
+            long long checkpoint_id = -1;
+            if (!json_get_int(json, "checkpoint_id", checkpoint_id) || checkpoint_id < 0) {
+                send_error("Missing or invalid 'checkpoint_id'");
+                return;
+            }
+            size_t target = reverse_checkpoints.size();
+            for (size_t i = 0; i < reverse_checkpoints.size(); i++) {
+                if (reverse_checkpoints[i].id == (uint64_t)checkpoint_id) {
+                    target = i;
+                    break;
+                }
+            }
+            if (target >= reverse_checkpoints.size()) {
+                send_error("checkpoint_id is not in retained history");
+                return;
+            }
+            reverse_navigate_to(target, "goto");
+            return;
+        }
+
+        send_error("Unknown reverse_trace op (start|stop|status|list|back|forward|goto)");
+        return;
+    }
+
+    if (cmd == "trace") {
+        // Branch trace ring control.
+        // {"cmd":"trace","op":"start"|"stop"|"status"}
+        // {"cmd":"trace","op":"dump","last":N}
+        std::string op;
+        if (!json_get_string(json, "op", op)) {
+            send_error("Missing 'op'");
+            return;
+        }
+        if (op == "start") {
+            branch_trace_enabled = true;
+            branch_ring_head  = 0;
+            branch_ring_count = 0;
+            send_ok(json_str("msg", "Branch trace started") + "," +
+                    json_num("ring_size", BRANCH_RING_SIZE));
+        } else if (op == "stop") {
+            branch_trace_enabled = false;
+            send_ok(json_str("msg", "Branch trace stopped") + "," +
+                    json_num("entries", (long long)branch_ring_count));
+        } else if (op == "status") {
+            send_ok(json_bool("enabled",  branch_trace_enabled) + "," +
+                    json_num("entries",   (long long)branch_ring_count) + "," +
+                    json_num("ring_size", BRANCH_RING_SIZE));
+        } else if (op == "dump") {
+            long long last_n;
+            if (!json_get_int(json, "last", last_n) || last_n <= 0)
+                last_n = (long long)branch_ring_count;
+            if (last_n > BRANCH_RING_SIZE) last_n = BRANCH_RING_SIZE;
+            if (last_n > (long long)branch_ring_count) last_n = (long long)branch_ring_count;
+
+            // Walk the ring backwards from most recent entry
+            std::string arr = "[";
+            bool first = true;
+            for (long long k = last_n - 1; k >= 0; k--) {
+                uint32_t idx = (uint32_t)((branch_ring_head - 1 - k + BRANCH_RING_SIZE * 2)
+                                          % BRANCH_RING_SIZE);
+                const BranchEntry& e = branch_ring[idx];
+                if (!first) arr += ",";
+                first = false;
+                char fbuf[24], tbuf[24];
+                snprintf(fbuf, sizeof(fbuf), "0x%08X", e.from_linear);
+                snprintf(tbuf, sizeof(tbuf), "0x%08X", e.to_linear);
+                arr += "{" +
+                       json_num("from_cs",     (long long)e.from_cs) + "," +
+                       json_str("from",        fbuf) + "," +
+                       json_num("to_cs",       (long long)e.to_cs) + "," +
+                       json_str("to",          tbuf) +
+                       "}";
+            }
+            arr += "]";
+            send_ok("\"entries\":" + arr + "," + json_num("count", last_n));
+        } else {
+            send_error("Unknown trace op (start|stop|status|dump)");
+        }
+        return;
+    }
+
+    if (cmd == "floppy_swap") {
+        // Swap the active disk image on a mounted floppy/CD/HDD drive.
+        // Works while a DOS program is running — no shell dependency.
+        //
+        // {"cmd":"floppy_swap","drive":"A"}
+        //   Cycle to the next image in the pre-loaded swap list (same as GUI "Swap disk").
+        //   Requires the drive to have been imgmounted with multiple images.
+        //
+        // {"cmd":"floppy_swap","drive":"A","image":"/host/path/Disk02.img"}
+        //   Replace the currently-active image with a new file from the host filesystem.
+        //   Equivalent to DriveManager::ChangeDisk — updates both the DOS filesystem
+        //   layer (Drives[]) and the BIOS INT 13h layer (imageDiskList[]).
+        std::string drive_str;
+        if (!json_get_string(json, "drive", drive_str) || drive_str.empty()) {
+            send_error("Missing 'drive'");
+            return;
+        }
+        int driveIdx = toupper((unsigned char)drive_str[0]) - 'A';
+        if (driveIdx < 0 || driveIdx >= DOS_DRIVES) {
+            send_error("Invalid drive letter");
+            return;
+        }
+        if (Drives[driveIdx] == nullptr) {
+            send_error("No drive mounted at this letter");
+            return;
+        }
+
+        std::string image_path;
+        bool has_image = json_get_string(json, "image", image_path) && !image_path.empty();
+
+        if (!has_image) {
+            // Cycle to the next image in the existing DriveManager swap list.
+            if (DriveManager::GetDisksSize(driveIdx) < 1) {
+                send_error("No disk images in swap list; use imgmount with multiple images first");
+                return;
+            }
+            swapInDrive(driveIdx, 0);
+            char pos_buf[32];
+            snprintf(pos_buf, sizeof(pos_buf), "%s", DriveManager::GetDrivePosition(driveIdx));
+            send_ok(json_str("msg", "Disk swapped (cycled to next)") + "," +
+                    json_str("drive", std::string(1, (char)('A' + driveIdx))) + "," +
+                    json_str("position", pos_buf));
+            return;
+        }
+
+        // Replace the currently-active image with a new file.
+        // Create a fatDrive from the image path (auto-detects geometry when sizes are 0).
+        if (DriveManager::GetDisksSize(driveIdx) < 1) {
+            send_error("Drive has no managed disk list; use imgmount first then use floppy_swap");
+            return;
+        }
+        std::vector<std::string> opts;
+        fatDrive *newDrive = new fatDrive(image_path.c_str(), 0, 0, 0, 0, opts);
+        if (!newDrive->created_successfully) {
+            delete newDrive;
+            send_error(("Failed to open image: " + image_path).c_str());
+            return;
+        }
+        // ChangeDisk: replaces current slot in DriveManager, updates Drives[] and imageDiskList[].
+        DriveManager::ChangeDisk(driveIdx, newDrive);
+        send_ok(json_str("msg", "New image loaded") + "," +
+                json_str("drive", std::string(1, (char)('A' + driveIdx))) + "," +
+                json_str("image", image_path) + "," +
+                json_str("position", DriveManager::GetDrivePosition(driveIdx)));
+        return;
+    }
+
+    if (cmd == "floppy_load_list") {
+        // Pre-load a list of disk images into a drive's swap list.
+        // Replicates what imgmount does with multiple image paths, without going through
+        // the DOS shell parser.  After this call, floppy_swap (no image) cycles through
+        // the list using the existing swapInDrive / DriveManager::CycleDisks mechanism.
+        //
+        // {"cmd":"floppy_load_list","drive":"A","images":["/abs/Disk01.img","/abs/Disk02.img",...]}
+        //   • Clears any existing swap list for the drive.
+        //   • Creates a fatDrive for each path (same as imgmount -t floppy -fs fat).
+        //   • Populates diskSwap[] (BIOS INT 13h layer) and DriveManager (DOS filesystem
+        //     layer) with the new images in order.
+        //   • Makes the first image active immediately.
+        //   • Returns {"status":"ok","msg":"N images loaded for drive A","count":N}.
+        std::string drive_str;
+        if (!json_get_string(json, "drive", drive_str) || drive_str.empty()) {
+            send_error("Missing 'drive'");
+            return;
+        }
+        int driveIdx = toupper((unsigned char)drive_str[0]) - 'A';
+        if (driveIdx < 0 || driveIdx >= DOS_DRIVES) {
+            send_error("Invalid drive letter");
+            return;
+        }
+        if (Drives[driveIdx] == nullptr) {
+            send_error("No drive mounted at this letter");
+            return;
+        }
+
+        std::vector<std::string> paths;
+        if (!json_get_string_array(json, "images", paths) || paths.empty()) {
+            send_error("Missing or empty 'images' array");
+            return;
+        }
+        if ((int)paths.size() > MAX_SWAPPABLE_DISKS) {
+            char errbuf[64];
+            snprintf(errbuf, sizeof(errbuf), "Too many images (max %d)", MAX_SWAPPABLE_DISKS);
+            send_error(errbuf);
+            return;
+        }
+
+        // Create fatDrive for every path (auto-detects geometry when sizes are 0,
+        // matching what imgmount does for -t floppy -fs fat).
+        std::vector<fatDrive*> newDrives;
+        std::vector<std::string> opts;
+        for (const auto& p : paths) {
+            fatDrive* fd = new fatDrive(p.c_str(), 0, 0, 0, 0, opts);
+            if (!fd->created_successfully) {
+                delete fd;
+                for (auto* d : newDrives) delete d;
+                send_error(("Failed to open image: " + p).c_str());
+                return;
+            }
+            newDrives.push_back(fd);
+        }
+
+        // Clear old diskSwap[] entries that belong to this drive (BIOS layer).
+        if (swapInDisksSpecificDrive == driveIdx || swapInDisksSpecificDrive == -1) {
+            for (size_t si = 0; si < MAX_SWAPPABLE_DISKS; si++) {
+                if (diskSwap[si] != NULL) {
+                    diskSwap[si]->Release();
+                    diskSwap[si] = NULL;
+                }
+            }
+            swapInDisksSpecificDrive = -1;
+        }
+
+        // Replace the DriveManager disk list for this drive (DOS filesystem layer).
+        // ClearDrive unmounts (and deletes) all existing disks; AppendDisk + InitializeDrive
+        // rebuilds the list and makes newDrives[0] the active drive in Drives[].
+        DriveManager::ClearDrive(driveIdx);
+        for (auto* fd : newDrives) {
+            DriveManager::AppendDisk(driveIdx, fd);
+        }
+        DriveManager::InitializeDrive(driveIdx);
+
+        // Populate diskSwap[] with the underlying imageDisk from each fatDrive
+        // (same pattern as imgmount multi-image for floppy drives).
+        for (size_t si = 0; si < newDrives.size() && si < MAX_SWAPPABLE_DISKS; si++) {
+            imageDisk* img = newDrives[si]->loadedDisk;
+            if (img != NULL) {
+                diskSwap[si] = img;
+                diskSwap[si]->Addref();
+            }
+        }
+        swapPosition = 0;
+
+        // Only floppy drives (A: = 0, B: = 1) use swapInDisksSpecificDrive and imageDiskList.
+        if (driveIdx < 2) {
+            swapInDisksSpecificDrive = driveIdx;
+            imageDisk* firstImg = newDrives[0]->loadedDisk;
+            if (firstImg != NULL) {
+                if (imageDiskList[driveIdx] != NULL) {
+                    imageDiskList[driveIdx]->Release();
+                }
+                imageDiskList[driveIdx] = firstImg;
+                imageDiskList[driveIdx]->Addref();
+                imageDiskChange[driveIdx] = true;
+            }
+        }
+
+        char msg_buf[64];
+        snprintf(msg_buf, sizeof(msg_buf), "%d image%s loaded for drive %c",
+                 (int)newDrives.size(), newDrives.size() == 1 ? "" : "s",
+                 'A' + driveIdx);
+        send_ok(json_str("msg", msg_buf) + "," +
+                json_str("drive", std::string(1, (char)('A' + driveIdx))) + "," +
+                json_num("count", (long long)newDrives.size()));
+        return;
+    }
+
     send_error("Unknown command");
 }
 
@@ -2240,9 +4110,18 @@ bool DEBUG_Socket_Init(int port) {
         return false;
     }
 
+    // Move to a high fd (>= 100) to avoid collision with disk-image file descriptors
+    // that are opened in low-numbered slots by imgmount / floppy_load_list.
+    server_socket = socket_bump_fd(server_socket);
+
     // Allow reuse
     int opt = 1;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+#if defined(__APPLE__) || defined(__MACH__)
+    // On macOS, suppress SIGPIPE at the socket level (MSG_NOSIGNAL is unavailable).
+    setsockopt(server_socket, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
 
     // Non-blocking
     int flags = fcntl(server_socket, F_GETFL, 0);
@@ -2296,17 +4175,26 @@ bool DEBUG_Socket_CheckCommands(void) {
         socklen_t client_len = sizeof(client_addr);
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
         if (client_socket >= 0) {
+            // Move to a high fd (>= 100) before doing anything else so that
+            // subsequent fclose() calls on disk-image files cannot accidentally
+            // recycle this fd number and silently break the socket.
+            client_socket = socket_bump_fd(client_socket);
+
             // Set non-blocking
             int flags = fcntl(client_socket, F_GETFL, 0);
             fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
-            LOG_MSG("DEBUG_Socket: Client connected");
+
+#if defined(__APPLE__) || defined(__MACH__)
+            int nosig = 1;
+            setsockopt(client_socket, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
+            LOG_MSG("DEBUG_Socket: Client connected (fd %d)", client_socket);
             
             // Reset protocol mode for new connection
             gdb_mode = false;
             
             // Send initial state (JSON format - will switch to GDB if first packet is GDB RSP)
-            std::string state = IsDebuggerRunwatch() ? "running" : "stopped";
-            send_response("{" + json_str("event", "connected") + "," + json_str("state", state) + "}");
+            send_response("{" + json_str("event", "connected") + "," + socket_state_fields() + "}");
         }
     }
 
@@ -2393,10 +4281,61 @@ void DEBUG_Socket_NotifyBreakpoint(uint16_t seg, uint32_t off) {
         // JSON mode
         char addr[32];
         snprintf(addr, sizeof(addr), "%04X:%08X", seg, off);
+        std::string load_info;
+        if (g_exec_breakpoint_pending &&
+            g_exec_breakpoint_seg == seg &&
+            g_exec_breakpoint_off == off &&
+            load_info_matches_entry(seg, off)) {
+            load_info = "," + load_info_json_field();
+        }
         send_and_latch_stop("{" + json_str("event", "stopped") + "," +
                             stop_context_json("breakpoint", seg, off) + "," +
-                            json_str("addr", addr) + "," + get_registers_json() + "}");
+                            json_str("addr", addr) + "," + get_registers_json() +
+                            load_info + "}");
     }
+}
+
+/* ---- allocation trace -------------------------------------------------
+   Every DOS and EMS memory call, logged where it is made rather than
+   where it lands. The guest cannot do this to itself usefully: a tracer
+   inside the program costs the very conventional memory it is trying to
+   account for, and misses whatever uGL and the C runtime do behind their
+   own APIs. Here it costs the guest nothing at all.
+
+   Requests only, not results -- the INT has not dispatched yet, so AX
+   does not hold the returned segment. What a request records (who asked,
+   for how much, in what order) is what an allocation profile needs;
+   whether it succeeded is already visible in the program's own output. */
+
+void DEBUG_Socket_TraceAlloc(uint8_t intNum) {
+    if (!alloc_trace_fp) return;
+    if (intNum != 0x21 && intNum != 0x67) return;
+
+    const char* what = NULL;
+    uint32_t    arg  = 0;
+
+    if (intNum == 0x21) {
+        switch (reg_ah) {
+            case 0x48: what = "dos_alloc";  arg = reg_bx;        break; /* paragraphs */
+            case 0x49: what = "dos_free";   arg = SegValue(es);  break;
+            case 0x4A: what = "dos_resize"; arg = reg_bx;        break;
+            default: return;
+        }
+    } else {
+        switch (reg_ah) {
+            case 0x43: what = "ems_alloc";  arg = reg_bx;        break; /* 16K pages */
+            case 0x45: what = "ems_free";   arg = reg_dx;        break; /* handle */
+            case 0x47: what = "ems_savemap";arg = reg_dx;        break;
+            case 0x48: what = "ems_restmap";arg = reg_dx;        break;
+            default: return;
+        }
+    }
+
+    fprintf(alloc_trace_fp, "%u %s arg=%u bytes=%u caller=%04X:%04X\n",
+            (unsigned)alloc_trace_n++, what, (unsigned)arg,
+            (unsigned)(intNum == 0x21 ? arg * 16u : arg * 16384u),
+            (unsigned)SegValue(cs), (unsigned)reg_eip);
+    fflush(alloc_trace_fp);   /* a run that dies mid-load still leaves the trail */
 }
 
 void DEBUG_Socket_NotifyInterrupt(uint8_t intNum, uint16_t seg, uint32_t off) {
@@ -2411,9 +4350,14 @@ void DEBUG_Socket_NotifyInterrupt(uint8_t intNum, uint16_t seg, uint32_t off) {
         // JSON mode - include interrupt number
         char addr[32];
         snprintf(addr, sizeof(addr), "%04X:%08X", seg, off);
-        send_and_latch_stop("{" + json_str("event", "stopped") + "," +
-                            stop_context_json("interrupt", seg, off, intNum) + "," +
-                            json_str("addr", addr) + "," + get_registers_json() + "}");
+        const std::string stop_json = "{" + json_str("event", "stopped") + "," +
+                                      stop_context_json("interrupt", seg, off, intNum) + "," +
+                                      json_str("addr", addr) + "," + get_registers_json() + "}";
+        if (intNum == 0x06 || intNum == 0x0D || intNum == 0x0E) {
+            send_and_latch_fault_stop(stop_json);
+        } else {
+            send_and_latch_stop(stop_json);
+        }
     }
 }
 
@@ -2500,11 +4444,13 @@ void DEBUG_Socket_FreezeWait(void) {
     // globals or the loop handler. The CPU core is simply parked here; all
     // socket read commands operate on the live guest state directly.
     socket_freeze_wait = true;
+    socket_freeze_loop_active = true;
     while (socket_freeze_wait) {
         DEBUG_Socket_CheckCommands();
         GFX_Events();
         usleep(1000);  // 1ms; keeps host responsive without busy-spinning
     }
+    socket_freeze_loop_active = false;
 }
 
 bool DEBUG_Socket_IsActive(void) {
