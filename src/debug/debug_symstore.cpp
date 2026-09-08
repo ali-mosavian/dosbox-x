@@ -5,6 +5,8 @@
 #include "debug_symstore.h"
 
 #include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static DebugSymbolStore debug_symbols;
 
@@ -167,6 +169,151 @@ const DebugSourceLine *DebugSymbolStore::LineAt(uint32_t linear) const
 		if (best == NULL || lines[i].begin > best->begin) best = &lines[i];
 	}
 	return best;
+}
+
+/* A file is named by its full path in some formats and its basename in
+ * others, and the case is the toolchain's choice, not the user's. */
+static bool FileNameMatches(const std::string &candidate,const std::string &requested)
+{
+	if (candidate.empty()) return false;
+
+	const std::string have = SymUpper(candidate);
+	const std::string want = SymUpper(requested);
+	if (have == want) return true;
+
+	const size_t slash = have.find_last_of("/\\");
+	return slash != std::string::npos && have.substr(slash + 1) == want;
+}
+
+const DebugSourceLine *DebugSymbolStore::LineFor(const std::string &file,uint16_t line,uint16_t &used) const
+{
+	const DebugSourceLine *exact = NULL;
+	const DebugSourceLine *next = NULL;
+
+	for (size_t i = 0;i < lines.size();i++) {
+		if (!file.empty() && !FileNameMatches(lines[i].file,file)) continue;
+
+		if (lines[i].line == line) {
+			if (exact == NULL || lines[i].begin < exact->begin) exact = &lines[i];
+		} else if (lines[i].line > line) {
+			if (next == NULL || lines[i].line < next->line ||
+			    (lines[i].line == next->line && lines[i].begin < next->begin))
+				next = &lines[i];
+		}
+	}
+
+	const DebugSourceLine *found = exact != NULL ? exact : next;
+	if (found != NULL) used = found->line;
+	return found;
+}
+
+/* Accepts 0x-prefixed hex and plain decimal, and nothing else: "0010" as an
+ * address is a real risk of being read as octal or hex by accident. */
+static bool ParseNumber(const std::string &text,uint32_t &out)
+{
+	if (text.empty()) return false;
+
+	char *end = NULL;
+	const bool hex = text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+	const unsigned long value = strtoul(text.c_str(),&end,hex ? 16 : 10);
+	if (end == NULL || *end != 0) return false;
+
+	out = (uint32_t)value;
+	return true;
+}
+
+static std::string TrimSpec(const std::string &text)
+{
+	size_t begin = 0,end = text.size();
+	while (begin < end && isspace((unsigned char)text[begin])) begin++;
+	while (end > begin && isspace((unsigned char)text[end-1])) end--;
+	return text.substr(begin,end - begin);
+}
+
+static bool AllDigits(const std::string &text)
+{
+	if (text.empty()) return false;
+	for (size_t i = 0;i < text.size();i++)
+		if (!isdigit((unsigned char)text[i])) return false;
+	return true;
+}
+
+bool DebugSymbolStore::ResolveLocation(const std::string &spec,DebugLocation &out,std::string &error) const
+{
+	const std::string text = TrimSpec(spec);
+	if (text.empty()) {
+		error = "Empty location";
+		return false;
+	}
+
+	if (text[0] == '*') {
+		if (!ParseNumber(TrimSpec(text.substr(1)),out.linear)) {
+			error = "Not an address: " + text;
+			return false;
+		}
+		out.kind = "address";
+		out.description = DEBUG_Hex(out.linear);
+		return true;
+	}
+
+	/* file:line, told from a symbol by the digits after the colon. */
+	const size_t colon = text.find_last_of(':');
+	if (colon != std::string::npos && AllDigits(text.substr(colon + 1))) {
+		const std::string file = text.substr(0,colon);
+		const uint32_t wanted = (uint32_t)atoi(text.c_str() + colon + 1);
+
+		uint16_t used = 0;
+		const DebugSourceLine *found = LineFor(file,(uint16_t)wanted,used);
+		if (found == NULL) {
+			error = "No line table entry for " + text;
+			return false;
+		}
+
+		char buf[32];
+		snprintf(buf,sizeof(buf),"%u",(unsigned int)used);
+		out.linear = found->begin;
+		out.kind = "line";
+		out.file = found->file;
+		out.line = used;
+		out.exactLine = used == wanted;
+		out.description = found->file + ":" + buf + " = " + DEBUG_Hex(found->begin);
+		if (!out.exactLine) out.description += " (the next line with code)";
+		return true;
+	}
+
+	/* symbol+offset, with the sign kept out of a name that contains one. */
+	std::string name = text;
+	int32_t adjust = 0;
+	const size_t sign = text.find_last_of("+-");
+	if (sign != std::string::npos && sign > 0) {
+		uint32_t amount = 0;
+		if (ParseNumber(TrimSpec(text.substr(sign + 1)),amount)) {
+			name = TrimSpec(text.substr(0,sign));
+			adjust = text[sign] == '-' ? -(int32_t)amount : (int32_t)amount;
+		}
+	}
+
+	const DebugSymbol *symbol = Resolve(name);
+	if (symbol != NULL) {
+		out.linear = (uint32_t)((int64_t)symbol->linear + adjust);
+		out.kind = "symbol";
+		out.symbol = symbol->name;
+		out.delta = (uint32_t)(adjust > 0 ? adjust : 0);
+		out.description = symbol->name +
+			(adjust != 0 ? (adjust > 0 ? "+" : "-") + DEBUG_Hex((uint32_t)(adjust > 0 ? adjust : -adjust)) : "") +
+			" = " + DEBUG_Hex(out.linear);
+		return true;
+	}
+
+	if (ParseNumber(text,out.linear)) {
+		out.kind = "address";
+		out.description = DEBUG_Hex(out.linear);
+		return true;
+	}
+
+	error = "Unknown location: " + text +
+		" (expected file:line, a symbol, symbol+offset, or an address)";
+	return false;
 }
 
 std::string DebugSymbolStore::Describe(uint32_t linear) const

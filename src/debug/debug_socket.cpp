@@ -17,6 +17,14 @@
  *   {"cmd":"sym_list","filter":"draw","limit":100} - List loaded symbols.
  *   {"cmd":"where"} - What is at CS:EIP: symbol, offset into it, source line.
  *     Takes {"linear":X} or {"seg":X,"off":Y} to ask about another address.
+ *   {"cmd":"resolve","spec":"file.c:29"} - A gdb-style location to an address.
+ *     Also "func", "func+0x10", "*0x9C7E" and a bare number. A line with no
+ *     code of its own resolves to the next line that has some, and exact_line
+ *     says so. bp_set_linear_exec takes the same spec as "location".
+ *   {"cmd":"line_list","file":"cvprobe.bas"} - The line table, as addresses.
+ *   {"cmd":"var","name":"g_counter"} - Read a variable by name. Its bytes
+ *     always, and a decoded value when the debug info gave it a type; "len"
+ *     overrides how much to read.
  *   {"cmd":"sym_load","file":"/host/path.map","loadSeg":X} - Load symbols from
  *     a host file, either a LINK .MAP or a program with debug info in it. Each
  *     program's symbols load by themselves as DOS EXEC runs it, so this is for
@@ -439,6 +447,10 @@ static std::string json_hex(const char* key, uint32_t val) {
 static std::string json_bool(const char* key, bool val) {
     return "\"" + std::string(key) + "\":" + (val ? "true" : "false");
 }
+// A number the caller already formatted, e.g. a decoded variable value.
+static std::string json_raw(const char* key, const std::string& val) {
+    return "\"" + std::string(key) + "\":" + (val.empty() ? "null" : val);
+}
 
 // Parse simple JSON value (handles optional whitespace after :)
 static bool json_get_string(const std::string& json, const char* key, std::string& out) {
@@ -623,6 +635,69 @@ static std::string address_json(uint32_t linear) {
     const DebugSourceLine* line = store.LineAt(linear);
     if (line != NULL) out += "," + json_str("file", line->file) + "," + json_num("line", line->line);
     return out;
+}
+
+// A location as the store resolved it, with what it went through.
+static std::string location_json(const DebugLocation& at) {
+    std::string out = json_hex("linear", at.linear) + "," +
+                      json_str("kind", at.kind) + "," +
+                      json_str("description", at.description);
+    if (!at.symbol.empty()) out += "," + json_str("symbol", at.symbol) + "," + json_num("delta", at.delta);
+    if (!at.file.empty()) {
+        out += "," + json_str("file", at.file) + "," + json_num("line", at.line) +
+               "," + json_bool("exact_line", at.exactLine);
+    }
+    return out;
+}
+
+// Guest bytes as hex, "??" for any that could not be read.
+static std::string read_guest_hex(uint32_t linear, uint32_t length, std::vector<uint8_t>& bytes, bool& complete) {
+    std::string hex;
+    complete = true;
+    for (uint32_t i = 0; i < length; i++) {
+        uint8_t val = 0;
+        if (mem_readb_checked(linear + i, &val)) {
+            hex += "??";
+            complete = false;
+            bytes.push_back(0);
+        } else {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%02X", val);
+            hex += buf;
+            bytes.push_back(val);
+        }
+    }
+    return hex;
+}
+
+// One value of `size` bytes, little-endian, read the way its type says.
+static std::string decode_value(const std::vector<uint8_t>& bytes, size_t at, uint32_t size, DebugValueKind kind) {
+    if (size == 0 || at + size > bytes.size()) return std::string();
+
+    uint64_t raw = 0;
+    for (uint32_t i = 0; i < size && i < 8; i++) raw |= (uint64_t)bytes[at+i] << (8 * i);
+
+    char buf[64];
+    if (kind == DEBUG_VALUE_FLOAT && size == 4) {
+        float f;
+        memcpy(&f, &bytes[at], 4);
+        snprintf(buf, sizeof(buf), "%g", (double)f);
+        return buf;
+    }
+    if (kind == DEBUG_VALUE_FLOAT && size == 8) {
+        double d;
+        memcpy(&d, &bytes[at], 8);
+        snprintf(buf, sizeof(buf), "%g", d);
+        return buf;
+    }
+    if (kind == DEBUG_VALUE_SIGNED && size <= 8) {
+        const uint64_t sign = (uint64_t)1 << (size * 8 - 1);
+        const int64_t value = (raw & sign) != 0 ? (int64_t)raw - (int64_t)(sign << 1) : (int64_t)raw;
+        snprintf(buf, sizeof(buf), "%lld", (long long)value);
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)raw);
+    return buf;
 }
 
 static bool name_contains(const std::string& name, const std::string& needle) {
@@ -2259,8 +2334,18 @@ static void process_command(const std::string& json) {
         long long once_val = 0;
         long long match_seg_val = -1;
         long long match_off_val = -1;
-        if (!json_get_int(json, "linear", linear)) {
-            send_error("Missing 'linear' address");
+        std::string spec, resolved;
+        if (json_get_string(json, "location", spec)) {
+            DebugLocation at;
+            std::string error;
+            if (!DEBUG_Symbols().ResolveLocation(spec, at, error)) {
+                send_error(error.c_str());
+                return;
+            }
+            linear = (long long)at.linear;
+            resolved = "," + location_json(at);
+        } else if (!json_get_int(json, "linear", linear)) {
+            send_error("Missing 'linear' address or 'location'");
             return;
         }
         json_get_int(json, "once", once_val);
@@ -2281,7 +2366,7 @@ static void process_command(const std::string& json) {
                 json_hex("match_seg", (uint16_t)match_seg_val) + "," +
                 json_bool("has_match_off", has_match_off) + "," +
                 json_hex("match_off", (uint32_t)match_off_val) + "," +
-                json_bool("once", once_val != 0));
+                json_bool("once", once_val != 0) + resolved);
         return;
     }
 
@@ -2418,6 +2503,104 @@ static void process_command(const std::string& json) {
             return;
         }
         send_ok(symbol_json(*symbol));
+        return;
+    }
+
+    if (cmd == "resolve") {
+        std::string spec;
+        if (!json_get_string(json, "spec", spec) && !json_get_string(json, "location", spec)) {
+            send_error("Missing 'spec'");
+            return;
+        }
+
+        DebugLocation at;
+        std::string error;
+        if (!DEBUG_Symbols().ResolveLocation(spec, at, error)) {
+            send_error(error.c_str());
+            return;
+        }
+        send_ok(json_str("spec", spec) + "," + location_json(at));
+        return;
+    }
+
+    if (cmd == "line_list") {
+        std::string file;
+        json_get_string(json, "file", file);
+        long long limit = 200;
+        json_get_int(json, "limit", limit);
+        if (limit < 0) limit = 0;
+
+        const std::vector<DebugSourceLine>& all = DEBUG_Symbols().Lines();
+        long long matched = 0;
+        std::string arr;
+        for (size_t i = 0; i < all.size(); i++) {
+            if (!file.empty() && !name_contains(all[i].file, file)) continue;
+            matched++;
+            if (matched > limit) continue;
+            if (!arr.empty()) arr += ",";
+            arr += "{" + json_str("file", all[i].file) + "," +
+                   json_num("line", all[i].line) + "," +
+                   json_hex("linear", all[i].begin) + "," +
+                   json_hex("end", all[i].end);
+            if (!all[i].program.empty()) arr += "," + json_str("program", all[i].program);
+            arr += "}";
+        }
+        send_ok(json_num("total", (long long)all.size()) + "," +
+                json_num("matched", matched) + "," +
+                "\"lines\":[" + arr + "]");
+        return;
+    }
+
+    if (cmd == "var") {
+        std::string name;
+        if (!json_get_string(json, "name", name)) {
+            send_error("Missing 'name'");
+            return;
+        }
+        const DebugSymbol* symbol = DEBUG_Symbols().Resolve(name);
+        if (symbol == NULL) {
+            send_error("Unknown symbol");
+            return;
+        }
+
+        long long len = 0;
+        const bool asked = json_get_int(json, "len", len) && len > 0;
+        uint32_t length = asked ? (uint32_t)len : symbol->valueSize;
+        // Nothing said how wide it is: a word is the DOS default, and
+        // size_known says the answer is a guess about the length only.
+        if (length == 0) length = 2;
+        if (length > 4096) length = 4096;
+
+        std::vector<uint8_t> bytes;
+        bool complete = true;
+        const std::string hex = read_guest_hex(symbol->linear, length, bytes, complete);
+
+        std::string out = symbol_json(*symbol) + "," +
+                          json_num("length", length) + "," +
+                          json_bool("size_known", asked || symbol->valueSize != 0) + "," +
+                          json_bool("readable", complete) + "," +
+                          json_str("bytes", hex);
+        if (!symbol->typeName.empty()) out += "," + json_str("type", symbol->typeName);
+
+        if (symbol->valueKind != DEBUG_VALUE_UNKNOWN && symbol->elementSize > 0) {
+            std::string values;
+            for (uint32_t at = 0; at + symbol->elementSize <= length; at += symbol->elementSize) {
+                const std::string one = decode_value(bytes, at, symbol->elementSize, symbol->valueKind);
+                if (one.empty()) break;
+                if (!values.empty()) values += ",";
+                values += one;
+            }
+            out += ",\"values\":[" + values + "]";
+        } else if (symbol->valueKind != DEBUG_VALUE_UNKNOWN) {
+            const std::string one = decode_value(bytes, 0, symbol->valueSize, symbol->valueKind);
+            if (!one.empty()) out += "," + json_raw("value", one);
+        } else if (length == 1 || length == 2 || length == 4) {
+            // No type to go on: give both readings of the bytes rather than
+            // picking one and calling it the value.
+            out += "," + json_raw("as_unsigned", decode_value(bytes, 0, length, DEBUG_VALUE_UNSIGNED)) +
+                   "," + json_raw("as_signed", decode_value(bytes, 0, length, DEBUG_VALUE_SIGNED));
+        }
+        send_ok(out);
         return;
     }
 

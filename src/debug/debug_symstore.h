@@ -21,6 +21,18 @@ struct DebugSourceLine {
 	std::string program;
 };
 
+/* Where a location spec landed, and what it went through to get there. */
+struct DebugLocation {
+	uint32_t linear = 0;
+	std::string kind;		/* "address", "symbol" or "line" */
+	std::string description;
+	std::string symbol;
+	uint32_t delta = 0;		/* offset past the symbol, for "symbol" */
+	std::string file;		/* for "line" */
+	uint16_t line = 0;
+	bool exactLine = true;		/* false when the next line with code was used */
+};
+
 class DebugSymbolStore {
 public:
 	void Clear();
@@ -48,6 +60,30 @@ public:
 
 	/* The source line covering an address, if any line covers it. */
 	const DebugSourceLine *LineAt(uint32_t linear) const;
+
+	const std::vector<DebugSourceLine> &Lines() const { return lines; }
+
+	/* The lowest address of a source line. A line with no code of its own
+	 * resolves forward to the next one that has some, the way a debugger
+	 * moves a breakpoint set on a blank line or a declaration; used says
+	 * which line that was. The file matches on its name or its basename,
+	 * case-insensitively: a program says TDSPROBE.C where the user types
+	 * tdsprobe.c. */
+	const DebugSourceLine *LineFor(const std::string &file,uint16_t line,uint16_t &used) const;
+
+	/*
+	 * A gdb-style location:
+	 *
+	 *   file.c:29     the line, or the next line that has code
+	 *   func          a symbol, "module!func" included
+	 *   func+0x10     that many bytes past one
+	 *   *0x9C7E       an address, spelled out
+	 *   0x9C7E        an address; a bare number is never a line number
+	 *
+	 * A segment:offset pair is not handled here -- what it means depends on
+	 * the CPU mode, which the store knows nothing about.
+	 */
+	bool ResolveLocation(const std::string &spec,DebugLocation &out,std::string &error) const;
 
 private:
 	std::vector<DebugSymbol> symbols;

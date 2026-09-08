@@ -292,3 +292,68 @@ TEST_F(DebugSymbolsTest, TheStoreDescribesAnAddressInsideARealProgram)
 }
 
 }
+
+TEST_F(DebugSymbolsTest, ResolveLocationReadsGdbStyleSpecs)
+{
+	if (MapFixtureDir().empty()) GTEST_SKIP() << "mcp/test/fixtures not found; set DOSBOX_TEST_FIXTURES";
+
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(MapFixture("cvprobe.exe").c_str(),0x8240,info));
+	DebugSymbolStore store;
+	store.AddDebugInfo(info,"CVPROBE.EXE");
+
+	DebugLocation at;
+	std::string error;
+
+	/* The loop body of cvprobe.bas, where a breakpoint hit 0824:0098. */
+	ASSERT_TRUE(store.ResolveLocation("cvprobe.bas:17",at,error)) << error;
+	EXPECT_EQ("line",at.kind);
+	EXPECT_EQ(17,at.line);
+	EXPECT_TRUE(at.exactLine);
+	EXPECT_EQ(0x8298u,at.linear);
+
+	/* Line 21 is `next k`'s blank neighbour: no code of its own, so the
+	 * breakpoint moves forward the way gdb moves one off a blank line. */
+	ASSERT_TRUE(store.ResolveLocation("cvprobe.bas:21",at,error)) << error;
+	EXPECT_FALSE(at.exactLine);
+	EXPECT_EQ(22,at.line);
+
+	ASSERT_TRUE(store.ResolveLocation("pr_add",at,error)) << error;
+	EXPECT_EQ("symbol",at.kind);
+	EXPECT_EQ(0x82f4u,at.linear);
+
+	ASSERT_TRUE(store.ResolveLocation("pr_add+0x0b",at,error)) << error;
+	EXPECT_EQ(0x82ffu,at.linear);
+	EXPECT_EQ(0x0bu,at.delta);
+
+	ASSERT_TRUE(store.ResolveLocation("*0x82f4",at,error)) << error;
+	EXPECT_EQ("address",at.kind);
+	EXPECT_EQ(0x82f4u,at.linear);
+
+	/* A bare number is an address, never a line: a DOS debugger is asked for
+	 * addresses far more often, and file:line says the other thing. */
+	ASSERT_TRUE(store.ResolveLocation("17",at,error)) << error;
+	EXPECT_EQ("address",at.kind);
+	EXPECT_EQ(17u,at.linear);
+
+	EXPECT_FALSE(store.ResolveLocation("no_such_symbol",at,error));
+	EXPECT_FALSE(store.ResolveLocation("cvprobe.bas:9999",at,error));
+}
+
+TEST_F(DebugSymbolsTest, ALineIsFoundByBasenameAndWithoutRegardToCase)
+{
+	if (MapFixtureDir().empty()) GTEST_SKIP() << "mcp/test/fixtures not found; set DOSBOX_TEST_FIXTURES";
+
+	/* Borland writes TDSPROBE.C; the user types the name as it is on disk. */
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(MapFixture("tdsprobe-stripped.exe").c_str(),0x8240,info));
+	DebugSymbolStore store;
+	store.AddDebugInfo(info,"TDSPROBE.EXE");
+
+	DebugLocation at;
+	std::string error;
+	ASSERT_TRUE(store.ResolveLocation("tdsprobe.c:29",at,error)) << error;
+	EXPECT_EQ(29,at.line);
+	/* _tp_scale is at 0x1a3:0x2b, and line 29 is its first statement. */
+	EXPECT_EQ(0x8240u + (0x1a3u << 4) + 0x2eu,at.linear);
+}
