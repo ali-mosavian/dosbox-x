@@ -2851,9 +2851,11 @@ server.tool(
 
 server.tool(
   "dosbox_var",
-  "Read a program variable by name. Returns its bytes always, and a decoded value " +
-  "when the program's debug info gave it a type (Borland TDINFO does; CodeView as " +
-  "read here does not, so those come back as bytes with both readings).",
+  "Read a program variable by name. A name that is not a global is looked up as a " +
+  "local or parameter of whatever is running at CS:EIP, read from the frame or the " +
+  "register it lives in. Returns its bytes always, and a decoded value when the " +
+  "program's debug info gave it a type (Borland TDINFO does; CodeView as read here " +
+  "does not, so those come back as bytes with both readings).",
   {
     name: z.string().describe("Variable name, e.g. 'g_counter' or 'module!g_counter'."),
     len: z.number().int().min(1).max(4096).optional().describe(
@@ -2862,6 +2864,20 @@ server.tool(
   },
   async ({ name, len }) => {
     const resp = await db.sendCommand(clean({ cmd: "var", name, len }));
+    return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+  },
+);
+
+server.tool(
+  "dosbox_locals",
+  "Every local and parameter in scope where the CPU is stopped, innermost first, " +
+  "with values. A frame variable is only where BP says it is once the function's " +
+  "prologue has run, so the frame each was read through comes back with it.",
+  {
+    linear: z.number().int().optional().describe("Ask about another address instead of CS:EIP."),
+  },
+  async ({ linear }) => {
+    const resp = await db.sendCommand(clean({ cmd: "locals", linear }));
     return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
   },
 );
