@@ -88,6 +88,7 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 	out.valueSize = 0;
 	out.valueKind = DEBUG_VALUE_UNKNOWN;
 	out.elementSize = 0;
+	out.fields.clear();
 	if (depth > 8) return std::string();
 
 	if (type < 0x1000) return CvPrimitiveName(type,out);
@@ -115,6 +116,7 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 		out.valueSize = record.size;
 		out.valueKind = inner.valueKind;
 		out.elementSize = inner.valueSize;
+		out.fields = inner.fields;
 
 		char count[32];
 		snprintf(count,sizeof(count),"[%u]",
@@ -123,15 +125,35 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 	}
 	case 0x0004:					/* LF_CLASS */
 	case 0x0005:					/* LF_STRUCTURE */
-	case 0x0006:					/* LF_UNION */
+	case 0x0006: {					/* LF_UNION */
 		out.valueSize = record.size;
+
+		/* Unlike Borland's, a CodeView member says where it sits. */
+		const size_t list = (size_t)record.fieldList - 0x1000;
+		if (record.fieldList >= 0x1000 && list < info.types.size()) {
+			const CvType &fields = info.types[list];
+			for (size_t i = 0;i < fields.members.size();i++) {
+				DebugSymbol member;
+				DebugField field;
+				field.typeName = CodeViewTypeName(info,fields.members[i].type,member,depth + 1);
+				field.name = fields.members[i].name;
+				field.offset = fields.members[i].offset;
+				field.size = member.valueSize;
+				field.kind = member.valueKind;
+				field.elementSize = member.elementSize;
+				out.fields.push_back(field);
+			}
+		}
 		return record.name.empty() ? std::string("struct") : record.name;
+	}
 	case 0x0008:					/* LF_PROCEDURE */
 		out.isFunction = true;
 		return "function";
 	case 0x000d:
 		/* A BASIC array: the symbol addresses a runtime descriptor, not the
 		 * elements, so there is no width to read here. */
+		out.elementSize = inner.valueSize;
+		out.fields = inner.fields;
 		return "BASIC array of " + (underlying.empty() ? std::string("?") : underlying);
 	}
 	return std::string();
@@ -225,13 +247,14 @@ static void CodeViewLines(const CvInfo &info,DebugInfo &out)
 }
 
 /* A symbol names a 1-based type record; ARRAY points at its element type. */
-static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSymbol &out)
+static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSymbol &out,int depth = 0)
 {
 	out.valueSize = 0;
 	out.valueKind = DEBUG_VALUE_UNKNOWN;
 	out.elementSize = 0;
+	out.fields.clear();
 	out.isFunction = false;
-	if (typeIndex < 1 || typeIndex > info.types.size()) return std::string();
+	if (depth > 8 || typeIndex < 1 || typeIndex > info.types.size()) return std::string();
 
 	const TdType &type = info.types[typeIndex-1];
 	out.valueSize = type.size;
@@ -248,8 +271,6 @@ static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSy
 	case 13: scalar = "float";         out.valueKind = DEBUG_VALUE_FLOAT; break;
 	case 15: scalar = "double";        out.valueKind = DEBUG_VALUE_FLOAT; break;
 	case 40: scalar = "bool";          out.valueKind = DEBUG_VALUE_UNSIGNED; break;
-	case 30: scalar = "struct"; break;
-	case 31: scalar = "union"; break;
 	case 34: scalar = "enum"; break;
 	}
 	if (scalar != NULL) return !type.name.empty() ? type.name : scalar;
@@ -262,16 +283,44 @@ static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSy
 
 	if (type.id == 26) {			/* ARRAY */
 		DebugSymbol element;
-		const std::string elementName = BorlandTypeName(info,type.memberType,element);
+		const std::string elementName = BorlandTypeName(info,type.memberType,element,depth + 1);
 
 		out.valueSize = type.size;
 		out.valueKind = element.valueKind;
 		out.elementSize = element.valueSize;
+		out.fields = element.fields;
 
 		char count[32];
 		snprintf(count,sizeof(count),"[%u]",
 		         (unsigned int)(element.valueSize > 0 ? type.size / element.valueSize : 0));
 		return (elementName.empty() ? std::string("?") : elementName) + count;
+	}
+
+	if (type.id == 30 || type.id == 31) {	/* STRUCT, UNION */
+		/* Members carry no offset of their own, so the fields are placed one
+		 * after another in declaration order. That is where they land under
+		 * Borland's default byte alignment and nowhere else, so the layout is
+		 * only reported when it adds up to the size the type declares. */
+		std::vector<DebugField> fields;
+		uint32_t at = 0;
+		for (size_t i = (size_t)type.memberType;i >= 1 && i <= info.members.size();i++) {
+			const TdMember &member = info.members[i-1];
+			if (member.info == 0xc0) break;
+
+			DebugSymbol field;
+			DebugField out_field;
+			out_field.typeName = BorlandTypeName(info,member.type,field,depth + 1);
+			out_field.name = member.name;
+			out_field.offset = type.id == 31 ? 0u : at;
+			out_field.size = field.valueSize;
+			out_field.kind = field.valueKind;
+			out_field.elementSize = field.elementSize;
+			fields.push_back(out_field);
+			at += field.valueSize;
+		}
+
+		if (type.id == 31 || at == type.size) out.fields = fields;
+		return type.name.empty() ? std::string(type.id == 31 ? "union" : "struct") : type.name;
 	}
 
 	return std::string();
@@ -343,6 +392,7 @@ static void BorlandScopes(const TdInfo &info,DebugInfo &out)
 				local.valueSize = typed.valueSize;
 				local.valueKind = typed.valueKind;
 				local.elementSize = typed.elementSize;
+				local.fields = typed.fields;
 				out_scope.locals.push_back(local);
 			}
 

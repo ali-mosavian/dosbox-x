@@ -147,11 +147,19 @@ struct CvLineTable {
  * and what it is made of. LF_BARRAY is a BASIC array, which carries no element
  * count because the count lives in the runtime descriptor the symbol points at.
  */
+struct CvMember {
+	std::string name;
+	uint16_t type = 0;
+	uint32_t offset = 0;
+};
+
 struct CvType {
 	uint16_t leaf = 0;
 	uint16_t utype = 0;	/* element, pointed-to or return type */
 	uint32_t size = 0;	/* bytes, for arrays and structures */
+	uint16_t fieldList = 0;	/* LF_FIELDLIST holding the members, for a structure */
 	std::string name;
+	std::vector<CvMember> members;	/* on the LF_FIELDLIST record itself */
 };
 
 struct CvDirEntry {
@@ -223,6 +231,15 @@ struct TdSymbol {
 	uint16_t type = 0;
 };
 
+/* A field of a structure or union. Members carry no offset: the fields sit
+ * one after another in declaration order, which is where they land under
+ * Borland's default byte alignment. info 0xC0 ends a member list. */
+struct TdMember {
+	std::string name;
+	uint16_t type = 0;
+	uint8_t info = 0;
+};
+
 struct TdModule {
 	uint16_t index = 0;
 	std::string name;
@@ -279,6 +296,7 @@ struct TdInfo {
 	std::vector<TdSourceFile> sourceFiles;
 	std::vector<TdLine> lines;
 	std::vector<TdType> types;
+	std::vector<TdMember> members;
 	std::vector<std::string> warnings;
 };
 
@@ -408,6 +426,16 @@ enum DebugValueKind {
 	DEBUG_VALUE_FLOAT
 };
 
+/* One field of a structure, placed within it. */
+struct DebugField {
+	std::string name;
+	uint32_t offset = 0;
+	uint32_t size = 0;
+	std::string typeName;
+	DebugValueKind kind = DEBUG_VALUE_UNKNOWN;
+	uint32_t elementSize = 0;	/* non-zero when the field is itself an array */
+};
+
 struct DebugSymbol {
 	std::string name;
 	uint32_t linear = 0;
@@ -428,6 +456,9 @@ struct DebugSymbol {
 	 * 0 for anything that is not one. */
 	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;
 	uint32_t elementSize = 0;
+	/* Set when the type is a structure, or an array of one: elementSize is
+	 * then the stride between elements. */
+	std::vector<DebugField> fields;
 	bool isFunction = false;
 	DebugFormatId source = DEBUG_FORMAT_CODEVIEW;
 };
@@ -462,6 +493,7 @@ struct DebugLocal {
 	uint32_t valueSize = 0;
 	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;
 	uint32_t elementSize = 0;
+	std::vector<DebugField> fields;
 };
 
 /* A function body or a block inside one, and the variables it holds. */

@@ -705,6 +705,70 @@ static std::string decode_value(const std::vector<uint8_t>& bytes, size_t at, ui
     return buf;
 }
 
+// The fields of one structure, decoded out of bytes already read. A field
+// whose own type is a structure or an array gets its place and width but no
+// value: one level is what a variable read is for.
+static std::string fields_json(const std::vector<uint8_t>& bytes, size_t at,
+                               const std::vector<DebugField>& fields) {
+    std::string out;
+    for (size_t i = 0; i < fields.size(); i++) {
+        const DebugField& field = fields[i];
+        std::string one = json_str("name", field.name) + "," +
+                          json_num("offset", field.offset) + "," +
+                          json_num("size", field.size);
+        if (!field.typeName.empty()) one += "," + json_str("type", field.typeName);
+
+        if (field.kind != DEBUG_VALUE_UNKNOWN && field.elementSize == 0) {
+            const std::string value = decode_value(bytes, at + field.offset, field.size, field.kind);
+            if (!value.empty()) one += "," + json_raw("value", value);
+        }
+        if (!out.empty()) out += ",";
+        out += "{" + one + "}";
+    }
+    return out;
+}
+
+// How to read the bytes of a variable: as one structure, as an array of
+// them, as an array of scalars, or as a single scalar.
+static const uint32_t VAR_MAX_ELEMENTS = 64;
+
+static std::string decoded_value_json(const std::vector<uint8_t>& bytes, uint32_t length,
+                                      DebugValueKind kind, uint32_t elementSize,
+                                      const std::vector<DebugField>& fields) {
+    if (!fields.empty() && elementSize > 0) {
+        std::string arr;
+        uint32_t shown = 0;
+        for (uint32_t at = 0; at + elementSize <= length && shown < VAR_MAX_ELEMENTS; at += elementSize) {
+            if (!arr.empty()) arr += ",";
+            arr += "{" + json_num("index", shown) + ",\"fields\":[" + fields_json(bytes, at, fields) + "]}";
+            shown++;
+        }
+        std::string out = ",\"elements\":[" + arr + "]";
+        const uint32_t total = elementSize > 0 ? length / elementSize : 0;
+        if (total > shown) out += "," + json_num("elements_not_shown", total - shown);
+        return out;
+    }
+    if (!fields.empty()) return ",\"fields\":[" + fields_json(bytes, 0, fields) + "]";
+
+    if (kind != DEBUG_VALUE_UNKNOWN && elementSize > 0) {
+        std::string values;
+        uint32_t shown = 0;
+        for (uint32_t at = 0; at + elementSize <= length && shown < VAR_MAX_ELEMENTS; at += elementSize) {
+            const std::string one = decode_value(bytes, at, elementSize, kind);
+            if (one.empty()) break;
+            if (!values.empty()) values += ",";
+            values += one;
+            shown++;
+        }
+        return ",\"values\":[" + values + "]";
+    }
+    if (kind != DEBUG_VALUE_UNKNOWN) {
+        const std::string one = decode_value(bytes, 0, length, kind);
+        if (!one.empty()) return "," + json_raw("value", one);
+    }
+    return std::string();
+}
+
 // Borland numbers registers the way x86 encodes them.
 static const char* register_name(uint16_t reg) {
     static const char* const names[8] = {"AX","CX","DX","BX","SP","BP","SI","DI"};
@@ -767,18 +831,7 @@ static std::string local_json(const DebugLocal& local, const std::string& functi
            "," + json_bool("readable", complete) +
            "," + json_str("bytes", hex);
 
-    if (local.valueKind != DEBUG_VALUE_UNKNOWN && local.elementSize > 0) {
-        std::string values;
-        for (uint32_t k = 0; k + local.elementSize <= length; k += local.elementSize) {
-            const std::string one = decode_value(bytes, k, local.elementSize, local.valueKind);
-            if (one.empty()) break;
-            if (!values.empty()) values += ",";
-            values += one;
-        }
-        out += ",\"values\":[" + values + "]";
-    } else if (local.valueKind != DEBUG_VALUE_UNKNOWN) {
-        out += "," + json_raw("value", decode_value(bytes, 0, length, local.valueKind));
-    }
+    out += decoded_value_json(bytes, length, local.valueKind, local.elementSize, local.fields);
     return out;
 }
 
@@ -2672,18 +2725,10 @@ static void process_command(const std::string& json) {
                           json_str("bytes", hex);
         if (!symbol->typeName.empty()) out += "," + json_str("type", symbol->typeName);
 
-        if (symbol->valueKind != DEBUG_VALUE_UNKNOWN && symbol->elementSize > 0) {
-            std::string values;
-            for (uint32_t at = 0; at + symbol->elementSize <= length; at += symbol->elementSize) {
-                const std::string one = decode_value(bytes, at, symbol->elementSize, symbol->valueKind);
-                if (one.empty()) break;
-                if (!values.empty()) values += ",";
-                values += one;
-            }
-            out += ",\"values\":[" + values + "]";
-        } else if (symbol->valueKind != DEBUG_VALUE_UNKNOWN) {
-            const std::string one = decode_value(bytes, 0, symbol->valueSize, symbol->valueKind);
-            if (!one.empty()) out += "," + json_raw("value", one);
+        const std::string decoded = decoded_value_json(bytes, length, symbol->valueKind,
+                                                       symbol->elementSize, symbol->fields);
+        if (!decoded.empty()) {
+            out += decoded;
         } else if (length == 1 || length == 2 || length == 4) {
             // No type to go on: give both readings of the bytes rather than
             // picking one and calling it the value.

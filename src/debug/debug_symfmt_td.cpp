@@ -209,5 +209,18 @@ bool DEBUG_ParseBorland(const DebugBytes &data,TdInfo &out)
 		type.memberType = data.u16((size_t)off + 6);
 		out.types.push_back(type);
 	}
+	at += (uint64_t)header.typesCount * 8;
+
+	for (uint16_t i = 0;i < header.membersCount;i++) {
+		const uint64_t off = at + (uint64_t)i * 5;
+		if (off + 5 > data.size()) break;
+
+		TdMember member;
+		member.info = data.u8((size_t)off);
+		const uint16_t nameIndex = data.u16((size_t)off + 1);
+		if (nameIndex >= 1 && nameIndex <= names.size()) member.name = names[nameIndex-1];
+		member.type = data.u16((size_t)off + 3);
+		out.members.push_back(member);
+	}
 	return true;
 }

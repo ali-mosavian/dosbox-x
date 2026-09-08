@@ -167,6 +167,39 @@ static uint32_t ReadNumericLeaf(const DebugBytes &body,size_t at,size_t &next)
 }
 
 /*
+ * The members of one LF_FIELDLIST: each is a leaf, the member's type, an
+ * attribute word, where it sits in the structure, and its name. Bytes 0xF0
+ * and up are padding to the next four-byte boundary, not a leaf.
+ */
+static std::vector<CvMember> ParseFieldList(const DebugBytes &body,size_t at,size_t end)
+{
+	std::vector<CvMember> members;
+
+	while (at + 2 <= end) {
+		/* LF_PADn says how many bytes to skip, itself included: stepping
+		 * over one byte lands in the middle of the padding and reads 0x0000
+		 * as the next leaf, which ends the list after its first member. */
+		if (body.u8(at) >= 0xf0) {
+			at += body.u8(at) & 0x0fu;
+			continue;
+		}
+
+		const uint16_t leaf = body.u16(at);
+		if (leaf != 0x0406 && leaf != 0x0405) break;	/* LF_MEMBER, LF_STMEMBER */
+
+		CvMember member;
+		member.type = body.u16(at + 2);
+
+		size_t next = 0;
+		member.offset = ReadNumericLeaf(body,at + 6,next);
+		member.name = body.pstr(next,&next);
+		members.push_back(member);
+		at = next;
+	}
+	return members;
+}
+
+/*
  * sstGlobalTypes: flags, a count, that many record offsets, then the records.
  * The offsets are counted from the start of the subsection -- the first one
  * lands exactly on the byte after the offset array, which is where the
@@ -209,10 +242,14 @@ static std::vector<CvType> ParseGlobalTypes(const DebugBytes &body)
 		case 0x0006: {					/* LF_UNION */
 			size_t next = 0;
 			const size_t at_size = type.leaf == 0x0006 ? record + 6 : record + 12;
+			type.fieldList = body.u16(record + 4);
 			type.size = ReadNumericLeaf(body,at_size,next);
 			type.name = body.pstr(next);
 			break;
 		}
+		case 0x0204:					/* LF_FIELDLIST */
+			type.members = ParseFieldList(body,record + 2,record + length);
+			break;
 		case 0x0008:					/* LF_PROCEDURE */
 			type.utype = body.u16(record + 2);	/* return type */
 			break;

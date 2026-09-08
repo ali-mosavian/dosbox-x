@@ -560,6 +560,35 @@ TEST_F(DebugSymFmtTest, CodeViewDecodesRealsAndStructuresInALargerProgram)
 	EXPECT_EQ("BASIC array of char[12]",byName["mem_tag"]->typeName);
 }
 
+TEST_F(DebugSymFmtTest, ACodeViewStructuresFieldsAreAllOfThem)
+{
+	/* A member record is padded to a four-byte boundary with LF_PADn, which
+	 * says how many bytes to skip including itself. Stepping over one byte
+	 * lands inside the padding, reads 0x0000 as the next leaf and ends the
+	 * list: u3dVector3f came back with x and neither y nor z. */
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("qrender-cv.exe").c_str(),0x8240,info));
+
+	const DebugSymbol *camera = NULL;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (info.symbols[i].name == "cam_up") camera = &info.symbols[i];
+	ASSERT_TRUE(camera != NULL);
+
+	EXPECT_EQ("u3dVector3f",camera->typeName);
+	ASSERT_EQ(3u,camera->fields.size());
+	EXPECT_EQ("x",camera->fields[0].name);
+	EXPECT_EQ(0u,camera->fields[0].offset);
+	EXPECT_EQ("y",camera->fields[1].name);
+	EXPECT_EQ(4u,camera->fields[1].offset);
+	EXPECT_EQ("z",camera->fields[2].name);
+	EXPECT_EQ(8u,camera->fields[2].offset);
+	for (size_t i = 0;i < 3;i++) {
+		EXPECT_EQ("float",camera->fields[i].typeName);
+		EXPECT_EQ(4u,camera->fields[i].size);
+		EXPECT_EQ(DEBUG_VALUE_FLOAT,camera->fields[i].kind);
+	}
+}
+
 /* ---- Borland TDINFO ---- */
 
 bool LoadTdInfo(const char *name,std::vector<uint8_t> &data,TdInfo &info)
@@ -948,4 +977,74 @@ TEST_F(DebugSymFmtTest, ACodeViewExeIsNotMistakenForWatcomDebugInfo)
 	}
 }
 
+}
+
+TEST_F(DebugSymFmtTest, ABorlandStructIsPlacedFieldByField)
+{
+	/* udtprobe.c's `struct Point { int x; int y; long tag; }` and its
+	 * `path[4]`. A member record carries no offset, so the fields are laid
+	 * out in declaration order and only reported when they add up to the
+	 * size the type itself declares. */
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("udtprobe.exe").c_str(),0x8240,info));
+
+	std::map<std::string,const DebugSymbol*> byName;
+	for (size_t i = 0;i < info.symbols.size();i++) byName[info.symbols[i].name] = &info.symbols[i];
+
+	ASSERT_TRUE(byName.count("_origin") != 0);
+	const DebugSymbol *origin = byName["_origin"];
+	EXPECT_EQ("Point",origin->typeName);
+	EXPECT_EQ(8u,origin->valueSize);
+	ASSERT_EQ(3u,origin->fields.size());
+	EXPECT_EQ("x",origin->fields[0].name);
+	EXPECT_EQ(0u,origin->fields[0].offset);
+	EXPECT_EQ(2u,origin->fields[0].size);
+	EXPECT_EQ("y",origin->fields[1].name);
+	EXPECT_EQ(2u,origin->fields[1].offset);
+	EXPECT_EQ("tag",origin->fields[2].name);
+	EXPECT_EQ(4u,origin->fields[2].offset);
+	EXPECT_EQ("long",origin->fields[2].typeName);
+	EXPECT_EQ(4u,origin->fields[2].size);
+
+	/* An array of them repeats those fields at its own stride. */
+	ASSERT_TRUE(byName.count("_path") != 0);
+	const DebugSymbol *path = byName["_path"];
+	EXPECT_EQ("Point[4]",path->typeName);
+	EXPECT_EQ(32u,path->valueSize);
+	EXPECT_EQ(8u,path->elementSize);
+	ASSERT_EQ(3u,path->fields.size());
+	EXPECT_EQ("tag",path->fields[2].name);
+
+	/* main's own `struct Point local` is a frame variable with the same
+	 * fields, reached through its scope rather than the symbol table. */
+	const DebugLocal *local = NULL;
+	for (size_t i = 0;i < info.scopes.size();i++)
+		for (size_t k = 0;k < info.scopes[i].locals.size();k++)
+			if (info.scopes[i].locals[k].name == "local") local = &info.scopes[i].locals[k];
+	ASSERT_TRUE(local != NULL);
+	EXPECT_EQ("Point",local->typeName);
+	EXPECT_EQ(DEBUG_STORAGE_FRAME,local->storage);
+	ASSERT_EQ(3u,local->fields.size());
+	EXPECT_EQ("tag",local->fields[2].name);
+}
+
+TEST_F(DebugSymFmtTest, ABorlandStructWithAHoleReportsNoFieldPlaces)
+{
+	/* udtalign.c is the same shape compiled with word alignment: `struct
+	 * Padded { char c; long v; }` is 6 bytes, and its member records account
+	 * for 5 -- the hole after c is a member record with info 0x40 and no
+	 * type, which says nothing about how wide it is. Laying the fields out
+	 * in declaration order would put v at 1 instead of 2, so the type is
+	 * named and its places are left out. */
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("udtalign.exe").c_str(),0x8240,info));
+
+	const DebugSymbol *padded = NULL;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (info.symbols[i].name == "_padded") padded = &info.symbols[i];
+	ASSERT_TRUE(padded != NULL);
+
+	EXPECT_EQ("Padded",padded->typeName);
+	EXPECT_EQ(6u,padded->valueSize);
+	EXPECT_TRUE(padded->fields.empty());
 }
