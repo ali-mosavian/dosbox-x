@@ -72,7 +72,7 @@ import {
   parseQualifiedSymbolName,
   type UnifiedSymbol,
 } from "./symbolIndex.js";
-import { symbolsFromSocketList } from "./socketSymbols.js";
+import { symbolFromSocket, symbolsFromSocketList } from "./socketSymbols.js";
 import {
   debuggerStopBlockDecision,
   isDefaultCriticalStopEvent,
@@ -939,6 +939,30 @@ async function resolveLoadedSymbolWithWarning(name: string, loadSegment?: number
     };
   }
 
+  // The emulator's store answers names the mirrored index cannot spell:
+  // "module!name" matches there with any extension stripped, and here only
+  // .d32 is. Asking it is also how a symbol that arrived after the last
+  // mirror still resolves.
+  const fromSocket = await db.sendCommand({ cmd: "sym", name }, undefined, 5_000)
+    .catch(() => ({ status: "error" }) as db.JsonObject);
+  if (fromSocket["status"] === "ok") {
+    const symbol = symbolFromSocket(fromSocket);
+    if (symbol !== undefined) {
+      return {
+        resolved: {
+          name: symbol.name,
+          requested: name,
+          space: symbol.space,
+          linear: symbol.linear,
+          offset: symbol.offset,
+          explanation: symbol.explanation,
+          source: symbol.source,
+        } as ResolvedAddress,
+        warning: undefined,
+      };
+    }
+  }
+
   let symError: Error | undefined;
   if (loadedSymbols !== undefined) {
     try {
@@ -1375,7 +1399,9 @@ server.tool(
     ),
   },
   async ({ conf, headless, skipStartupFaults }) => {
-    const result = await withTimeout("dosbox_launch", 5_000, db.launch({ conf, headless }));
+    // db.launch waits 15 s for the socket; giving up sooner than it does
+    // reported every slow-but-successful launch as a failure.
+    const result = await withTimeout("dosbox_launch", 20_000, db.launch({ conf, headless }));
     clearMcpDebugSessionState();
     // Only for reporting which drives are mounted; the emulator reads a
     // program's debug info through its own filesystem, so nothing here has to
@@ -2428,7 +2454,14 @@ server.tool(
 
       if (op === "resolve") {
         if (name === undefined) return { content: [{ type: "text", text: "ERROR: name is required" }], isError: true };
-        const resolved = symbolIndex.resolve(name);
+        let resolved = symbolIndex.resolve(name);
+        if (resolved === undefined) {
+          // The emulator's store spells some names this index cannot, such as
+          // "cvprobe!pr_fill": module matching there strips any extension.
+          const reply = await db.sendCommand({ cmd: "sym", name }, undefined, 5_000)
+            .catch(() => ({ status: "error" }) as db.JsonObject);
+          if (reply["status"] === "ok") resolved = symbolFromSocket(reply);
+        }
         if (resolved === undefined) return { content: [{ type: "text", text: `ERROR: unknown symbol ${name}` }], isError: true };
         return { content: [{ type: "text", text: j(resolved) }] };
       }

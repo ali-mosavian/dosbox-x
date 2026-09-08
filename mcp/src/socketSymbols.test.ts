@@ -50,6 +50,16 @@ test("an entry with no name or no address is dropped, not indexed at 0", () => {
   assert.equal(symbolFromSocket(undefined), undefined);
 });
 
+test("a {cmd:'sym'} reply converts too: same fields, no array around them", () => {
+  const symbol = symbolFromSocket({
+    status: "ok", name: "pr_fill", linear: "0x00008319", segment: 1, offset: "0x000000D9",
+    source: "codeview", size: 62, module: "cvprobe.obj", program: "CVPROBE.EXE",
+  });
+  assert.ok(symbol);
+  assert.equal(symbol.linear, 0x8319);
+  assert.equal(symbol.module, "cvprobe.obj");
+});
+
 test("symbolsFromSocketList reads the reply and skips what it cannot use", () => {
   assert.deepEqual(symbolsFromSocketList(LIVE_REPLY).map((symbol) => symbol.name), ["pr_add", "R_DRAW_WORLD"]);
   assert.deepEqual(symbolsFromSocketList({ status: "error" }), []);

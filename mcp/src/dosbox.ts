@@ -27,13 +27,17 @@ const __dirname = dirname(__filename);
 
 export const PROJECT_ROOT = resolve(__dirname, "../..");
 // mcp/bin/dosbox-x is the bundled copy; fall back to the in-tree debug build.
-export const DEFAULT_BIN = existsSync(resolve(__dirname, "../bin/dosbox-x"))
+// DOSBOX_MCP_BIN overrides both, which is how a freshly built emulator gets
+// exercised without overwriting the bundled copy a live session is running.
+export const DEFAULT_BIN = process.env["DOSBOX_MCP_BIN"] ?? (existsSync(resolve(__dirname, "../bin/dosbox-x"))
   ? resolve(__dirname, "../bin/dosbox-x")
-  : resolve(PROJECT_ROOT, "src/dosbox-x");
+  : resolve(PROJECT_ROOT, "src/dosbox-x"));
 // macOS .app wrapper — launched via open(1) to get proper Cocoa/SDL GUI context.
 export const MACOS_APP_BUNDLE = resolve(__dirname, "../bin/dosbox-debug.app");
 export const DEFAULT_CONF = process.env["DOSBOX_MCP_CONF"] ?? resolve(PROJECT_ROOT, "dosbox-x.reference.conf");
-export const DEFAULT_PORT = 2159;
+/* DOSBOX_MCP_PORT keeps a second server off the port a live session is using,
+ * which is also the only way to exercise this one while one is running. */
+export const DEFAULT_PORT = Number.parseInt(process.env["DOSBOX_MCP_PORT"] ?? "2159", 10) || 2159;
 
 export type JsonObject = Record<string, unknown>;
 
