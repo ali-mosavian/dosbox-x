@@ -1,0 +1,24 @@
+{
+  "name": "dosbox-debug-mcp",
+  "version": "1.0.0",
+  "description": "DOSBox-X debug socket MCP server",
+  "type": "module",
+  "bin": {
+    "dosbox-debug-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test \"build/**/*.test.js\"",
+    "bundle": "mkdir -p bin && cp ../src/dosbox-x bin/dosbox-x",
+    "start": "node build/index.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}

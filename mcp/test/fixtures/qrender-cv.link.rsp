@@ -1,0 +1,16 @@
+/NOE /CO /MAP /SEG:800 main.obj+common.obj+h_bench.obj+h_frame.obj+
+qglarr.obj+qglchk.obj+qgldiff.obj+qglface.obj+
+qglpres.obj+sys.obj+vid.obj+d_mdl.obj+
+d_poly.obj+d_surf.obj+mod_tex.obj+model.obj+
+r_bsp.obj+screen.obj+ent.obj+in_main.obj+
+pl_move.obj+snd.obj+view.obj+D_FACES.OBJ+
+R_SPAN.OBJ+R_WALK.OBJ+SB_BUILD.OBJ+PL_TRACE.OBJ+
+QR_PROF.OBJ+R_SWEEP.OBJ+AR.OBJ+CLIP.OBJ+
+DR.OBJ+FILE.OBJ+GEM.OBJ+MEM.OBJ+
+MGLDC.OBJ+MGLEMS.OBJ+RS.OBJ+SB.OBJ+
+SF.OBJ+TXT.OBJ+VGA.OBJ+Z.OBJ+
+B8FILL.OBJ+B8SPAN.OBJ+M:\LIB\ADDONS\U3D.OBJ
+qrender.exe
+qrender.map
+V:\LIB\VBDCL10E.LIB+C:\UGLV.LIB+B:\LIB\MATHC.LIB+B:\LIB\CL.LIB
+;
