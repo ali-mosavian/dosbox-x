@@ -103,7 +103,6 @@ bool DEBUG_ParseBorland(const DebugBytes &data,TdInfo &out)
 	snprintf(version,sizeof(version),"TDINFO %u.%u",(unsigned int)header.major,(unsigned int)header.minor);
 	out.version = version;
 	out.base = base;
-	out.lineRecordCount = header.lineNumbersCount;
 
 	/* The tables are a flat run in a fixed order with no directory: every one
 	 * must be stepped over at its own record size to reach the next. */
@@ -141,8 +140,43 @@ bool DEBUG_ParseBorland(const DebugBytes &data,TdInfo &out)
 	}
 	at += (uint64_t)header.modulesCount * 16;
 
+	/* A source file record is a name and four bytes this reader does not use;
+	 * only the name is needed to say which file a line belongs to. */
+	for (uint16_t i = 0;i < header.sourceFilesCount;i++) {
+		const uint64_t off = at + (uint64_t)i * 6;
+		if (off + 6 > data.size()) break;
+
+		TdSourceFile file;
+		const uint16_t nameIndex = data.u16((size_t)off);
+		if (nameIndex >= 1 && nameIndex <= names.size()) file.name = names[nameIndex-1];
+		out.sourceFiles.push_back(file);
+	}
 	at += (uint64_t)header.sourceFilesCount * 6;
+
+	for (uint16_t i = 0;i < header.lineNumbersCount;i++) {
+		const uint64_t off = at + (uint64_t)i * 4;
+		if (off + 4 > data.size()) break;
+
+		TdLine line;
+		line.line = data.u16((size_t)off);
+		line.offset = data.u16((size_t)off + 2);
+		out.lines.push_back(line);
+	}
 	at += (uint64_t)header.lineNumbersCount * 4;
+
+	for (uint16_t i = 0;i < header.scopesCount;i++) {
+		const uint64_t off = at + (uint64_t)i * 12;
+		if (off + 12 > data.size()) break;
+
+		TdScope scope;
+		scope.symbolIndex = data.u16((size_t)off);
+		scope.symbolCount = data.u16((size_t)off + 2);
+		scope.parent = data.u16((size_t)off + 4);
+		scope.function = data.u16((size_t)off + 6);
+		scope.offset = data.u16((size_t)off + 8);
+		scope.length = data.u16((size_t)off + 10);
+		out.scopes.push_back(scope);
+	}
 	at += (uint64_t)header.scopesCount * 12;
 
 	for (uint16_t i = 0;i < header.segmentsCount;i++) {
@@ -154,7 +188,26 @@ bool DEBUG_ParseBorland(const DebugBytes &data,TdInfo &out)
 		segment.codeSegment = data.u16((size_t)off + 2);
 		segment.codeOffset = data.u16((size_t)off + 4);
 		segment.codeLength = data.u16((size_t)off + 6);
+		segment.scopeIndex = data.u16((size_t)off + 8);
+		segment.scopeCount = data.u16((size_t)off + 10);
 		out.segments.push_back(segment);
+	}
+	at += (uint64_t)header.segmentsCount * 16;
+
+	at += (uint64_t)header.correlationsCount * 8;
+
+	for (uint16_t i = 0;i < header.typesCount;i++) {
+		const uint64_t off = at + (uint64_t)i * 8;
+		if (off + 8 > data.size()) break;
+
+		TdType type;
+		type.id = data.u8((size_t)off);
+		const uint16_t nameIndex = data.u16((size_t)off + 1);
+		if (nameIndex >= 1 && nameIndex <= names.size()) type.name = names[nameIndex-1];
+		type.size = data.u16((size_t)off + 3);
+		type.classType = data.u8((size_t)off + 5);
+		type.memberType = data.u16((size_t)off + 6);
+		out.types.push_back(type);
 	}
 	return true;
 }

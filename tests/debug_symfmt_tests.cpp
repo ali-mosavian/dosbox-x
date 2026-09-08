@@ -484,7 +484,7 @@ TEST_F(DebugSymFmtTest, TheSegmentTableIsReachedByStridingTheTablesBeforeIt)
 	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",data,info));
 
 	EXPECT_EQ(113u,info.symbols.size());
-	EXPECT_EQ(17u,info.lineRecordCount);
+	EXPECT_EQ(17u,info.lines.size());
 
 	ASSERT_EQ(1u,info.segments.size());
 	EXPECT_EQ(1u,info.segments[0].module);
@@ -506,6 +506,103 @@ TEST_F(DebugSymFmtTest, AnAutoSymbolsBpDisplacementIsSigned)
 			local = &info.symbols[i];
 	ASSERT_TRUE(local != NULL);
 	EXPECT_EQ(-2,local->offset);
+}
+
+TEST_F(DebugSymFmtTest, BorlandLineRecordsAreLineAndOffsetPairs)
+{
+	/* tdinfo-parser skips this table as padding, so the layout was derived
+	 * from the fixture: every record has to name a statement line of
+	 * tdsprobe.c and an offset inside the module's 112 bytes of code. Read
+	 * with the fields the other way round, record 0 claims line 14 at offset
+	 * 13 -- a plausible-looking pair that is wrong for every record. */
+	std::vector<uint8_t> data;
+	TdInfo info;
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",data,info));
+
+	ASSERT_EQ(17u,info.lines.size());
+	EXPECT_EQ(13u,info.lines[0].line);
+	EXPECT_EQ(0x0eu,info.lines[0].offset);
+	EXPECT_EQ(43u,info.lines[16].line);
+	EXPECT_EQ(0x79u,info.lines[16].offset);
+
+	/* The three function entries the .MAP places: tp_sum 0x0E, tp_scale
+	 * 0x2B, main 0x44, at the lines they are declared on. */
+	std::map<uint16_t,uint16_t> byLine;
+	for (size_t i = 0;i < info.lines.size();i++) byLine[info.lines[i].line] = info.lines[i].offset;
+	EXPECT_EQ(0x0eu,byLine[13]);
+	EXPECT_EQ(0x2bu,byLine[25]);
+	EXPECT_EQ(0x44u,byLine[34]);
+
+	ASSERT_EQ(1u,info.sourceFiles.size());
+	EXPECT_EQ("TDSPROBE.C",info.sourceFiles[0].name);
+}
+
+TEST_F(DebugSymFmtTest, ABorlandAddressReportsTheSourceLineCoveringIt)
+{
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("tdsprobe-stripped.exe").c_str(),0x1000,info));
+	ASSERT_EQ(17u,info.lines.size());
+
+	const uint32_t code = 0x1a3u << 4;
+	const DebugLine *entry = DEBUG_SourceLineAt(info,code + 0x0e);
+	ASSERT_TRUE(entry != NULL);
+	EXPECT_EQ(13u,entry->line);
+	EXPECT_EQ("TDSPROBE.C",entry->file);
+
+	/* One byte before the next record still belongs to the line before it. */
+	entry = DEBUG_SourceLineAt(info,code + 0x10);
+	ASSERT_TRUE(entry != NULL);
+	EXPECT_EQ(13u,entry->line);
+
+	entry = DEBUG_SourceLineAt(info,code + 0x44);
+	ASSERT_TRUE(entry != NULL);
+	EXPECT_EQ(34u,entry->line);
+
+	/* Past the module's 112 bytes of code nothing covers the address. */
+	EXPECT_TRUE(DEBUG_SourceLineAt(info,code + 0x100) == NULL);
+
+	/* A line ends where the next one starts, and the last runs to the end of
+	 * the module's code. Stretching every line to that end still answers
+	 * lookups correctly, so the ranges are pinned here directly. */
+	const DebugLine *first = NULL,*last = NULL;
+	for (size_t i = 0;i < info.lines.size();i++) {
+		if (info.lines[i].line == 13) first = &info.lines[i];
+		if (info.lines[i].line == 43) last = &info.lines[i];
+	}
+	ASSERT_TRUE(first != NULL && last != NULL);
+	EXPECT_EQ(code + 0x0eu,first->imageOffset);
+	EXPECT_EQ(code + 0x11u,first->endOffset);
+	EXPECT_EQ(code + 14u + 112u,last->endOffset);
+}
+
+TEST_F(DebugSymFmtTest, BorlandTypesGiveAVariableItsSizeAndAFunctionItsExtent)
+{
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("tdsprobe-stripped.exe").c_str(),0x1000,info));
+
+	std::map<std::string,const DebugSymbol*> byName;
+	for (size_t i = 0;i < info.symbols.size();i++) byName[info.symbols[i].name] = &info.symbols[i];
+
+	ASSERT_TRUE(byName.count("_g_counter") != 0);
+	EXPECT_EQ("int",byName["_g_counter"]->typeName);
+	EXPECT_EQ(2u,byName["_g_counter"]->valueSize);
+
+	EXPECT_EQ(DEBUG_VALUE_SIGNED,byName["_g_counter"]->valueKind);
+	EXPECT_EQ(0u,byName["_g_counter"]->elementSize);
+
+	ASSERT_TRUE(byName.count("_g_table") != 0);
+	EXPECT_EQ("int[8]",byName["_g_table"]->typeName);
+	EXPECT_EQ(16u,byName["_g_table"]->valueSize);
+	/* An array reads as its element type, eight times over. */
+	EXPECT_EQ(DEBUG_VALUE_SIGNED,byName["_g_table"]->valueKind);
+	EXPECT_EQ(2u,byName["_g_table"]->elementSize);
+
+	/* A function's extent comes from its scope record, not its type. */
+	ASSERT_TRUE(byName.count("_tp_sum") != 0);
+	EXPECT_TRUE(byName["_tp_sum"]->isFunction);
+	EXPECT_TRUE(byName["_tp_sum"]->hasSize);
+	EXPECT_EQ(29u,byName["_tp_sum"]->size);
+	EXPECT_EQ(58u,byName["_main"]->size);
 }
 
 TEST_F(DebugSymFmtTest, AStandaloneTdsParsesToTheBlockTdstripRemoved)

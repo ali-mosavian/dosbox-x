@@ -102,6 +102,135 @@ static void CodeViewLines(const CvInfo &info,DebugInfo &out)
 	}
 }
 
+/* A symbol names a 1-based type record; ARRAY points at its element type. */
+static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSymbol &out)
+{
+	out.valueSize = 0;
+	out.valueKind = DEBUG_VALUE_UNKNOWN;
+	out.elementSize = 0;
+	out.isFunction = false;
+	if (typeIndex < 1 || typeIndex > info.types.size()) return std::string();
+
+	const TdType &type = info.types[typeIndex-1];
+	out.valueSize = type.size;
+
+	const char *scalar = NULL;
+	switch (type.id) {
+	case 4:  scalar = "signed char";   out.valueKind = DEBUG_VALUE_SIGNED; break;
+	case 5:  scalar = "int";           out.valueKind = DEBUG_VALUE_SIGNED; break;
+	case 6:  scalar = "long";          out.valueKind = DEBUG_VALUE_SIGNED; break;
+	case 8:  scalar = "unsigned char"; out.valueKind = DEBUG_VALUE_UNSIGNED; break;
+	case 9:  scalar = "unsigned int";  out.valueKind = DEBUG_VALUE_UNSIGNED; break;
+	case 10: scalar = "unsigned long"; out.valueKind = DEBUG_VALUE_UNSIGNED; break;
+	case 12: scalar = "char *";        out.valueKind = DEBUG_VALUE_UNSIGNED; break;
+	case 13: scalar = "float";         out.valueKind = DEBUG_VALUE_FLOAT; break;
+	case 15: scalar = "double";        out.valueKind = DEBUG_VALUE_FLOAT; break;
+	case 40: scalar = "bool";          out.valueKind = DEBUG_VALUE_UNSIGNED; break;
+	case 30: scalar = "struct"; break;
+	case 31: scalar = "union"; break;
+	case 34: scalar = "enum"; break;
+	}
+	if (scalar != NULL) return !type.name.empty() ? type.name : scalar;
+
+	if (type.id == 35) {			/* FUNCTION */
+		out.isFunction = true;
+		out.valueSize = 0;
+		return "function";
+	}
+
+	if (type.id == 26) {			/* ARRAY */
+		DebugSymbol element;
+		const std::string elementName = BorlandTypeName(info,type.memberType,element);
+
+		out.valueSize = type.size;
+		out.valueKind = element.valueKind;
+		out.elementSize = element.valueSize;
+
+		char count[32];
+		snprintf(count,sizeof(count),"[%u]",
+		         (unsigned int)(element.valueSize > 0 ? type.size / element.valueSize : 0));
+		return (elementName.empty() ? std::string("?") : elementName) + count;
+	}
+
+	return std::string();
+}
+
+/* A scope with no parent is a function body, and its length is the only place
+ * TDINFO says how far a function reaches. */
+static void BorlandFunctionSizes(const TdInfo &info,DebugInfo &out)
+{
+	for (size_t s = 0;s < info.segments.size();s++) {
+		const TdSegment &segment = info.segments[s];
+		for (uint16_t i = 0;i < segment.scopeCount;i++) {
+			const size_t index = (size_t)segment.scopeIndex + i;
+			if (index < 1 || index > info.scopes.size()) continue;
+
+			const TdScope &scope = info.scopes[index-1];
+			if (scope.parent != 0 || scope.length == 0) continue;
+
+			for (size_t k = 0;k < out.symbols.size();k++) {
+				DebugSymbol &symbol = out.symbols[k];
+				if (symbol.segment != segment.codeSegment) continue;
+				if (symbol.offset != scope.offset) continue;
+				symbol.size = scope.length;
+				symbol.hasSize = true;
+			}
+		}
+	}
+}
+
+/* Line offsets are counted in the code segment of the module they belong to,
+ * and a segment record is what says which module owns which stretch of code. */
+static void BorlandLines(const TdInfo &info,DebugInfo &out)
+{
+	std::string file;
+	if (info.sourceFiles.size() == 1) file = info.sourceFiles[0].name;
+	else if (info.sourceFiles.size() > 1)
+		out.warnings.push_back("TDINFO does not say which of its source files a line belongs to; "
+		                       "lines are reported against their module");
+
+	for (size_t s = 0;s < info.segments.size();s++) {
+		const TdSegment &segment = info.segments[s];
+		const uint32_t begin = segment.codeOffset;
+		const uint32_t end = (uint32_t)segment.codeOffset + segment.codeLength;
+
+		std::string module;
+		if (segment.module >= 1 && segment.module <= info.modules.size())
+			module = info.modules[segment.module-1].name;
+
+		std::vector<uint32_t> offsets;
+		std::vector<uint16_t> numbers;
+		for (size_t i = 0;i < info.lines.size();i++) {
+			if (info.lines[i].offset < begin || info.lines[i].offset >= end) continue;
+			offsets.push_back(info.lines[i].offset);
+			numbers.push_back(info.lines[i].line);
+		}
+		if (offsets.empty()) continue;
+
+		/* Sorted so that a line's end is the next line's start, whatever
+		 * order the table happens to be written in. */
+		for (size_t i = 0;i + 1 < offsets.size();i++)
+			for (size_t k = i + 1;k < offsets.size();k++)
+				if (offsets[k] < offsets[i]) {
+					std::swap(offsets[i],offsets[k]);
+					std::swap(numbers[i],numbers[k]);
+				}
+
+		const uint32_t base = (uint32_t)segment.codeSegment << 4u;
+		for (size_t i = 0;i < offsets.size();i++) {
+			const uint32_t next = i + 1 < offsets.size() ? offsets[i+1] : end;
+
+			DebugLine line;
+			line.module = module;
+			line.file = file.empty() ? module : file;
+			line.line = numbers[i];
+			line.imageOffset = base + offsets[i];
+			line.endOffset = base + std::max(next,offsets[i] + 1);
+			out.lines.push_back(line);
+		}
+	}
+}
+
 static void BorlandSymbols(const TdInfo &info,uint32_t loadLinear,DebugInfo &out)
 {
 	/* A TDINFO segment is already a load-relative paragraph, unlike CodeView's
@@ -119,8 +248,11 @@ static void BorlandSymbols(const TdInfo &info,uint32_t loadLinear,DebugInfo &out
 		out_symbol.segmentBase = (uint32_t)symbol.segment << 4u;
 		out_symbol.linear = loadLinear + out_symbol.segmentBase + out_symbol.offset;
 		out_symbol.source = DEBUG_FORMAT_TDINFO;
+		out_symbol.typeName = BorlandTypeName(info,symbol.type,out_symbol);
 		out.symbols.push_back(out_symbol);
 	}
+
+	BorlandFunctionSizes(info,out);
 }
 
 static void WatcomSymbols(const WatInfo &info,uint32_t loadLinear,DebugInfo &out)
@@ -222,12 +354,6 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 		out.format = DEBUG_FORMAT_TDINFO;
 		out.version = td.version;
 		out.warnings = td.warnings;
-		if (td.lineRecordCount != 0) {
-			char buf[96];
-			snprintf(buf,sizeof(buf),"%u TDINFO line records present but their layout is unknown",
-			         (unsigned int)td.lineRecordCount);
-			out.warnings.push_back(buf);
-		}
 		for (size_t i = 0;i < td.modules.size();i++) {
 			DebugModule module;
 			module.name = td.modules[i].name;
@@ -235,6 +361,7 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 			out.modules.push_back(module);
 		}
 		BorlandSymbols(td,loadLinear,out);
+		BorlandLines(td,out);
 		return true;
 	}
 

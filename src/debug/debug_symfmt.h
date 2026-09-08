@@ -179,10 +179,11 @@ std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t mod
  * rather than with the tables it serves.
  *
  * Layouts from ramikg/tdinfo-parser's tdinfo_structs.py, the only complete
- * open-source description of the 16-bit form. Its source-file and line-number
- * records are skipped as padding there, so their fields are unknown and this
- * reader carries no line numbers -- see lineRecordCount, which reports how many
- * are present but unread.
+ * open-source description of the 16-bit form. It skips the source-file and
+ * line-number records as padding, so those two were derived here from
+ * tdsprobe.tds instead: a line record is {u16 line, u16 offset}, and every one
+ * of the fixture's 17 records lands on a statement line of tdsprobe.c with the
+ * offset its .MAP gives that statement's function.
  */
 
 enum TdSymbolClass {
@@ -211,11 +212,45 @@ struct TdModule {
 	std::string name;
 };
 
+struct TdSourceFile {
+	std::string name;
+};
+
+/* Offsets are within the code segment of the module the line belongs to, the
+ * same space a segment record's codeOffset counts in. */
+struct TdLine {
+	uint16_t line = 0;
+	uint16_t offset = 0;
+};
+
+/* A type is reached by 1-based index from a symbol. id is Borland's TypeId:
+ * 4 SCHAR, 5 SINT, 6 SLONG, 8 UCHAR, 9 UINT, 10 ULONG, 12 PCHAR, 13 FLOAT,
+ * 15 DOUBLE, 26 ARRAY, 30 STRUCT, 31 UNION, 34 ENUM, 35 FUNCTION, 40 BOOL. */
+struct TdType {
+	uint8_t id = 0;
+	std::string name;
+	uint16_t size = 0;
+	uint8_t classType = 0;
+	uint16_t memberType = 0;	/* element type for ARRAY, return type for FUNCTION */
+};
+
 struct TdSegment {
 	uint16_t module = 0;
 	uint16_t codeSegment = 0;
 	uint16_t codeOffset = 0;
 	uint16_t codeLength = 0;
+	uint16_t scopeIndex = 0;	/* 1-based into the scope table; 0 = none */
+	uint16_t scopeCount = 0;
+};
+
+/* One function or block: which symbols it holds and what code it covers. */
+struct TdScope {
+	uint16_t symbolIndex = 0;	/* 1-based into the symbol table */
+	uint16_t symbolCount = 0;
+	uint16_t parent = 0;		/* 1-based; 0 = none */
+	uint16_t function = 0;
+	uint16_t offset = 0;		/* within the module's code segment */
+	uint16_t length = 0;
 };
 
 struct TdInfo {
@@ -224,8 +259,10 @@ struct TdInfo {
 	std::vector<TdSymbol> symbols;
 	std::vector<TdModule> modules;
 	std::vector<TdSegment> segments;
-	/* Present in the file but not decoded; their layout is unknown. */
-	uint16_t lineRecordCount = 0;
+	std::vector<TdScope> scopes;
+	std::vector<TdSourceFile> sourceFiles;
+	std::vector<TdLine> lines;
+	std::vector<TdType> types;
 	std::vector<std::string> warnings;
 };
 
@@ -348,6 +385,13 @@ struct DebugModule {
 	uint16_t index = 0;
 };
 
+enum DebugValueKind {
+	DEBUG_VALUE_UNKNOWN,
+	DEBUG_VALUE_SIGNED,
+	DEBUG_VALUE_UNSIGNED,
+	DEBUG_VALUE_FLOAT
+};
+
 struct DebugSymbol {
 	std::string name;
 	uint32_t linear = 0;
@@ -358,6 +402,17 @@ struct DebugSymbol {
 	bool hasSize = false;
 	std::string module;
 	std::string program;		/* the loaded program these came with */
+	/* Printable type, when the format says one: "int", "int[8]", "function".
+	 * Empty means the format carried no type this reader understands. */
+	std::string typeName;
+	/* Bytes to read to see the whole variable, 0 when unknown. A function
+	 * carries its code length in size instead. */
+	uint32_t valueSize = 0;
+	/* How to read those bytes, and for an array the width of one element --
+	 * 0 for anything that is not one. */
+	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;
+	uint32_t elementSize = 0;
+	bool isFunction = false;
 	DebugFormatId source = DEBUG_FORMAT_CODEVIEW;
 };
 
