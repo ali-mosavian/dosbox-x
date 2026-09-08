@@ -281,6 +281,16 @@ static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSy
 		return "function";
 	}
 
+	if (type.id == 21 || type.id == 22) {	/* NEAR, FAR pointer */
+		DebugSymbol target;
+		const std::string name = BorlandTypeName(info,type.memberType,target,depth + 1);
+
+		out.valueSize = type.id == 21 ? 2u : 4u;
+		out.valueKind = DEBUG_VALUE_UNSIGNED;
+		return std::string(type.id == 21 ? "near ptr" : "far ptr") +
+		       (name.empty() ? std::string() : " to " + name);
+	}
+
 	if (type.id == 26) {			/* ARRAY */
 		DebugSymbol element;
 		const std::string elementName = BorlandTypeName(info,type.memberType,element,depth + 1);

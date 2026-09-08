@@ -1015,6 +1015,15 @@ TEST_F(DebugSymFmtTest, ABorlandStructIsPlacedFieldByField)
 	ASSERT_EQ(3u,path->fields.size());
 	EXPECT_EQ("tag",path->fields[2].name);
 
+	/* sum_x takes its array as a far pointer, the large model's default. */
+	const DebugLocal *parameter = NULL;
+	for (size_t i = 0;i < info.scopes.size();i++)
+		for (size_t k = 0;k < info.scopes[i].locals.size();k++)
+			if (info.scopes[i].locals[k].name == "p") parameter = &info.scopes[i].locals[k];
+	ASSERT_TRUE(parameter != NULL);
+	EXPECT_EQ("far ptr to Point",parameter->typeName);
+	EXPECT_EQ(4u,parameter->valueSize);
+
 	/* main's own `struct Point local` is a frame variable with the same
 	 * fields, reached through its scope rather than the symbol table. */
 	const DebugLocal *local = NULL;
