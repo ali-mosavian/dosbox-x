@@ -17,11 +17,7 @@
 #include <algorithm>
 #include <map>
 
-namespace dbgsym {
-
-namespace {
-
-const char * const CV_SIGNATURES[] = {
+static const char * const CV_SIGNATURES[] = {
 	"NB00","NB01","NB02","NB03","NB04","NB05","NB06","NB07","NB08","NB09","NB10","NB11"
 };
 
@@ -52,7 +48,8 @@ enum {
 	S_PUB32   = 0x0203
 };
 
-std::string format(const char *fmt,...) {
+static std::string SymFormat(const char *fmt,...)
+{
 	char buf[256];
 	va_list args;
 	va_start(args,fmt);
@@ -61,22 +58,24 @@ std::string format(const char *fmt,...) {
 	return std::string(buf);
 }
 
-bool ReadCvSignature(const Bytes &data,int64_t at,std::string &out) {
+static bool ReadCvSignature(const DebugBytes &data,int64_t at,std::string &out)
+{
 	if (at < 0 || (uint64_t)at + 8 > data.size()) return false;
 	const std::string text = data.latin1((size_t)at,(size_t)at + 4);
-	if (!IsCvSignature(text)) return false;
+	if (!DEBUG_IsCvSignature(text)) return false;
 	out = text;
 	return true;
 }
 
-std::vector<CvDirEntry> ReadDirectory(const Bytes &data,uint64_t base,bool isCv3,std::vector<std::string> &warnings) {
+static std::vector<CvDirEntry> ReadDirectory(const DebugBytes &data,uint64_t base,bool isCv3,std::vector<std::string> &warnings)
+{
 	std::vector<CvDirEntry> entries;
 
 	const uint32_t lfoDirectory = data.u32((size_t)base + 4);
 	const uint64_t at = base + lfoDirectory;
 	/* The CV4 header is 8 bytes before cDir has been read; CV3's count is 2. */
 	if (at + (isCv3 ? 2u : 8u) > data.size()) {
-		warnings.push_back(format("directory offset %u past end of file",(unsigned int)lfoDirectory));
+		warnings.push_back(SymFormat("directory offset %u past end of file",(unsigned int)lfoDirectory));
 		return entries;
 	}
 
@@ -101,7 +100,7 @@ std::vector<CvDirEntry> ReadDirectory(const Bytes &data,uint64_t base,bool isCv3
 	const uint16_t cbDirEntry = data.u16((size_t)at + 2);
 	const uint32_t cDir = data.u32((size_t)at + 4);
 	if (cbDirEntry < 12 || cbDirHeader < 8) {
-		warnings.push_back(format("implausible directory header cbDirHeader=%u cbDirEntry=%u",
+		warnings.push_back(SymFormat("implausible directory header cbDirHeader=%u cbDirEntry=%u",
 		                          (unsigned int)cbDirHeader,(unsigned int)cbDirEntry));
 		return entries;
 	}
@@ -117,13 +116,14 @@ std::vector<CvDirEntry> ReadDirectory(const Bytes &data,uint64_t base,bool isCv3
 		entries.push_back(entry);
 	}
 	if (entries.size() != cDir) {
-		warnings.push_back(format("directory claims %u entries, %u fit in the file",
+		warnings.push_back(SymFormat("directory claims %u entries, %u fit in the file",
 		                          (unsigned int)cDir,(unsigned int)entries.size()));
 	}
 	return entries;
 }
 
-bool ParseModule(const Bytes &body,uint16_t index,CvModule &out) {
+static bool ParseModule(const DebugBytes &body,uint16_t index,CvModule &out)
+{
 	if (body.size() < 8) return false;
 
 	const uint16_t cSeg = body.u16(4);
@@ -144,7 +144,8 @@ bool ParseModule(const Bytes &body,uint16_t index,CvModule &out) {
 	return true;
 }
 
-std::vector<CvSegMapEntry> ParseSegMap(const Bytes &body) {
+static std::vector<CvSegMapEntry> ParseSegMap(const DebugBytes &body)
+{
 	std::vector<CvSegMapEntry> entries;
 	if (body.size() < 4) return entries;
 
@@ -171,7 +172,8 @@ std::vector<CvSegMapEntry> ParseSegMap(const Bytes &body) {
 	return entries;
 }
 
-bool ParseSymbol(const Bytes &body,size_t at,uint16_t kindCode,uint16_t moduleIndex,CvSymbol &out) {
+static bool ParseSymbol(const DebugBytes &body,size_t at,uint16_t kindCode,uint16_t moduleIndex,CvSymbol &out)
+{
 	out.moduleIndex = moduleIndex;
 
 	switch (kindCode) {
@@ -226,14 +228,16 @@ bool ParseSymbol(const Bytes &body,size_t at,uint16_t kindCode,uint16_t moduleIn
  * tables, which are not records. Both fixtures happen to yield the same
  * symbols without the bound -- the extra records decode to kind 0 and are
  * dropped -- so this is right by the format, not by measurement. */
-std::vector<CvSymbol> ParseGlobalSymbols(const Bytes &body,uint16_t moduleIndex) {
+static std::vector<CvSymbol> ParseGlobalSymbols(const DebugBytes &body,uint16_t moduleIndex)
+{
 	if (body.size() < 16) return std::vector<CvSymbol>();
 	const uint32_t cbSymbol = body.u32(4);
 	const size_t end = (size_t)std::min((uint64_t)16u + cbSymbol,(uint64_t)body.size());
-	return ParseCvSymbolRun(body,moduleIndex,16,end);
+	return DEBUG_ParseCvSymbolRun(body,moduleIndex,16,end);
 }
 
-std::vector<CvLineTable> ParseSrcModule(const Bytes &body,uint16_t moduleIndex) {
+static std::vector<CvLineTable> ParseSrcModule(const DebugBytes &body,uint16_t moduleIndex)
+{
 	std::vector<CvLineTable> tables;
 	if (body.size() < 4) return tables;
 
@@ -276,9 +280,8 @@ std::vector<CvLineTable> ParseSrcModule(const Bytes &body,uint16_t moduleIndex) 
 	return tables;
 }
 
-}
-
-bool IsCvSignature(const std::string &text) {
+bool DEBUG_IsCvSignature(const std::string &text)
+{
 	for (size_t i = 0;i < sizeof(CV_SIGNATURES)/sizeof(CV_SIGNATURES[0]);i++)
 		if (text == CV_SIGNATURES[i]) return true;
 	return false;
@@ -292,17 +295,18 @@ bool IsCvSignature(const std::string &text) {
  * there, cvprobe.exe's two bytes later, so it is a fallback and not the
  * primary.
  */
-bool FindCvBase(const Bytes &data,uint64_t &base,std::string &signature) {
+bool DEBUG_FindCvBase(const DebugBytes &data,uint64_t &base,std::string &signature)
+{
 	std::vector<int64_t> candidates;
 
 	if (data.size() >= 8) {
 		const std::string trailer = data.latin1(data.size() - 8,data.size() - 4);
-		if (IsCvSignature(trailer))
+		if (DEBUG_IsCvSignature(trailer))
 			candidates.push_back((int64_t)data.size() - (int64_t)data.u32(data.size() - 4));
 	}
 
 	MzImage image;
-	if (ParseMzImage(data,image) && image.appendedOffset < data.size())
+	if (DEBUG_ParseMzImage(data,image) && image.appendedOffset < data.size())
 		candidates.push_back((int64_t)image.appendedOffset);
 
 	for (size_t i = 0;i < candidates.size();i++) {
@@ -323,7 +327,8 @@ bool FindCvBase(const Bytes &data,uint64_t &base,std::string &signature) {
  * covers at least the kind. Reading past it costs the whole subsection --
  * cvprobe.exe's two sstAlignSym blocks yielded 0 symbols before this.
  */
-std::vector<CvSymbol> ParseCvSymbolRun(const Bytes &body,uint16_t moduleIndex,size_t from,size_t to) {
+std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to)
+{
 	std::vector<CvSymbol> out;
 	if (to > body.size()) to = body.size();
 
@@ -342,10 +347,11 @@ std::vector<CvSymbol> ParseCvSymbolRun(const Bytes &body,uint16_t moduleIndex,si
 	return out;
 }
 
-bool ParseCodeView(const Bytes &data,CvInfo &out) {
+bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out)
+{
 	uint64_t base = 0;
 	std::string signature;
-	if (!FindCvBase(data,base,signature)) return false;
+	if (!DEBUG_FindCvBase(data,base,signature)) return false;
 
 	out.signature = signature;
 	out.base = base;
@@ -364,10 +370,10 @@ bool ParseCodeView(const Bytes &data,CvInfo &out) {
 		const CvDirEntry &entry = out.directory[i];
 		const uint64_t at = base + entry.offset;
 		if (at + entry.length > data.size()) {
-			out.warnings.push_back(format("subsection %x runs past end of file",(unsigned int)entry.subsection));
+			out.warnings.push_back(SymFormat("subsection %x runs past end of file",(unsigned int)entry.subsection));
 			continue;
 		}
-		const Bytes body = data.sub((size_t)at,entry.length);
+		const DebugBytes body = data.sub((size_t)at,entry.length);
 
 		switch (entry.subsection) {
 		case sstModule: {
@@ -379,7 +385,7 @@ bool ParseCodeView(const Bytes &data,CvInfo &out) {
 		case sstSymbols:
 		case sstAlignSym:
 		case sstStaticSym: {
-			const std::vector<CvSymbol> run = ParseCvSymbolRun(body,entry.moduleIndex,0,body.size());
+			const std::vector<CvSymbol> run = DEBUG_ParseCvSymbolRun(body,entry.moduleIndex,0,body.size());
 			out.symbols.insert(out.symbols.end(),run.begin(),run.end());
 			break;
 		}
@@ -417,10 +423,9 @@ bool ParseCodeView(const Bytes &data,CvInfo &out) {
 	return true;
 }
 
-bool ReadCodeViewFile(const char *path,CvInfo &out) {
+bool DEBUG_ReadCodeViewFile(const char *path,CvInfo &out)
+{
 	std::vector<uint8_t> data;
-	if (!ReadHostFile(path,data)) return false;
-	return ParseCodeView(Bytes(data.data(),data.size()),out);
-}
-
+	if (!DEBUG_ReadHostFile(path,data)) return false;
+	return DEBUG_ParseCodeView(DebugBytes(data.data(),data.size()),out);
 }

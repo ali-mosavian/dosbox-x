@@ -8,41 +8,45 @@
 
 #include <algorithm>
 
-namespace dbgsym {
-
-uint16_t Bytes::u16(size_t at) const {
+uint16_t DebugBytes::u16(size_t at) const
+{
 	if (at + 2 > n) return 0;
 	return (uint16_t)((uint16_t)p[at] | ((uint16_t)p[at+1] << 8));
 }
 
-uint32_t Bytes::u32(size_t at) const {
+uint32_t DebugBytes::u32(size_t at) const
+{
 	if (at + 4 > n) return 0;
 	return (uint32_t)p[at] | ((uint32_t)p[at+1] << 8) | ((uint32_t)p[at+2] << 16) | ((uint32_t)p[at+3] << 24);
 }
 
-std::string Bytes::latin1(size_t from,size_t to) const {
+std::string DebugBytes::latin1(size_t from,size_t to) const
+{
 	if (from >= n) return std::string();
 	if (to > n) to = n;
 	if (to <= from) return std::string();
 	return std::string((const char*)p + from,to - from);
 }
 
-std::string Bytes::pstr(size_t at,size_t *next) const {
+std::string DebugBytes::pstr(size_t at,size_t *next) const
+{
 	if (at >= n) {
-		if (next != nullptr) *next = at;
+		if (next != NULL) *next = at;
 		return std::string();
 	}
 	const size_t len = p[at];
-	if (next != nullptr) *next = at + 1 + len;
+	if (next != NULL) *next = at + 1 + len;
 	return latin1(at + 1,at + 1 + len);
 }
 
-Bytes Bytes::sub(size_t from,size_t len) const {
-	if (from >= n) return Bytes();
-	return Bytes(p + from,std::min(len,n - from));
+DebugBytes DebugBytes::sub(size_t from,size_t len) const
+{
+	if (from >= n) return DebugBytes();
+	return DebugBytes(p + from,std::min(len,n - from));
 }
 
-bool ParseMzHeader(const Bytes &data,MzHeader &out) {
+bool DEBUG_ParseMzHeader(const DebugBytes &data,MzHeader &out)
+{
 	if (data.size() < 28) return false;
 	const uint16_t signature = data.u16(0);
 	/* ZM is the rarer byte-swapped spelling some early linkers emitted. */
@@ -64,9 +68,10 @@ bool ParseMzHeader(const Bytes &data,MzHeader &out) {
 	return true;
 }
 
-bool ParseMzImage(const Bytes &data,MzImage &out) {
+bool DEBUG_ParseMzImage(const DebugBytes &data,MzImage &out)
+{
 	MzHeader header;
-	if (!ParseMzHeader(data,header)) return false;
+	if (!DEBUG_ParseMzHeader(data,header)) return false;
 
 	const uint64_t imageOffset = (uint64_t)header.headerParagraphs << 4u;
 	/* e_cblp is how much of the LAST page is used; zero means the page is full. */
@@ -82,7 +87,8 @@ bool ParseMzImage(const Bytes &data,MzImage &out) {
 	return true;
 }
 
-std::string MzFingerprint(const MzHeader &header) {
+std::string DEBUG_MzFingerprint(const MzHeader &header)
+{
 	const uint16_t fields[11] = {
 		header.extraBytes, header.pages, header.relocationCount,
 		header.headerParagraphs, header.minAlloc, header.maxAlloc,
@@ -100,9 +106,10 @@ std::string MzFingerprint(const MzHeader &header) {
 	return out;
 }
 
-bool ReadHostFile(const char *path,std::vector<uint8_t> &out) {
+bool DEBUG_ReadHostFile(const char *path,std::vector<uint8_t> &out)
+{
 	FILE *f = fopen(path,"rb");
-	if (f == nullptr) return false;
+	if (f == NULL) return false;
 
 	out.clear();
 	uint8_t buf[64u*1024u];
@@ -113,6 +120,4 @@ bool ReadHostFile(const char *path,std::vector<uint8_t> &out) {
 	fclose(f);
 	if (!ok) out.clear();
 	return ok;
-}
-
 }
