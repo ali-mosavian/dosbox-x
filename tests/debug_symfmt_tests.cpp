@@ -430,6 +430,136 @@ TEST_F(DebugSymFmtTest, ParseDebugInfoAppliesTheLoadBaseAndReportsModulesAndLine
 }
 
 
+TEST_F(DebugSymFmtTest, CodeViewTypesComeFromTheGlobalTypesTable)
+{
+	std::vector<uint8_t> data;
+	CvInfo info;
+	ASSERT_TRUE(LoadFixture("cvprobe.exe",data));
+	ASSERT_TRUE(DEBUG_ParseCodeView(DebugBytes(data.data(),data.size()),info));
+
+	/* The table is a flags word, a count, that many offsets, then the
+	 * records; the offsets are counted from the start of the subsection.
+	 * Reading the count where the flags are gives 1 record instead of 12. */
+	ASSERT_EQ(12u,info.types.size());
+	EXPECT_EQ(0x0201u,info.types[0].leaf);		/* LF_ARGLIST */
+	EXPECT_EQ(0x0008u,info.types[1].leaf);		/* LF_PROCEDURE returning short */
+	EXPECT_EQ(0x0011u,info.types[1].utype);
+	EXPECT_EQ(0x0002u,info.types[2].leaf);		/* LF_POINTER to short */
+	EXPECT_EQ(0x0011u,info.types[2].utype);
+	EXPECT_EQ(2u,info.types[2].size);
+	EXPECT_EQ(0x000du,info.types[3].leaf);		/* LF_BARRAY of short: pr_tab */
+	EXPECT_EQ(0x0011u,info.types[3].utype);
+}
+
+TEST_F(DebugSymFmtTest, CodeViewArraysAndStructuresCarryTheirSize)
+{
+	std::vector<uint8_t> data;
+	CvInfo info;
+	ASSERT_TRUE(LoadFixture("qrender-cv.exe",data));
+	ASSERT_TRUE(DEBUG_ParseCodeView(DebugBytes(data.data(),data.size()),info));
+	ASSERT_EQ(471u,info.types.size());
+
+	/* A size read from the wrong offset in the record comes out as a leaf
+	 * code or zero, so every array's has to be a whole number of elements
+	 * and every structure has to have one. */
+	unsigned int arrays = 0,structures = 0;
+	for (size_t i = 0;i < info.types.size();i++) {
+		const CvType &type = info.types[i];
+		if (type.leaf == 0x0003) {
+			arrays++;
+			EXPECT_EQ(0x0010u,type.utype);	/* every one of them is char[] */
+			EXPECT_NE(0u,type.size);
+			EXPECT_GT(0x8000u,type.size);
+		}
+		if (type.leaf == 0x0005) {
+			structures++;
+			EXPECT_NE(0u,type.size);
+			EXPECT_FALSE(type.name.empty());
+		}
+	}
+	EXPECT_EQ(11u,arrays);
+	EXPECT_EQ(77u,structures);
+
+	/* Sizes pinned individually: read one field early the size comes off
+	 * idxtype instead, which is 0x0021 for every one of them -- non-zero,
+	 * under 0x8000, and wrong. These are the fixed string widths in
+	 * qrender's own TYPEs. */
+	std::vector<uint32_t> sizes;
+	for (size_t i = 0;i < info.types.size();i++)
+		if (info.types[i].leaf == 0x0003) sizes.push_back(info.types[i].size);
+	std::sort(sizes.begin(),sizes.end());
+	ASSERT_EQ(11u,sizes.size());
+	EXPECT_EQ(1u,sizes[0]);
+	EXPECT_EQ(4u,sizes[1]);
+	EXPECT_EQ(1024u,sizes[10]);
+
+	/* One of qrender's own BASIC TYPEs, by name and declared size. */
+	const CvType *bounds = NULL;
+	for (size_t i = 0;i < info.types.size();i++)
+		if (info.types[i].name == "Bounds") bounds = &info.types[i];
+	ASSERT_TRUE(bounds != NULL);
+	EXPECT_EQ(12u,bounds->size);
+}
+
+TEST_F(DebugSymFmtTest, CodeViewVariablesGetASizeAndAReadableType)
+{
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("cvprobe.exe").c_str(),0x8240,info));
+
+	std::map<std::string,const DebugSymbol*> byName;
+	for (size_t i = 0;i < info.symbols.size();i++) byName[info.symbols[i].name] = &info.symbols[i];
+
+	/* BASIC's integer is a direct signed 2-byte, type index 0x0011. */
+	ASSERT_TRUE(byName.count("pr_sum") != 0);
+	EXPECT_EQ("short",byName["pr_sum"]->typeName);
+	EXPECT_EQ(2u,byName["pr_sum"]->valueSize);
+	EXPECT_EQ(DEBUG_VALUE_SIGNED,byName["pr_sum"]->valueKind);
+	EXPECT_EQ("short",byName["pr_count"]->typeName);
+
+	/* A BASIC array's symbol addresses a runtime descriptor rather than the
+	 * elements, so it gets a name and no width to read. */
+	ASSERT_TRUE(byName.count("pr_tab") != 0);
+	EXPECT_EQ("BASIC array of short",byName["pr_tab"]->typeName);
+	EXPECT_EQ(0u,byName["pr_tab"]->valueSize);
+
+	ASSERT_TRUE(byName.count("pr_add") != 0);
+	EXPECT_TRUE(byName["pr_add"]->isFunction);
+	EXPECT_EQ(0u,byName["pr_add"]->valueSize);
+	/* A proc keeps its code length; that is not a value width. */
+	EXPECT_TRUE(byName["pr_add"]->hasSize);
+	EXPECT_EQ(34u,byName["pr_add"]->size);
+}
+
+TEST_F(DebugSymFmtTest, CodeViewDecodesRealsAndStructuresInALargerProgram)
+{
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("qrender-cv.exe").c_str(),0x8240,info));
+
+	std::map<std::string,const DebugSymbol*> byName;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (byName.count(info.symbols[i].name) == 0) byName[info.symbols[i].name] = &info.symbols[i];
+
+	/* BASIC's SINGLE and LONG, and one of qrender's own TYPEs: three
+	 * singles, so twelve bytes. */
+	ASSERT_TRUE(byName.count("host_accum") != 0);
+	EXPECT_EQ("float",byName["host_accum"]->typeName);
+	EXPECT_EQ(4u,byName["host_accum"]->valueSize);
+	EXPECT_EQ(DEBUG_VALUE_FLOAT,byName["host_accum"]->valueKind);
+
+	ASSERT_TRUE(byName.count("host_ticks") != 0);
+	EXPECT_EQ("long",byName["host_ticks"]->typeName);
+	EXPECT_EQ(4u,byName["host_ticks"]->valueSize);
+	EXPECT_EQ(DEBUG_VALUE_SIGNED,byName["host_ticks"]->valueKind);
+
+	ASSERT_TRUE(byName.count("cam_up") != 0);
+	EXPECT_EQ("u3dVector3f",byName["cam_up"]->typeName);
+	EXPECT_EQ(12u,byName["cam_up"]->valueSize);
+
+	/* An array reached through a BASIC array, with its width in the name. */
+	ASSERT_TRUE(byName.count("mem_tag") != 0);
+	EXPECT_EQ("BASIC array of char[12]",byName["mem_tag"]->typeName);
+}
+
 /* ---- Borland TDINFO ---- */
 
 bool LoadTdInfo(const char *name,std::vector<uint8_t> &data,TdInfo &info)

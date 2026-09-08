@@ -139,6 +139,21 @@ struct CvLineTable {
 	std::vector<CvLine> lines;
 };
 
+/*
+ * One record of sstGlobalTypes, addressed from a symbol as 0x1000 + index.
+ * Anything below 0x1000 is a primitive encoded in the index itself.
+ *
+ * Only what a debugger needs to read a variable is kept: what it is, how wide,
+ * and what it is made of. LF_BARRAY is a BASIC array, which carries no element
+ * count because the count lives in the runtime descriptor the symbol points at.
+ */
+struct CvType {
+	uint16_t leaf = 0;
+	uint16_t utype = 0;	/* element, pointed-to or return type */
+	uint32_t size = 0;	/* bytes, for arrays and structures */
+	std::string name;
+};
+
 struct CvDirEntry {
 	uint16_t subsection = 0;
 	uint16_t moduleIndex = 0;
@@ -154,6 +169,7 @@ struct CvInfo {
 	std::vector<CvSymbol> symbols;
 	std::vector<CvSegMapEntry> segments;
 	std::vector<CvLineTable> lines;
+	std::vector<CvType> types;	/* index 0x1000 + position */
 	std::vector<std::string> warnings;
 };
 

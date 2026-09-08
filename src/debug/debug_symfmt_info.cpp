@@ -21,6 +21,122 @@ static std::string SegKey(uint16_t moduleIndex,uint16_t segment)
 
 static bool ByOffset(const CvLine &a,const CvLine &b) { return a.offset < b.offset; }
 
+/*
+ * A CodeView type index below 0x1000 is a primitive encoded in the index
+ * itself: bits 8-10 are the pointer mode, bits 4-7 what kind of thing it is,
+ * and bits 0-3 which width of it. cvprobe's BASIC integers come through as
+ * 0x0011, a direct signed 2-byte -- the same encoding Microsoft C uses.
+ */
+static std::string CvPrimitiveName(uint16_t type,DebugSymbol &out)
+{
+	out.valueSize = 0;
+	out.valueKind = DEBUG_VALUE_UNKNOWN;
+
+	const uint16_t mode = (uint16_t)((type >> 8) & 7u);
+	const uint16_t base = (uint16_t)(type & 0xffu);
+
+	static const char * const signedNames[4] = {"char","short","long","int64"};
+	static const char * const unsignedNames[4] = {"unsigned char","unsigned short","unsigned long","unsigned int64"};
+	static const char * const boolNames[4] = {"bool8","bool16","bool32","bool64"};
+	static const char * const realNames[5] = {"float","double","long double","real128","real48"};
+	static const uint32_t realSizes[5] = {4,8,10,16,6};
+
+	std::string name;
+	if (base == 0x03) name = "void";
+	else if (base >= 0x10 && base <= 0x13) {
+		name = signedNames[base - 0x10];
+		out.valueSize = 1u << (base - 0x10);
+		out.valueKind = DEBUG_VALUE_SIGNED;
+	} else if (base >= 0x20 && base <= 0x23) {
+		name = unsignedNames[base - 0x20];
+		out.valueSize = 1u << (base - 0x20);
+		out.valueKind = DEBUG_VALUE_UNSIGNED;
+	} else if (base >= 0x30 && base <= 0x33) {
+		name = boolNames[base - 0x30];
+		out.valueSize = 1u << (base - 0x30);
+		out.valueKind = DEBUG_VALUE_UNSIGNED;
+	} else if (base >= 0x40 && base <= 0x44) {
+		name = realNames[base - 0x40];
+		out.valueSize = realSizes[base - 0x40];
+		out.valueKind = DEBUG_VALUE_FLOAT;
+	} else if (base == 0x70) {
+		name = "char";
+		out.valueSize = 1;
+		out.valueKind = DEBUG_VALUE_SIGNED;
+	} else if (base == 0x71) {
+		name = "wchar";
+		out.valueSize = 2;
+		out.valueKind = DEBUG_VALUE_UNSIGNED;
+	} else if (base == 0x74 || base == 0x75) {
+		name = base == 0x74 ? "int" : "unsigned int";
+		out.valueSize = 4;
+		out.valueKind = base == 0x74 ? DEBUG_VALUE_SIGNED : DEBUG_VALUE_UNSIGNED;
+	}
+
+	if (mode == 0) return name;
+
+	/* A pointer is the address, whatever it points at. */
+	const char * const kinds[3] = {"near ptr","far ptr","huge ptr"};
+	out.valueSize = mode == 1 ? 2u : 4u;
+	out.valueKind = DEBUG_VALUE_UNSIGNED;
+	return std::string(kinds[mode <= 3 ? mode - 1 : 2]) + (name.empty() ? "" : " to " + name);
+}
+
+/* Depth-limited: a type table is free to point back at itself. */
+static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol &out,int depth = 0)
+{
+	out.valueSize = 0;
+	out.valueKind = DEBUG_VALUE_UNKNOWN;
+	out.elementSize = 0;
+	if (depth > 8) return std::string();
+
+	if (type < 0x1000) return CvPrimitiveName(type,out);
+
+	const size_t index = (size_t)(type - 0x1000);
+	if (index >= info.types.size()) return std::string();
+
+	const CvType &record = info.types[index];
+	DebugSymbol inner;
+	const std::string underlying = record.leaf == 0x0201 ? std::string()
+		: CodeViewTypeName(info,record.utype,inner,depth + 1);
+
+	switch (record.leaf) {
+	case 0x0001:					/* LF_MODIFIER */
+		out.valueSize = inner.valueSize;
+		out.valueKind = inner.valueKind;
+		out.elementSize = inner.elementSize;
+		return underlying;
+	case 0x0002:					/* LF_POINTER */
+		out.valueSize = record.size != 0 ? record.size : 2u;
+		out.valueKind = DEBUG_VALUE_UNSIGNED;
+		return (out.valueSize == 2 ? "near ptr" : "far ptr") +
+		       (underlying.empty() ? std::string() : " to " + underlying);
+	case 0x0003: {					/* LF_ARRAY */
+		out.valueSize = record.size;
+		out.valueKind = inner.valueKind;
+		out.elementSize = inner.valueSize;
+
+		char count[32];
+		snprintf(count,sizeof(count),"[%u]",
+		         (unsigned int)(inner.valueSize > 0 ? record.size / inner.valueSize : 0));
+		return (underlying.empty() ? std::string("?") : underlying) + count;
+	}
+	case 0x0004:					/* LF_CLASS */
+	case 0x0005:					/* LF_STRUCTURE */
+	case 0x0006:					/* LF_UNION */
+		out.valueSize = record.size;
+		return record.name.empty() ? std::string("struct") : record.name;
+	case 0x0008:					/* LF_PROCEDURE */
+		out.isFunction = true;
+		return "function";
+	case 0x000d:
+		/* A BASIC array: the symbol addresses a runtime descriptor, not the
+		 * elements, so there is no width to read here. */
+		return "BASIC array of " + (underlying.empty() ? std::string("?") : underlying);
+	}
+	return std::string();
+}
+
 static void CodeViewSymbols(const CvInfo &info,uint32_t loadLinear,DebugInfo &out)
 {
 	const std::map<uint16_t,uint32_t> bases = DEBUG_CvSegmentBases(info);
@@ -44,6 +160,12 @@ static void CodeViewSymbols(const CvInfo &info,uint32_t loadLinear,DebugInfo &ou
 		out_symbol.hasSize = symbol.hasSize;
 		out_symbol.module = symbol.module;
 		out_symbol.source = DEBUG_FORMAT_CODEVIEW;
+		out_symbol.typeName = CodeViewTypeName(info,symbol.type,out_symbol);
+		if (symbol.kind == CV_SYM_PROC) {
+			out_symbol.isFunction = true;
+			out_symbol.valueSize = 0;
+			out_symbol.valueKind = DEBUG_VALUE_UNKNOWN;
+		}
 		out.symbols.push_back(out_symbol);
 	}
 

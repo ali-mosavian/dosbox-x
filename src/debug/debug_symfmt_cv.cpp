@@ -31,6 +31,7 @@ enum {
 	sstGlobalSym = 0x129,
 	sstGlobalPub = 0x12a,
 	sstSegMap = 0x12d,
+	sstGlobalTypes = 0x12b,
 	sstStaticSym = 0x134
 };
 
@@ -142,6 +143,88 @@ static bool ParseModule(const DebugBytes &body,uint16_t index,CvModule &out)
 	}
 	out.name = body.pstr(at);
 	return true;
+}
+
+/* A numeric leaf: a value below 0x8000 is itself, anything else says which
+ * kind of number follows it. */
+static uint32_t ReadNumericLeaf(const DebugBytes &body,size_t at,size_t &next)
+{
+	const uint16_t lead = body.u16(at);
+	if (lead < 0x8000u) {
+		next = at + 2;
+		return lead;
+	}
+
+	switch (lead) {
+	case 0x8000: next = at + 3; return body.u8(at + 2);			/* LF_CHAR */
+	case 0x8001: next = at + 4; return body.u16(at + 2);			/* LF_SHORT */
+	case 0x8002: next = at + 4; return body.u16(at + 2);			/* LF_USHORT */
+	case 0x8003: next = at + 6; return body.u32(at + 2);			/* LF_LONG */
+	case 0x8004: next = at + 6; return body.u32(at + 2);			/* LF_ULONG */
+	}
+	next = at + 2;
+	return 0;
+}
+
+/*
+ * sstGlobalTypes: flags, a count, that many record offsets, then the records.
+ * The offsets are counted from the start of the subsection -- the first one
+ * lands exactly on the byte after the offset array, which is where the
+ * records begin.
+ */
+static std::vector<CvType> ParseGlobalTypes(const DebugBytes &body)
+{
+	std::vector<CvType> types;
+	const uint32_t count = body.u32(4);
+	if (count == 0 || (uint64_t)8 + (uint64_t)count * 4 > body.size()) return types;
+
+	for (uint32_t i = 0;i < count;i++) {
+		const uint32_t at = body.u32(8 + (size_t)i * 4);
+		if ((uint64_t)at + 4 > body.size()) break;
+
+		const uint16_t length = body.u16(at);
+		const size_t record = (size_t)at + 2;
+		if (length < 2 || (uint64_t)record + length > body.size()) break;
+
+		CvType type;
+		type.leaf = body.u16(record);
+
+		switch (type.leaf) {
+		case 0x0001:					/* LF_MODIFIER: const/volatile */
+			type.utype = body.u16(record + 4);
+			break;
+		case 0x0002:					/* LF_POINTER */
+			type.utype = body.u16(record + 4);
+			type.size = (body.u16(record + 2) & 0x1fu) == 0 ? 2u : 4u;
+			break;
+		case 0x0003: {					/* LF_ARRAY */
+			size_t next = 0;
+			type.utype = body.u16(record + 2);
+			type.size = ReadNumericLeaf(body,record + 6,next);
+			type.name = body.pstr(next);
+			break;
+		}
+		case 0x0004:					/* LF_CLASS */
+		case 0x0005:					/* LF_STRUCTURE */
+		case 0x0006: {					/* LF_UNION */
+			size_t next = 0;
+			const size_t at_size = type.leaf == 0x0006 ? record + 6 : record + 12;
+			type.size = ReadNumericLeaf(body,at_size,next);
+			type.name = body.pstr(next);
+			break;
+		}
+		case 0x0008:					/* LF_PROCEDURE */
+			type.utype = body.u16(record + 2);	/* return type */
+			break;
+		case 0x000d:					/* LF_BARRAY: a BASIC array */
+			type.utype = body.u16(record + 2);
+			break;
+		default:
+			break;
+		}
+		types.push_back(type);
+	}
+	return types;
 }
 
 static std::vector<CvSegMapEntry> ParseSegMap(const DebugBytes &body)
@@ -397,6 +480,9 @@ bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out)
 		}
 		case sstSegMap:
 			out.segments = ParseSegMap(body);
+			break;
+		case sstGlobalTypes:
+			out.types = ParseGlobalTypes(body);
 			break;
 		case sstSrcModule: {
 			const std::vector<CvLineTable> tables = ParseSrcModule(body,entry.moduleIndex);
