@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node --test \"build/**/*.test.js\"",
-    "bundle": "mkdir -p bin && cp ../src/dosbox-x bin/dosbox-x",
+    "bundle": "mkdir -p bin && cp ../src/dosbox-x bin/.dosbox-x.new && mv -f bin/.dosbox-x.new bin/dosbox-x",
     "start": "node build/index.js",
     "dev": "tsc --watch"
   },

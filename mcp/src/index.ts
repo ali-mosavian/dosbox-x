@@ -68,6 +68,7 @@ import {
 } from "./snapshot.js";
 import {
   SymbolIndex,
+  breakpointMatchOff,
   loadSidecarSymbols,
   parseQualifiedSymbolName,
   type UnifiedSymbol,
@@ -586,10 +587,6 @@ async function fetchLastStopFallback(): Promise<db.JsonObject | undefined> {
 
 async function resolveLoadedSymbol(name: string, loadSegment?: number) {
   return (await resolveLoadedSymbolWithWarning(name, loadSegment)).resolved;
-}
-
-function breakpointMatchOff(resolved: ResolvedAddress): number {
-  return resolved.source === "map" || resolved.space === "com" ? resolved.offset : resolved.linear;
 }
 
 async function effectiveMapLoadInfo(): Promise<NormalizedLoadInfo> {

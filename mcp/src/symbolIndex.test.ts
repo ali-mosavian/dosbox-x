@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   SymbolIndex,
+  breakpointMatchOff,
   loadSidecarSymbols,
 } from "./symbolIndex.js";
 
@@ -64,4 +65,21 @@ test("SymbolIndex resolves module-qualified names case-insensitively", () => {
   assert.equal(index.resolve("libc!loader_body")?.linear, 0x810000);
   assert.equal(index.resolve("LIBC.D32!loader_body")?.linear, 0x810000);
   assert.equal(index.resolve("missing!loader_body"), undefined);
+});
+
+test("breakpointMatchOff gives a 16-bit symbol its segment offset, not its linear", () => {
+  // pr_add at 0824:00B4 was armed with match_off 0x82F4, which is compared
+  // against EIP, so the breakpoint never fired and the program ran to exit.
+  const codeview = { source: "codeview", space: "seg1", offset: 0xb4, linear: 0x82f4 };
+  assert.equal(breakpointMatchOff(codeview), 0xb4);
+
+  for (const source of ["tdinfo", "watcom", "map"]) {
+    assert.equal(breakpointMatchOff({ ...codeview, source }), 0xb4);
+  }
+
+  // A flat 32-bit symbol keeps matching on its linear address.
+  assert.equal(
+    breakpointMatchOff({ source: "d32-debug", space: "flat", offset: 0x30, linear: 0x110030 }),
+    0x110030,
+  );
 });

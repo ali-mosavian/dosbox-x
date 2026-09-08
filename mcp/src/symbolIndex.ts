@@ -25,6 +25,26 @@ export interface UnifiedSymbol {
   explanation: string;
 }
 
+/* The emulator compares match_off against EIP, so a breakpoint on a 16-bit
+ * symbol has to carry its offset within the code segment. Every format the
+ * emulator reads is segmented; a flat 32-bit symbol has offset == linear, so
+ * it is unaffected either way. Sending the linear address for pr_add at
+ * 0824:00B4 armed a breakpoint that waited for EIP == 0x82F4 and never fired. */
+const SEGMENTED_SOURCES: ReadonlySet<string> = new Set([
+  "map",
+  "codeview",
+  "tdinfo",
+  "watcom",
+]);
+
+export function breakpointMatchOff(
+  resolved: { source: string; space: string; offset: number; linear: number },
+): number {
+  return SEGMENTED_SOURCES.has(resolved.source) || resolved.space === "com"
+    ? resolved.offset
+    : resolved.linear;
+}
+
 export interface SidecarSymbol {
   name: string;
   segmentName?: string;
