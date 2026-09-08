@@ -89,6 +89,7 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 	out.valueKind = DEBUG_VALUE_UNKNOWN;
 	out.elementSize = 0;
 	out.fields.clear();
+	out.isBasicArray = false;
 	if (depth > 8) return std::string();
 
 	if (type < 0x1000) return CvPrimitiveName(type,out);
@@ -152,6 +153,7 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 	case 0x000d:
 		/* A BASIC array: the symbol addresses a runtime descriptor, not the
 		 * elements, so there is no width to read here. */
+		out.isBasicArray = true;
 		out.elementSize = inner.valueSize;
 		out.fields = inner.fields;
 		return "BASIC array of " + (underlying.empty() ? std::string("?") : underlying);
@@ -403,6 +405,7 @@ static void BorlandScopes(const TdInfo &info,DebugInfo &out)
 				local.valueKind = typed.valueKind;
 				local.elementSize = typed.elementSize;
 				local.fields = typed.fields;
+				local.isBasicArray = typed.isBasicArray;
 				out_scope.locals.push_back(local);
 			}
 

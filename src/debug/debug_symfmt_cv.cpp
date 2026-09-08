@@ -552,3 +552,16 @@ bool DEBUG_ReadCodeViewFile(const char *path,CvInfo &out)
 	if (!DEBUG_ReadHostFile(path,data)) return false;
 	return DEBUG_ParseCodeView(DebugBytes(data.data(),data.size()),out);
 }
+
+bool DEBUG_ParseBasicArrayDescriptor(const DebugBytes &data,uint32_t expectedElementSize,
+                                     BasicArrayDescriptor &out)
+{
+	out.offset = data.u16(0);
+	out.segment = data.u16(2);
+	out.elementSize = data.u16(12);
+	out.count = data.u16(14);
+
+	if (out.elementSize == 0 || out.count == 0) return false;
+	if (expectedElementSize != 0 && out.elementSize != expectedElementSize) return false;
+	return true;
+}

@@ -24,8 +24,9 @@
  *   {"cmd":"line_list","file":"cvprobe.bas"} - The line table, as addresses.
  *   {"cmd":"var","name":"g_counter"} - Read a variable by name. Its bytes
  *     always, and a decoded value when the debug info gave it a type; "len"
- *     overrides how much to read. A name that is not a global is looked up
- *     as a local or parameter of whatever is running at CS:EIP.
+ *     overrides how much to read. A BASIC array is followed through its
+ *     runtime descriptor to the elements. A name that is not a global is
+ *     looked up as a local or parameter of whatever is running at CS:EIP.
  *   {"cmd":"locals"} - Every local and parameter in scope at CS:EIP,
  *     innermost first, with values. A frame variable is only where BP says
  *     it is once the function's prologue has run, so the frame each was read
@@ -767,6 +768,28 @@ static std::string decoded_value_json(const std::vector<uint8_t>& bytes, uint32_
         if (!one.empty()) return "," + json_raw("value", one);
     }
     return std::string();
+}
+
+/* A BASIC array's symbol addresses a descriptor, not the elements; the far
+ * pointer in it leads to them. Layout and guard: DEBUG_ParseBasicArrayDescriptor. */
+static const uint32_t BASIC_DESCRIPTOR_BYTES = 16;
+
+static bool basic_array_data(uint32_t descriptor, uint32_t expectedElementSize,
+                             uint32_t& data, uint32_t& elementSize, uint32_t& count) {
+    std::vector<uint8_t> bytes;
+    bool complete = true;
+    read_guest_hex(descriptor, BASIC_DESCRIPTOR_BYTES, bytes, complete);
+    if (!complete) return false;
+
+    BasicArrayDescriptor descriptorFields;
+    if (!DEBUG_ParseBasicArrayDescriptor(DebugBytes(bytes.data(), bytes.size()),
+                                         expectedElementSize, descriptorFields))
+        return false;
+
+    elementSize = descriptorFields.elementSize;
+    count = descriptorFields.count;
+    data = (uint32_t)GetAddress(descriptorFields.segment, descriptorFields.offset);
+    return data != 0;
 }
 
 // Borland numbers registers the way x86 encodes them.
@@ -2714,13 +2737,35 @@ static void process_command(const std::string& json) {
         if (length == 0) length = 2;
         if (length > 4096) length = 4096;
 
+        // A BASIC array is read through its descriptor unless the caller
+        // asked for a plain byte count at the symbol itself.
+        uint32_t at = symbol->linear;
+        bool sized = asked || symbol->valueSize != 0;
+        std::string array;
+        if (symbol->isBasicArray && !asked) {
+            uint32_t data = 0, elementSize = 0, count = 0;
+            if (basic_array_data(symbol->linear, symbol->elementSize, data, elementSize, count)) {
+                at = data;
+                sized = true;
+                length = elementSize * count;
+                if (length > 4096) length = 4096;
+                array = "," + json_hex("descriptor", symbol->linear) +
+                        "," + json_hex("data", data) +
+                        "," + json_num("elements", count) +
+                        "," + json_num("element_size", elementSize);
+            } else {
+                array = "," + json_str("note",
+                    "BASIC array descriptor could not be read, or disagrees with the type");
+            }
+        }
+
         std::vector<uint8_t> bytes;
         bool complete = true;
-        const std::string hex = read_guest_hex(symbol->linear, length, bytes, complete);
+        const std::string hex = read_guest_hex(at, length, bytes, complete);
 
-        std::string out = symbol_json(*symbol) + "," +
+        std::string out = symbol_json(*symbol) + array + "," +
                           json_num("length", length) + "," +
-                          json_bool("size_known", asked || symbol->valueSize != 0) + "," +
+                          json_bool("size_known", sized) + "," +
                           json_bool("readable", complete) + "," +
                           json_str("bytes", hex);
         if (!symbol->typeName.empty()) out += "," + json_str("type", symbol->typeName);

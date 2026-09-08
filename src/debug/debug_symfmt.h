@@ -191,6 +191,22 @@ bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out);
 /* A run of [length:u16][kind:u16][data] records. Exposed for the tests. */
 std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to);
 
+/* What a BASIC array's symbol addresses: a descriptor the runtime fills in,
+ * not the elements. Measured on cvprobe.exe (2-byte elements, 16 of them)
+ * and udtbas.exe (an 8-byte TYPE, 4 of them). */
+struct BasicArrayDescriptor {
+	uint16_t offset = 0;
+	uint16_t segment = 0;
+	uint16_t elementSize = 0;
+	uint16_t count = 0;
+};
+
+/* False unless the bytes read as a descriptor whose element width is the one
+ * the program's own type table declares -- the guard against following
+ * something that is not a descriptor. expectedElementSize 0 skips it. */
+bool DEBUG_ParseBasicArrayDescriptor(const DebugBytes &data,uint32_t expectedElementSize,
+                                     BasicArrayDescriptor &out);
+
 /* ---- Borland TDINFO ---- */
 
 /*
@@ -460,6 +476,9 @@ struct DebugSymbol {
 	 * then the stride between elements. */
 	std::vector<DebugField> fields;
 	bool isFunction = false;
+	/* A BASIC array: the symbol addresses a runtime descriptor, and the
+	 * elements are wherever that points. elementSize is one element. */
+	bool isBasicArray = false;
 	DebugFormatId source = DEBUG_FORMAT_CODEVIEW;
 };
 
@@ -494,6 +513,7 @@ struct DebugLocal {
 	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;
 	uint32_t elementSize = 0;
 	std::vector<DebugField> fields;
+	bool isBasicArray = false;
 };
 
 /* A function body or a block inside one, and the variables it holds. */

@@ -530,6 +530,91 @@ TEST_F(DebugSymFmtTest, CodeViewVariablesGetASizeAndAReadableType)
 	EXPECT_EQ(34u,byName["pr_add"]->size);
 }
 
+TEST_F(DebugSymFmtTest, ABasicTypeDecodesFieldByFieldAndAsAnArrayOfItself)
+{
+	/* udtbas.bas declares TYPE Vtx as two integers and a long, then one of
+	 * them and an array of four. */
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("udtbas.exe").c_str(),0x8240,info));
+
+	std::map<std::string,const DebugSymbol*> byName;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (byName.count(info.symbols[i].name) == 0) byName[info.symbols[i].name] = &info.symbols[i];
+
+	ASSERT_TRUE(byName.count("home") != 0);
+	EXPECT_EQ("Vtx",byName["home"]->typeName);
+	EXPECT_EQ(8u,byName["home"]->valueSize);
+	ASSERT_EQ(3u,byName["home"]->fields.size());
+	EXPECT_EQ("x",byName["home"]->fields[0].name);
+	EXPECT_EQ(0u,byName["home"]->fields[0].offset);
+	EXPECT_EQ(2u,byName["home"]->fields[0].size);
+	EXPECT_EQ("y",byName["home"]->fields[1].name);
+	EXPECT_EQ(2u,byName["home"]->fields[1].offset);
+	EXPECT_EQ("tag",byName["home"]->fields[2].name);
+	EXPECT_EQ(4u,byName["home"]->fields[2].offset);
+	EXPECT_EQ(4u,byName["home"]->fields[2].size);
+
+	/* The array's width comes from the element, since a BASIC array record
+	 * carries no count -- the descriptor holds that at runtime. */
+	ASSERT_TRUE(byName.count("nodes") != 0);
+	EXPECT_TRUE(byName["nodes"]->isBasicArray);
+	EXPECT_EQ("BASIC array of Vtx",byName["nodes"]->typeName);
+	EXPECT_EQ(8u,byName["nodes"]->elementSize);
+	EXPECT_EQ(0u,byName["nodes"]->valueSize);
+	ASSERT_EQ(3u,byName["nodes"]->fields.size());
+	EXPECT_EQ("tag",byName["nodes"]->fields[2].name);
+}
+
+TEST_F(DebugSymFmtTest, ABasicArrayDescriptorLeadsToTheElements)
+{
+	/* udtbas.exe stopped at line 29: nodes() is four 8-byte Vtx. Reading a
+	 * field early gave the descriptor's own flags instead of the count and
+	 * printed one element. */
+	static const uint8_t descriptor[16] = {
+		0x5E,0x00, 0x3B,0x0C,       /* far pointer 0C3B:005E to the elements */
+		0x00,0x00, 0x00,0x00,
+		0x01,0x40,                  /* flags */
+		0x5E,0x00,                  /* the offset again */
+		0x08,0x00,                  /* one element is eight bytes */
+		0x04,0x00 };                /* there are four of them */
+
+	BasicArrayDescriptor parsed;
+	ASSERT_TRUE(DEBUG_ParseBasicArrayDescriptor(DebugBytes(descriptor,sizeof(descriptor)),8,parsed));
+	EXPECT_EQ(0x005Eu,parsed.offset);
+	EXPECT_EQ(0x0C3Bu,parsed.segment);
+	EXPECT_EQ(8u,parsed.elementSize);
+	EXPECT_EQ(4u,parsed.count);
+
+	/* cvprobe.exe's pr_tab: sixteen 2-byte integers. */
+	static const uint8_t shorts[16] = {
+		0xBE,0x42, 0x20,0x09, 0x00,0x00, 0x00,0x00,
+		0x01,0x40, 0xBE,0x42, 0x02,0x00, 0x10,0x00 };
+
+	ASSERT_TRUE(DEBUG_ParseBasicArrayDescriptor(DebugBytes(shorts,sizeof(shorts)),2,parsed));
+	EXPECT_EQ(2u,parsed.elementSize);
+	EXPECT_EQ(16u,parsed.count);
+}
+
+TEST_F(DebugSymFmtTest, WhatIsNotABasicArrayDescriptorIsNotFollowed)
+{
+	/* The width the type table declares is the guard: without it any bytes
+	 * read as a pointer and led the reader somewhere arbitrary. */
+	static const uint8_t descriptor[16] = {
+		0x5E,0x00, 0x3B,0x0C, 0x00,0x00, 0x00,0x00,
+		0x01,0x40, 0x5E,0x00, 0x08,0x00, 0x04,0x00 };
+
+	BasicArrayDescriptor parsed;
+	EXPECT_FALSE(DEBUG_ParseBasicArrayDescriptor(DebugBytes(descriptor,sizeof(descriptor)),12,parsed));
+
+	static const uint8_t empty[16] = {
+		0x5E,0x00, 0x3B,0x0C, 0x00,0x00, 0x00,0x00,
+		0x01,0x40, 0x5E,0x00, 0x08,0x00, 0x00,0x00 };
+	EXPECT_FALSE(DEBUG_ParseBasicArrayDescriptor(DebugBytes(empty,sizeof(empty)),8,parsed));
+
+	/* Short of a whole descriptor, there is nothing to read. */
+	EXPECT_FALSE(DEBUG_ParseBasicArrayDescriptor(DebugBytes(descriptor,15),8,parsed));
+}
+
 TEST_F(DebugSymFmtTest, CodeViewDecodesRealsAndStructuresInALargerProgram)
 {
 	DebugInfo info;
