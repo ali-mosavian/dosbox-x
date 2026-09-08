@@ -74,6 +74,7 @@ import {
   type UnifiedSymbol,
 } from "./symbolIndex.js";
 import { symbolFromSocket, symbolsFromSocketList } from "./socketSymbols.js";
+import { j } from "./report.js";
 import {
   debuggerStopBlockDecision,
   isDefaultCriticalStopEvent,
@@ -86,10 +87,6 @@ const server = new McpServer({
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────── //
-
-function j(val: unknown): string {
-  return JSON.stringify(val, null, 2);
-}
 
 function isErr(resp: db.JsonObject): boolean {
   return resp["status"] === "error" || resp["status"] === "blocked";
@@ -2630,7 +2627,7 @@ server.tool(
             linear: linear === undefined ? undefined : hex(linear),
             registers,
             symbolLocation,
-            sourceLine: linear === undefined ? undefined : autoDebugSourceLine(linear),
+            sourceLine: linear === undefined ? undefined : await autoDebugSourceLine(linear),
             mapLocation,
             loadInfo: currentLoadInfo,
             debugInfo: autoDebugInfoNote,
@@ -2852,6 +2849,23 @@ server.tool(
   },
 );
 
+server.tool(
+  "dosbox_var",
+  "Read a program variable by name. Returns its bytes always, and a decoded value " +
+  "when the program's debug info gave it a type (Borland TDINFO does; CodeView as " +
+  "read here does not, so those come back as bytes with both readings).",
+  {
+    name: z.string().describe("Variable name, e.g. 'g_counter' or 'module!g_counter'."),
+    len: z.number().int().min(1).max(4096).optional().describe(
+      "Bytes to read. Defaults to the size the debug info gives, else 2.",
+    ),
+  },
+  async ({ name, len }) => {
+    const resp = await db.sendCommand(clean({ cmd: "var", name, len }));
+    return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+  },
+);
+
 // ─── 6. Breakpoints ───────────────────────────────────────────────────────── //
 
 server.tool(
@@ -2869,6 +2883,10 @@ server.tool(
     seg: z.number().optional().describe("Segment value (exec kind, with off)."),
     off: z.number().optional().describe("Offset value (exec kind, with seg)."),
     name: z.string().optional().describe("Loaded symbol name (resolves to exec_linear or write watchpoint)."),
+    location: z.string().optional().describe(
+      "gdb-style location resolved by the emulator: 'cvprobe.bas:17', 'pr_add', 'pr_add+0x10', '*0x82F4'. " +
+      "A line with no code of its own moves to the next line that has some. exec_linear only.",
+    ),
     once: z.boolean().optional().describe("One-shot breakpoint (default false)."),
     deferred: z.boolean().optional().describe("Register symbolic deferred breakpoint spec instead of failing when unresolved."),
     offsetDelta: z.number().int().optional().describe("Add to resolved symbol linear address (deferred or immediate)."),
@@ -2881,7 +2899,7 @@ server.tool(
     loadSegment: z.number().int().optional().describe("Override COM load segment for symbol resolution."),
     length: z.number().int().min(1).max(65536).optional().describe("Watchpoint byte length (kind=write/rw, default 4)."),
   },
-  async ({ addr, seg, off, name, once, deferred, offsetDelta, kind, intNum, ah, al, loadSegment, length }) => {
+  async ({ addr, seg, off, name, location, once, deferred, offsetDelta, kind, intNum, ah, al, loadSegment, length }) => {
     try {
       const effectiveKind = kind ?? (
         intNum !== undefined ? "int" :
@@ -2920,6 +2938,12 @@ server.tool(
       }
 
       if (effectiveKind === "exec_linear") {
+        if (location !== undefined) {
+          // The emulator owns the line table, so it resolves the spec.
+          const resp = await db.sendCommand(clean({ cmd: "bp_set_linear_exec", location, once: onceVal }));
+          return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+        }
+
         if (deferred === true) {
           if (name === undefined) {
             return { content: [{ type: "text", text: "ERROR: deferred breakpoints require name" }], isError: true };
