@@ -27,6 +27,9 @@
 #include "regs.h"
 #include "callback.h"
 #include "debug.h"
+#if C_DEBUG
+#include "debug/debug_symbols.h"
+#endif
 #include "cpu.h"
 #include "menu.h"
 #include "crc32.h"
@@ -859,6 +862,9 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint16_t flags) {
 			LOG(LOG_EXEC,LOG_ERROR)("stack outside memory block at EXEC");
 	}
 
+#if C_DEBUG
+	DEBUG_SymbolsOnProgramLoad(name,iscom,loadseg);
+#endif
 
 	if ((flags == LOAD) || (flags == LOADNGO)) {
 		/* Get Caller's program CS:IP of the stack and set termination address to that */

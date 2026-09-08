@@ -68,21 +68,27 @@ bool DEBUG_ParseMzHeader(const DebugBytes &data,MzHeader &out)
 	return true;
 }
 
+uint64_t DEBUG_MzAppendedOffset(const MzHeader &header)
+{
+	const uint64_t imageOffset = (uint64_t)header.headerParagraphs << 4u;
+	/* e_cblp is how much of the LAST page is used; zero means the page is full. */
+	const uint64_t lastPage = header.extraBytes == 0 ? 512u : header.extraBytes;
+	const uint64_t pagedSize = header.pages == 0 ? 0u : ((uint64_t)(header.pages - 1) * 512u + lastPage);
+	return pagedSize > imageOffset ? pagedSize : imageOffset;
+}
+
 bool DEBUG_ParseMzImage(const DebugBytes &data,MzImage &out)
 {
 	MzHeader header;
 	if (!DEBUG_ParseMzHeader(data,header)) return false;
 
 	const uint64_t imageOffset = (uint64_t)header.headerParagraphs << 4u;
-	/* e_cblp is how much of the LAST page is used; zero means the page is full. */
-	const uint64_t lastPage = header.extraBytes == 0 ? 512u : header.extraBytes;
-	const uint64_t pagedSize = header.pages == 0 ? 0u : ((uint64_t)(header.pages - 1) * 512u + lastPage);
-	const uint64_t imageSize = pagedSize > imageOffset ? pagedSize - imageOffset : 0u;
+	const uint64_t imageEnd = DEBUG_MzAppendedOffset(header);
 
 	out.header = header;
 	out.imageOffset = imageOffset;
-	out.imageSize = imageSize;
-	out.appendedOffset = std::min(imageOffset + imageSize,(uint64_t)data.size());
+	out.imageSize = imageEnd - imageOffset;
+	out.appendedOffset = std::min(imageEnd,(uint64_t)data.size());
 	out.fileSize = data.size();
 	return true;
 }

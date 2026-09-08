@@ -70,6 +70,10 @@ struct MzImage {
 bool DEBUG_ParseMzHeader(const DebugBytes &data,MzHeader &out);
 bool DEBUG_ParseMzImage(const DebugBytes &data,MzImage &out);
 
+/* Where appended debug info would start, from the header alone: a caller that
+ * has read only the header can tell whether the file carries any. */
+uint64_t DEBUG_MzAppendedOffset(const MzHeader &header);
+
 /* The header fields DOS EXEC reports back through loadInfo, joined. Matching
  * a host file to the running program by name alone picks the wrong one as
  * soon as two build directories hold the same basename. */
@@ -273,12 +277,70 @@ struct WatInfo {
 
 bool DEBUG_ParseWatcom(const DebugBytes &data,WatInfo &out);
 
+/* ---- Microsoft LINK .MAP ---- */
+
+struct LinkMapSegment {
+	uint32_t start = 0;
+	uint32_t stop = 0;
+	uint32_t length = 0;
+	std::string name;
+	std::string className;
+};
+
+struct LinkMapAddress {
+	uint16_t segment = 0;
+	uint32_t offset = 0;
+	/* (segment << 4) + offset: load-relative, the space the whole map uses. */
+	uint32_t mapOffset = 0;
+};
+
+struct LinkMapGroup {
+	std::string name;
+	LinkMapAddress address;
+};
+
+struct LinkMapPublic {
+	std::string name;
+	LinkMapAddress address;
+};
+
+struct LinkMapFile {
+	std::string sourceName;
+	std::vector<LinkMapSegment> segments;
+	std::vector<LinkMapGroup> groups;
+	/* Keyed by the name as written and by its upper-case form, first wins. */
+	std::map<std::string,LinkMapPublic> publics;
+	bool hasEntryPoint = false;
+	LinkMapAddress entryPoint;
+};
+
+struct LinkMapResolution {
+	std::string requested;
+	std::string name;
+	uint32_t linear = 0;
+	uint32_t offset = 0;
+	uint32_t mapOffset = 0;
+	std::string explanation;
+};
+
+void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFile &out);
+bool DEBUG_ReadLinkMapFile(const char *path,LinkMapFile &out);
+
+/* Accepts a public, a segment name, "SEG+off"/"SEG:off", a raw "seg:off" pair,
+ * or "entry". Returns false with a reason in error. */
+bool DEBUG_ResolveLinkMapSymbol(const LinkMapFile &map,const std::string &requested,uint32_t loadLinear,
+                                LinkMapResolution &out,std::string &error);
+
+/* The public at exactly this address, else "SEGMENT+0x...", else false. */
+bool DEBUG_DescribeMapAddress(const LinkMapFile &map,uint32_t loadLinear,uint32_t linear,std::string &out);
+
 /* ---- format-independent layer ---- */
 
 enum DebugFormatId {
 	DEBUG_FORMAT_CODEVIEW,
 	DEBUG_FORMAT_TDINFO,
-	DEBUG_FORMAT_WATCOM
+	DEBUG_FORMAT_WATCOM,
+	DEBUG_FORMAT_MAP
 };
 
 struct DebugModule {
@@ -295,6 +357,7 @@ struct DebugSymbol {
 	uint32_t size = 0;
 	bool hasSize = false;
 	std::string module;
+	std::string program;		/* the loaded program these came with */
 	DebugFormatId source = DEBUG_FORMAT_CODEVIEW;
 };
 

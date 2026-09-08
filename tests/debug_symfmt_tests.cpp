@@ -263,14 +263,9 @@ TEST_F(DebugSymFmtTest, ReadCodeViewScalesToARealMediumModelProgram)
 
 
 /*
- * A LINK .MAP publics reader, for this test only.
- *
- * The .MAP and the EXE come from the same LINK invocation, so a CodeView
- * address that differs from it is the CodeView reader being wrong -- there is
- * nothing else it could be. This mirrors mcp/src/linkmap.ts, including its
- * reading of the "Abs" class column as the symbol name: absolute symbols
- * therefore never match by name, which suits this comparison, since CodeView
- * keeps them in segment 0 and sstSegMap never describes it.
+ * The .MAP and the EXE come from the same LINK invocation, so an address that
+ * differs from the map is the appended-info reader being wrong -- there is
+ * nothing else it could be.
  */
 
 std::string Upper(const std::string &text)
@@ -280,65 +275,14 @@ std::string Upper(const std::string &text)
 	return out;
 }
 
-bool ParseMapAddressRow(const std::string &line,uint32_t &mapOffset,std::string &name)
-{
-	size_t at = line.find_first_not_of(" \t");
-	if (at == std::string::npos) return false;
-
-	uint32_t value[2] = {0,0};
-	for (int part = 0;part < 2;part++) {
-		size_t digits = 0;
-		while (at < line.size() && isxdigit((unsigned char)line[at])) {
-			value[part] = (value[part] << 4) + (uint32_t)(isdigit((unsigned char)line[at])
-				? line[at] - '0'
-				: (toupper((unsigned char)line[at]) - 'A' + 10));
-			at++;
-			digits++;
-		}
-		if (digits == 0) return false;
-		if (part == 0) {
-			if (at >= line.size() || line[at] != ':') return false;
-			at++;
-		}
-	}
-
-	if (at >= line.size() || !isspace((unsigned char)line[at])) return false;
-	at = line.find_first_not_of(" \t",at);
-	if (at == std::string::npos) return false;
-
-	const size_t end = line.find_first_of(" \t",at);
-	name = line.substr(at,end == std::string::npos ? std::string::npos : end - at);
-	mapOffset = (value[0] << 4) + value[1];
-	return true;
-}
-
 std::map<std::string,uint32_t> LoadMapPublics(const std::string &path)
 {
 	std::map<std::string,uint32_t> publics;
-	std::vector<uint8_t> raw;
-	if (!DEBUG_ReadHostFile(path.c_str(),raw)) return publics;
+	LinkMapFile map;
+	if (!DEBUG_ReadLinkMapFile(path.c_str(),map)) return publics;
 
-	std::string text((const char*)raw.data(),raw.size());
-	bool inPublics = false;
-	size_t at = 0;
-	while (at <= text.size()) {
-		const size_t eol = text.find('\n',at);
-		std::string line = text.substr(at,eol == std::string::npos ? std::string::npos : eol - at);
-		at = eol == std::string::npos ? text.size() + 1 : eol + 1;
-		while (!line.empty() && (line[line.size()-1] == '\r' || line[line.size()-1] == ' ')) line.erase(line.size()-1);
-
-		const std::string upper = Upper(line);
-		if (upper.find("PUBLICS BY VALUE") != std::string::npos) { inPublics = true; continue; }
-		if (upper.find("PROGRAM ENTRY POINT AT") != std::string::npos) { inPublics = false; continue; }
-
-		uint32_t mapOffset = 0;
-		std::string name;
-		if (!inPublics || !ParseMapAddressRow(line,mapOffset,name)) continue;
-
-		if (publics.find(name) == publics.end()) publics[name] = mapOffset;
-		const std::string key = Upper(name);
-		if (publics.find(key) == publics.end()) publics[key] = mapOffset;
-	}
+	for (std::map<std::string,LinkMapPublic>::const_iterator it = map.publics.begin();it != map.publics.end();++it)
+		publics[it->first] = it->second.address.mapOffset;
 	return publics;
 }
 
@@ -587,6 +531,9 @@ TEST_F(DebugSymFmtTest, ParseDebugInfoReadsAStrippedExeThroughItsTdsSidecar)
 	DebugInfo info;
 	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("tdsprobe-stripped.exe").c_str(),0x1000,info));
 	EXPECT_EQ(DEBUG_FORMAT_TDINFO,info.format);
+	/* Only static and absolute symbols carry an address worth registering;
+	 * this is the count the emulator reports when it loads tdsprobe.exe. */
+	EXPECT_EQ(97u,info.symbols.size());
 
 	const DebugSymbol *symbol = NULL;
 	for (size_t i = 0;i < info.symbols.size();i++)

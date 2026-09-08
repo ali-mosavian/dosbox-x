@@ -1,0 +1,44 @@
+/*
+ * debug_symstore.h - the emulator's symbol store.
+ *
+ * One place every symbol source feeds into -- debug info appended to the
+ * program by its linker, or a .MAP the user supplies -- so that name and
+ * address lookups work the same whatever produced them.
+ */
+
+#ifndef DOSBOX_DEBUG_SYMSTORE_H
+#define DOSBOX_DEBUG_SYMSTORE_H
+
+#include "debug_symfmt.h"
+
+class DebugSymbolStore {
+public:
+	void Clear();
+	/* Drops what an earlier load of the same program left behind, so
+	 * re-running one does not leave two sets of stale addresses. */
+	void ClearProgram(const std::string &program);
+
+	void Add(const DebugSymbol &symbol);
+	void AddDebugInfo(const DebugInfo &info,const std::string &program);
+	void AddLinkMap(const LinkMapFile &map,uint32_t loadLinear,const std::string &program);
+
+	size_t Size() const { return symbols.size(); }
+	const std::vector<DebugSymbol> &All() const { return symbols; }
+
+	/* Exact name, then case-insensitive, then "module!name". */
+	const DebugSymbol *Resolve(const std::string &name) const;
+
+	/* The closest symbol at or below linear, ignoring one whose own size says
+	 * the address is past its end. */
+	const DebugSymbol *Nearest(uint32_t linear,uint32_t &delta) const;
+
+	/* "module:name+0x0000000C", or empty when nothing covers the address. */
+	std::string Describe(uint32_t linear) const;
+
+private:
+	std::vector<DebugSymbol> symbols;
+};
+
+DebugSymbolStore &DEBUG_Symbols(void);
+
+#endif
