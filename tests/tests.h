@@ -21,6 +21,7 @@
 
 // The following are source files containing unit tests.
 
+#include "debug_symfmt_tests.cpp"
 #include "dos_files_tests.cpp"
 #include "drives_tests.cpp"
 #include "shell_cmds_tests.cpp"
