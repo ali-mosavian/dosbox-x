@@ -183,6 +183,19 @@ TEST_F(DebugSymbolsTest, TheStoreResolvesExactNamesAndBoundsBySize)
 	EXPECT_EQ("",store.Describe(0x123490));
 }
 
+TEST_F(DebugSymbolsTest, ASizelessSymbolDoesNotReachOutsideItsOwnSegment)
+{
+	/* Every format but CodeView's procs gives no size, and unbounded the
+	 * lowest symbol answers for the whole address space: asking where the CPU
+	 * was in the BIOS returned cvprobe.exe's _end+0xF06E6. */
+	DebugSymbolStore store;
+	store.Add(MakeSymbol("_end",0x8000,0,NULL));
+
+	EXPECT_EQ("_end+0x0000FFFF",store.Describe(0x8000 + 0xffff));
+	EXPECT_EQ("",store.Describe(0x8000 + 0x10000));
+	EXPECT_EQ("",store.Describe(0xfd186));
+}
+
 TEST_F(DebugSymbolsTest, TheStoreResolvesModuleQualifiedNamesCaseInsensitively)
 {
 	DebugSymbolStore store;
@@ -213,6 +226,32 @@ TEST_F(DebugSymbolsTest, ClearProgramDropsOnlyThatProgramsSymbols)
 	EXPECT_EQ(1u,store.Size());
 	EXPECT_TRUE(store.Resolve("stale") == NULL);
 	EXPECT_TRUE(store.Resolve("kept") != NULL);
+}
+
+TEST_F(DebugSymbolsTest, TheStoreAnswersSourceLinesInLinearAddresses)
+{
+	if (MapFixtureDir().empty()) GTEST_SKIP() << "mcp/test/fixtures not found; set DOSBOX_TEST_FIXTURES";
+
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(MapFixture("cvprobe.exe").c_str(),0x12340,info));
+
+	DebugSymbolStore store;
+	store.AddDebugInfo(info,"CVPROBE.EXE");
+	EXPECT_EQ(info.lines.size(),store.LineCount());
+
+	/* cvprobe.bas ends on line 37, covering 301..316 in load-relative bytes. */
+	const DebugSourceLine *last = store.LineAt(0x12340 + 315);
+	ASSERT_TRUE(last != NULL);
+	EXPECT_EQ("cvprobe.bas",last->file);
+	EXPECT_EQ(37u,last->line);
+	EXPECT_EQ(0x12340u + 301u,last->begin);
+
+	EXPECT_TRUE(store.LineAt(0x12340 + 316) == NULL);
+	/* The entry point is in the runtime, a module with no line info. */
+	EXPECT_TRUE(store.LineAt(0x12340 + 0x2dbc) == NULL);
+
+	store.ClearProgram("CVPROBE.EXE");
+	EXPECT_EQ(0u,store.LineCount());
 }
 
 TEST_F(DebugSymbolsTest, AddLinkMapRegistersEachPublicOnce)

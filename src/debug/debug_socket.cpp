@@ -12,6 +12,16 @@
  *   {"cmd":"bp_clear","seg":X,"off":Y} - Clear breakpoint
  *   {"cmd":"bp_list"}         - List breakpoints
  *   {"cmd":"get_load_info"}   - Get latest DOS EXEC COM/EXE load metadata
+ *   {"cmd":"sym","name":"_main"} - Resolve a symbol name to an address. Accepts
+ *     "module!name" and matches case-insensitively when the exact name misses.
+ *   {"cmd":"sym_list","filter":"draw","limit":100} - List loaded symbols.
+ *   {"cmd":"where"} - What is at CS:EIP: symbol, offset into it, source line.
+ *     Takes {"linear":X} or {"seg":X,"off":Y} to ask about another address.
+ *   {"cmd":"sym_load","file":"/host/path.map","loadSeg":X} - Load symbols from
+ *     a host file, either a LINK .MAP or a program with debug info in it. Each
+ *     program's symbols load by themselves as DOS EXEC runs it, so this is for
+ *     files the guest cannot see.
+ *   {"cmd":"sym_clear"} - Drop every symbol, or one program's with "program".
  *   {"cmd":"regs"}            - Get registers
  *   {"cmd":"regs_set","reg":"EAX","val":X} - Set register
  *   {"cmd":"mem_read","seg":X,"off":Y,"len":Z} - Read memory
@@ -57,6 +67,7 @@
 #if C_DEBUG
 
 #include "debug_socket.h"
+#include "debug_symstore.h"
 #include "debug.h"
 #include "cpu.h"
 #include "regs.h"
@@ -569,6 +580,60 @@ static void send_response(const std::string& json) {
 }
 
 // Send error response
+// ---- symbols ----
+
+static const char* symbol_source_name(DebugFormatId source) {
+    switch (source) {
+    case DEBUG_FORMAT_CODEVIEW: return "codeview";
+    case DEBUG_FORMAT_TDINFO:   return "tdinfo";
+    case DEBUG_FORMAT_WATCOM:   return "watcom";
+    case DEBUG_FORMAT_MAP:      return "map";
+    }
+    return "unknown";
+}
+
+static std::string symbol_json(const DebugSymbol& symbol) {
+    std::string out = json_str("name", symbol.name) + "," +
+                      json_hex("linear", symbol.linear) + "," +
+                      json_num("segment", symbol.segment) + "," +
+                      json_hex("offset", symbol.offset) + "," +
+                      json_str("source", symbol_source_name(symbol.source));
+    if (symbol.hasSize) out += "," + json_num("size", symbol.size);
+    if (!symbol.module.empty()) out += "," + json_str("module", symbol.module);
+    if (!symbol.program.empty()) out += "," + json_str("program", symbol.program);
+    return out;
+}
+
+// What is at an address: the symbol it falls inside, and the source line.
+static std::string address_json(uint32_t linear) {
+    DebugSymbolStore& store = DEBUG_Symbols();
+    std::string out = json_hex("linear", linear);
+
+    uint32_t delta = 0;
+    const DebugSymbol* symbol = store.Nearest(linear, delta);
+    if (symbol != NULL) {
+        out += "," + json_str("symbol", symbol->name) +
+               "," + json_num("delta", delta) +
+               "," + json_str("description", store.Describe(linear)) +
+               "," + json_str("source", symbol_source_name(symbol->source));
+        if (!symbol->module.empty()) out += "," + json_str("module", symbol->module);
+        if (!symbol->program.empty()) out += "," + json_str("program", symbol->program);
+    }
+
+    const DebugSourceLine* line = store.LineAt(linear);
+    if (line != NULL) out += "," + json_str("file", line->file) + "," + json_num("line", line->line);
+    return out;
+}
+
+static bool name_contains(const std::string& name, const std::string& needle) {
+    if (needle.empty()) return true;
+    std::string haystack = name;
+    std::string want = needle;
+    for (size_t i = 0; i < haystack.size(); i++) haystack[i] = (char)toupper((unsigned char)haystack[i]);
+    for (size_t i = 0; i < want.size(); i++) want[i] = (char)toupper((unsigned char)want[i]);
+    return haystack.find(want) != std::string::npos;
+}
+
 static void send_error(const char* msg) {
     send_response("{" + json_str("status", "error") + "," + json_str("msg", msg) + "}");
 }
@@ -2338,6 +2403,113 @@ static void process_command(const std::string& json) {
         uint64_t linear = GetAddress(cs, eip);
         send_ok(json_hex("linear_addr", linear) + "," + 
                 json_num("CS", cs) + "," + json_hex("EIP", eip));
+        return;
+    }
+
+    if (cmd == "sym") {
+        std::string name;
+        if (!json_get_string(json, "name", name)) {
+            send_error("Missing 'name'");
+            return;
+        }
+        const DebugSymbol* symbol = DEBUG_Symbols().Resolve(name);
+        if (symbol == NULL) {
+            send_error("Unknown symbol");
+            return;
+        }
+        send_ok(symbol_json(*symbol));
+        return;
+    }
+
+    if (cmd == "sym_list") {
+        std::string filter;
+        json_get_string(json, "filter", filter);
+        long long limit = 100;
+        json_get_int(json, "limit", limit);
+        if (limit < 0) limit = 0;
+
+        const std::vector<DebugSymbol>& all = DEBUG_Symbols().All();
+        long long matched = 0;
+        std::string arr;
+        for (size_t i = 0; i < all.size(); i++) {
+            if (!name_contains(all[i].name, filter)) continue;
+            matched++;
+            if (matched > limit) continue;
+            if (!arr.empty()) arr += ",";
+            arr += "{" + symbol_json(all[i]) + "}";
+        }
+        send_ok(json_num("total", (long long)DEBUG_Symbols().Size()) + "," +
+                json_num("matched", matched) + "," +
+                json_num("lines", (long long)DEBUG_Symbols().LineCount()) + "," +
+                "\"symbols\":[" + arr + "]");
+        return;
+    }
+
+    // No address given means where the CPU is now.
+    if (cmd == "where") {
+        long long linear = 0, seg = 0, off = 0;
+        std::string extra;
+        uint32_t address;
+
+        if (json_get_int(json, "linear", linear)) {
+            address = (uint32_t)linear;
+        } else if (json_get_int(json, "seg", seg) && json_get_int(json, "off", off)) {
+            address = (uint32_t)GetAddress((uint16_t)seg, (uint32_t)off);
+        } else {
+            const uint16_t cs = SegValue(SegNames::cs);
+            address = (uint32_t)GetAddress(cs, reg_eip);
+            extra = "," + json_num("CS", cs) + "," + json_hex("EIP", reg_eip);
+        }
+        send_ok(address_json(address) + extra);
+        return;
+    }
+
+    if (cmd == "sym_load") {
+        std::string file;
+        if (!json_get_string(json, "file", file)) {
+            send_error("Missing 'file'");
+            return;
+        }
+
+        long long load_linear = 0, load_seg = 0;
+        if (!json_get_int(json, "loadLinear", load_linear)) {
+            if (json_get_int(json, "loadSeg", load_seg)) load_linear = load_seg << 4;
+            else load_linear = 0;
+        }
+
+        std::string program = file;
+        json_get_string(json, "program", program);
+
+        DebugSymbolStore& store = DEBUG_Symbols();
+        const size_t before = store.Size();
+        store.ClearProgram(program);
+
+        // A .MAP is text and a program's own debug info is not, so which one
+        // this file is does not have to be declared.
+        LinkMapFile map;
+        DebugInfo info;
+        if (DEBUG_ReadLinkMapFile(file.c_str(), map) && !map.publics.empty()) {
+            store.AddLinkMap(map, (uint32_t)load_linear, program);
+            send_ok(json_str("format", "map") + "," +
+                    json_num("added", (long long)store.Size() - (long long)before) + "," +
+                    json_num("total", (long long)store.Size()));
+        } else if (DEBUG_ParseDebugInfo(file.c_str(), (uint32_t)load_linear, info)) {
+            store.AddDebugInfo(info, program);
+            send_ok(json_str("format", info.version) + "," +
+                    json_num("added", (long long)store.Size() - (long long)before) + "," +
+                    json_num("lines", (long long)store.LineCount()) + "," +
+                    json_num("total", (long long)store.Size()));
+        } else {
+            send_error("File carries no LINK map or debug info this build can read");
+        }
+        return;
+    }
+
+    if (cmd == "sym_clear") {
+        std::string program;
+        if (json_get_string(json, "program", program)) DEBUG_Symbols().ClearProgram(program);
+        else DEBUG_Symbols().Clear();
+        send_ok(json_num("total", (long long)DEBUG_Symbols().Size()));
         return;
     }
 

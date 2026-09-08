@@ -45,14 +45,20 @@ static bool ModuleNameMatches(const std::string &candidate,const std::string &re
 void DebugSymbolStore::Clear()
 {
 	symbols.clear();
+	lines.clear();
 }
 
 void DebugSymbolStore::ClearProgram(const std::string &program)
 {
-	std::vector<DebugSymbol> kept;
+	std::vector<DebugSymbol> keptSymbols;
 	for (size_t i = 0;i < symbols.size();i++)
-		if (symbols[i].program != program) kept.push_back(symbols[i]);
-	symbols.swap(kept);
+		if (symbols[i].program != program) keptSymbols.push_back(symbols[i]);
+	symbols.swap(keptSymbols);
+
+	std::vector<DebugSourceLine> keptLines;
+	for (size_t i = 0;i < lines.size();i++)
+		if (lines[i].program != program) keptLines.push_back(lines[i]);
+	lines.swap(keptLines);
 }
 
 void DebugSymbolStore::Add(const DebugSymbol &symbol)
@@ -66,6 +72,20 @@ void DebugSymbolStore::AddDebugInfo(const DebugInfo &info,const std::string &pro
 		DebugSymbol symbol = info.symbols[i];
 		symbol.program = program;
 		symbols.push_back(symbol);
+	}
+
+	/* Line ranges arrive load-relative; the store answers in linear
+	 * addresses, so the load base is applied once here rather than at every
+	 * lookup. */
+	for (size_t i = 0;i < info.lines.size();i++) {
+		DebugSourceLine line;
+		line.begin = info.loadLinear + info.lines[i].imageOffset;
+		line.end = info.loadLinear + info.lines[i].endOffset;
+		line.line = info.lines[i].line;
+		line.file = info.lines[i].file;
+		line.module = info.lines[i].module;
+		line.program = program;
+		lines.push_back(line);
 	}
 }
 
@@ -121,11 +141,30 @@ const DebugSymbol *DebugSymbolStore::Nearest(uint32_t linear,uint32_t &delta) co
 		if (symbol.linear > linear) continue;
 
 		const uint32_t distance = linear - symbol.linear;
-		if (symbol.hasSize && symbol.size > 0 && distance >= symbol.size) continue;
+		if (symbol.hasSize && symbol.size > 0) {
+			if (distance >= symbol.size) continue;
+		} else if (distance >= 0x10000u) {
+			/* Most formats give no size, and without a bound the lowest
+			 * symbol in the store answers for the whole address space: at a
+			 * BIOS address, cvprobe.exe's _end came back with +0xF06E6 on it.
+			 * A 16-bit symbol can only be reached through its own segment, so
+			 * nothing 64K past it is inside it. */
+			continue;
+		}
 		if (best == NULL || distance < delta) {
 			best = &symbol;
 			delta = distance;
 		}
+	}
+	return best;
+}
+
+const DebugSourceLine *DebugSymbolStore::LineAt(uint32_t linear) const
+{
+	const DebugSourceLine *best = NULL;
+	for (size_t i = 0;i < lines.size();i++) {
+		if (linear < lines[i].begin || linear >= lines[i].end) continue;
+		if (best == NULL || lines[i].begin > best->begin) best = &lines[i];
 	}
 	return best;
 }

@@ -37,15 +37,16 @@ static bool ReadGuestFile(const char *name,std::vector<uint8_t> &out,uint32_t ma
 	return done == size;
 }
 
-/* The block TDSTRIP moved out of the EXE sits in a .TDS beside it. */
-static bool ReadTdsSidecar(const char *program,std::vector<uint8_t> &out)
+/* A file beside the program with the same stem: the block TDSTRIP moved out
+ * into a .TDS, or the .MAP its linker wrote. */
+static bool ReadSidecar(const char *program,const char *extension,std::vector<uint8_t> &out)
 {
 	const std::string path = program;
 	const size_t dot = path.find_last_of('.');
 	if (dot == std::string::npos) return false;
 	if (path.find_first_of("/\\",dot) != std::string::npos) return false;
 
-	return ReadGuestFile((path.substr(0,dot) + ".TDS").c_str(),out,16u*1024u*1024u);
+	return ReadGuestFile((path.substr(0,dot) + extension).c_str(),out,16u*1024u*1024u);
 }
 
 /* True when the file has bytes past the load image, which is where every
@@ -71,33 +72,55 @@ static bool HasAppendedData(const char *program)
 
 void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg)
 {
-	/* No appended debug format exists for a COM image: it has no header to
-	 * say where the load image stops. */
-	if (program == NULL || isCom) return;
+	if (program == NULL) return;
 
 	/* Opening files here must leave no trace: the guest reads the DOS error
-	 * code after EXEC returns, and a missing .TDS would overwrite it. */
+	 * code after EXEC returns, and a missing sidecar would overwrite it. */
 	const uint16_t saved_errorcode = dos.errorcode;
+	const uint32_t loadLinear = (uint32_t)loadSeg << 4u;
 
 	std::vector<uint8_t> data;
 	DebugInfo info;
 	bool found = false;
 
-	if (HasAppendedData(program) && ReadGuestFile(program,data,64u*1024u*1024u))
-		found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,
-		                                 (uint32_t)loadSeg << 4u,info);
+	/* A COM image has no header saying where its load image stops, so no
+	 * appended format can be found in one. */
+	if (!isCom) {
+		if (HasAppendedData(program) && ReadGuestFile(program,data,64u*1024u*1024u))
+			found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,loadLinear,info);
 
-	if (!found && ReadTdsSidecar(program,data))
-		found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,
-		                                 (uint32_t)loadSeg << 4u,info);
+		if (!found && ReadSidecar(program,".TDS",data))
+			found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,loadLinear,info);
+	}
+
+	if (found) {
+		DEBUG_Symbols().ClearProgram(program);
+		DEBUG_Symbols().AddDebugInfo(info,program);
+		LOG_MSG("DEBUG: %s carries %u %s symbols, loaded at segment %04X",
+		        program,(unsigned int)info.symbols.size(),info.version.c_str(),loadSeg);
+		dos.errorcode = saved_errorcode;
+		return;
+	}
+
+	/* A .MAP names far less -- publics only, no modules, sizes or lines -- so
+	 * it is what to fall back to, never what to prefer.
+	 *
+	 * Only for an EXE: a COM .MAP's addresses are written relative to
+	 * whatever origin its toolchain chose, and no COM fixture was available
+	 * to find out which. Guessing would put every symbol 0x100 out. */
+	if (!isCom && ReadSidecar(program,".MAP",data)) {
+		LinkMapFile map;
+		DEBUG_ParseLinkMap(std::string((const char*)data.data(),data.size()),program,map);
+		if (!map.publics.empty()) {
+			DEBUG_Symbols().ClearProgram(program);
+			const size_t before = DEBUG_Symbols().Size();
+			DEBUG_Symbols().AddLinkMap(map,loadLinear,program);
+			LOG_MSG("DEBUG: %s has no appended debug info; its .MAP gives %u symbols at segment %04X",
+			        program,(unsigned int)(DEBUG_Symbols().Size() - before),loadSeg);
+		}
+	}
 
 	dos.errorcode = saved_errorcode;
-	if (!found) return;
-
-	DEBUG_Symbols().ClearProgram(program);
-	DEBUG_Symbols().AddDebugInfo(info,program);
-	LOG_MSG("DEBUG: %s carries %u %s symbols, loaded at segment %04X",
-	        program,(unsigned int)info.symbols.size(),info.version.c_str(),loadSeg);
 }
 
 #endif
