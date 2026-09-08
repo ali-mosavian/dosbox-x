@@ -40,14 +40,12 @@ import {
   type ResolvedSymbol,
   type SymFile,
 } from "./symbols.js";
-import { parseDebugInfo, sourceLineAt, type DebugInfo } from "./debuginfo.js";
 import { scrapeDosErrors } from "./dosErrors.js";
 import { parseElf32Symbols } from "./elf.js";
 import {
   loadConfMounts,
-  locateProgram,
   type Mount,
-} from "./exeLocator.js";
+} from "./mounts.js";
 import {
   moduleScanners,
   resolveProbeName,
@@ -72,7 +70,9 @@ import {
   SymbolIndex,
   loadSidecarSymbols,
   parseQualifiedSymbolName,
+  type UnifiedSymbol,
 } from "./symbolIndex.js";
+import { symbolsFromSocketList } from "./socketSymbols.js";
 import {
   debuggerStopBlockDecision,
   isDefaultCriticalStopEvent,
@@ -230,12 +230,10 @@ let currentLoadSegment: number | undefined;
 let currentLoadSegmentFresh = false;
 let currentLoadInfo: NormalizedLoadInfo | undefined;
 let guestMounts: Mount[] = [];
-let programSearchPaths: string[] = [];
-let autoDebugInfo: DebugInfo | undefined;
-let autoDebugInfoKey: string | undefined;
+/** Symbols the emulator parsed for itself; mirrored here, never re-parsed. */
+let socketSymbols: UnifiedSymbol[] = [];
+let socketSymbolsKey: string | undefined;
 let autoDebugInfoNote: string | undefined;
-/** An explicit dosbox_debuginfo load; discovery must not overwrite it. */
-let autoDebugInfoPinned = false;
 let lastStopRegisters: Record<string, number> | undefined;
 let lastStopEvent: db.JsonObject | undefined;
 let lastProcessExit: db.JsonObject | undefined;
@@ -547,7 +545,7 @@ async function captureStopState(resp: db.JsonObject): Promise<string | undefined
         : loadInfo.loadSeg;
       currentLoadSegmentFresh = true;
     }
-    rebuildSymbolIndex();
+    await syncSocketSymbols();
     const source = loadInfoFromResponse(resp) === undefined ? "get_load_info" : "loadInfo";
     const segmentText = currentLoadSegment === undefined ? "unknown" : hex(currentLoadSegment);
     return `loadInfo → loadSegment ${segmentText} (${source})`;
@@ -599,7 +597,7 @@ async function effectiveMapLoadInfo(): Promise<NormalizedLoadInfo> {
   const fetched = await fetchLoadInfoFallback();
   if (fetched !== undefined) {
     currentLoadInfo = fetched;
-    rebuildSymbolIndex();
+    await syncSocketSymbols();
     return fetched;
   }
   throw new Error("Resolving LINK map addresses requires loadInfo from a break-at-entry stop or get_load_info");
@@ -693,47 +691,37 @@ function addElfSymbolsToIndex(): void {
 }
 
 /**
- * Parse the debug info out of the EXE the guest actually launched.
+ * Mirror the emulator's symbol store.
  *
- * DOS hands the debugger the path string it was EXEC'd with, which may be
- * relative or a shell fallback -- so the file is found by name and then
- * confirmed against the MZ header fields loadInfo carries back. Two build
- * directories holding the same basename is this project's normal state, and
- * a name match alone silently resolves against the wrong binary.
+ * DOSBox-X reads a program's debug info through its own DOS filesystem as
+ * EXEC loads it, which is the only place the running program's identity is
+ * certain -- no mount table to walk, no MZ fingerprint to match, and image
+ * and zip drives work like any other. This asks for the result rather than
+ * parsing the file a second time here.
  */
-function syncAutoDebugInfo(): void {
-  if (autoDebugInfoPinned) return;
+async function syncSocketSymbols(force = false): Promise<void> {
+  const key = `${currentLoadInfo?.program ?? ""}@${currentLoadInfo?.loadLinear ?? ""}`;
+  if (!force && key === socketSymbolsKey) return;
 
-  const program = currentLoadInfo?.program;
-  if (program === undefined || program === "" || currentLoadInfo?.loadLinear === undefined) {
-    autoDebugInfo = undefined;
-    autoDebugInfoKey = undefined;
+  const resp = await db.sendCommand({ cmd: "sym_list", limit: 1_000_000 }, undefined, 20_000)
+    .catch((e) => ({ status: "error", msg: (e as Error).message }) as db.JsonObject);
+  if (resp["status"] !== "ok" || !Array.isArray(resp["symbols"])) {
+    autoDebugInfoNote = `emulator symbols unavailable: ${String(resp["msg"] ?? "no sym_list support")}`;
+    socketSymbols = [];
+    socketSymbolsKey = key;
+    rebuildSymbolIndex();
     return;
   }
 
-  const loadLinear = currentLoadInfo.loadLinear >>> 0;
-  // The mounts go into the key by path, not by count: remounting a drive
-  // somewhere else leaves the count unchanged and would keep the old build
-  // directory's symbols indexed -- the very mistake the fingerprint prevents.
-  const mounts = guestMounts.map((mount) => `${mount.drive}=${mount.hostPath}`).join(",");
-  const key = `${program}@${hex(loadLinear)}@${mounts}@${programSearchPaths.join(",")}`;
-  if (key === autoDebugInfoKey) return;
-  autoDebugInfoKey = key;
-  autoDebugInfo = undefined;
+  socketSymbols = symbolsFromSocketList(resp as Record<string, unknown>);
+  socketSymbolsKey = key;
 
-  const located = locateProgram(program, guestMounts, programSearchPaths, currentLoadInfo);
-  if (located === undefined) {
-    autoDebugInfoNote = `no host file matched guest program ${program}`;
-    return;
-  }
-  try {
-    autoDebugInfo = parseDebugInfo(located.file, loadLinear);
-    autoDebugInfoNote = autoDebugInfo === undefined
-      ? `${located.file} carries no recognised debug info`
-      : `${autoDebugInfo.format} ${autoDebugInfo.version} from ${located.file} (matched by ${located.matchedBy})`;
-  } catch (e) {
-    autoDebugInfoNote = `${located.file}: ${(e as Error).message}`;
-  }
+  const total = parseRegisterNumber(resp["total"]) ?? socketSymbols.length;
+  const lines = parseRegisterNumber(resp["lines"]) ?? 0;
+  autoDebugInfoNote = total === 0
+    ? "the emulator found no debug info in the loaded program"
+    : `${total} symbols and ${lines} line records from the emulator`;
+  rebuildSymbolIndex();
 }
 
 async function currentLinearAddress(): Promise<number | undefined> {
@@ -744,20 +732,17 @@ async function currentLinearAddress(): Promise<number | undefined> {
   return text === "" ? undefined : Number.parseInt(text.replace(/^0x/i, ""), 16) >>> 0;
 }
 
-function addAutoDebugInfoToIndex(): void {
-  if (autoDebugInfo !== undefined) symbolIndex.addMany(autoDebugInfo.symbols);
-}
-
-function autoDebugSourceLine(linear: number): string | undefined {
-  if (autoDebugInfo === undefined || currentLoadInfo?.loadLinear === undefined) return undefined;
-  const found = sourceLineAt(autoDebugInfo, (linear - currentLoadInfo.loadLinear) >>> 0);
-  return found === undefined ? undefined : `${found.file}:${found.line}`;
+/** The source line covering an address, from the emulator's line tables. */
+async function autoDebugSourceLine(linear: number): Promise<string | undefined> {
+  const resp = await db.sendCommand({ cmd: "where", linear }, undefined, 5_000)
+    .catch(() => ({ status: "error" }) as db.JsonObject);
+  if (resp["status"] !== "ok" || typeof resp["file"] !== "string") return undefined;
+  return `${resp["file"]}:${String(resp["line"] ?? "")}`;
 }
 
 function rebuildSymbolIndex(): void {
   symbolIndex.clear();
-  syncAutoDebugInfo();
-  addAutoDebugInfoToIndex();
+  symbolIndex.addMany(socketSymbols);
   addMapSymbolsToIndex();
   addSymFileToIndex();
   addElfSymbolsToIndex();
@@ -781,10 +766,9 @@ function clearMcpDebugSessionState(opts: {
   currentLoadSegment = undefined;
   currentLoadSegmentFresh = false;
   currentLoadInfo = undefined;
-  autoDebugInfo = undefined;
-  autoDebugInfoKey = undefined;
+  socketSymbols = [];
+  socketSymbolsKey = undefined;
   autoDebugInfoNote = undefined;
-  autoDebugInfoPinned = false;
   lastStopRegisters = undefined;
   lastStopEvent = undefined;
   lastProcessExit = undefined;
@@ -1393,8 +1377,9 @@ server.tool(
   async ({ conf, headless, skipStartupFaults }) => {
     const result = await withTimeout("dosbox_launch", 5_000, db.launch({ conf, headless }));
     clearMcpDebugSessionState();
-    // The conf's [autoexec] MOUNT lines are how a guest path becomes a host
-    // path, which is what makes symbol discovery need no extra call.
+    // Only for reporting which drives are mounted; the emulator reads a
+    // program's debug info through its own filesystem, so nothing here has to
+    // turn a guest path into a host one.
     guestMounts = loadConfMounts(conf ?? db.DEFAULT_CONF);
     const parts: string[] = [j(result)];
     if (guestMounts.length > 0) {
@@ -1927,7 +1912,7 @@ server.tool(
     const loadInfo = loadInfoFromResponse(resp);
     if (loadInfo !== undefined) {
       currentLoadInfo = loadInfo;
-      rebuildSymbolIndex();
+      await syncSocketSymbols();
     }
     return { content: [{ type: "text", text: j({ ...resp, normalized: loadInfo }) }], isError: isErr(resp) };
   },
@@ -2315,67 +2300,64 @@ server.tool(
 
 server.tool(
   "dosbox_debuginfo",
-  "Debug info carried inside the program the guest loaded (CodeView NB0x today). " +
-  "It is parsed and indexed automatically on program load, so this tool is for inspecting " +
-  "and steering that, not for enabling it. " +
-  "op='status': what was found and which host file it came from. " +
-  "op='paths': add directories/files to search when the guest path cannot be mapped through a mount. " +
-  "op='modules': object modules the program was linked from. " +
+  "Debug info the emulator read out of the program the guest loaded. DOSBox-X parses it " +
+  "through its own DOS filesystem as EXEC loads the program -- CodeView, Borland TDINFO " +
+  "including a .TDS sidecar, Watcom, or the program's .MAP as a fallback -- so this tool " +
+  "reports that work rather than doing any of it. " +
+  "op='status': what the emulator found and how much of it. " +
+  "op='modules': the object modules those symbols name. " +
   "op='lines': source file and line for a linear address (or for the current CS:IP). " +
-  "op='load': parse a specific host EXE instead of the located one.",
+  "op='load': have the emulator read a host file too, an EXE carrying debug info or a LINK .MAP.",
   {
-    op: z.enum(["status", "paths", "modules", "lines", "load"]).describe("Operation."),
-    file: z.string().optional().describe("Host path to an EXE carrying debug info (op=load)."),
-    paths: z.array(z.string()).optional().describe("Directories or files to search for the loaded program (op=paths)."),
+    op: z.enum(["status", "modules", "lines", "load"]).describe("Operation."),
+    file: z.string().optional().describe("Host path for op=load."),
     addr: z.number().optional().describe("Linear address for op=lines; defaults to the current location."),
+    loadSeg: z.number().optional().describe("Load segment for op=load; defaults to the running program's."),
   },
-  async ({ op, file, paths, addr }) => {
+  async ({ op, file, addr, loadSeg }) => {
     try {
-      if (op === "paths") {
-        if (paths !== undefined) programSearchPaths = paths;
-        rebuildSymbolIndex();
-        return { content: [{ type: "text", text: j({ programSearchPaths, mounts: guestMounts, note: autoDebugInfoNote }) }] };
-      }
-
       if (op === "load") {
         if (file === undefined) return { content: [{ type: "text", text: "ERROR: 'file' required for op=load" }], isError: true };
-        const loadLinear = currentLoadInfo === undefined ? 0 : effectiveLoadLinear(currentLoadInfo);
-        const parsed = parseDebugInfo(file, loadLinear);
-        if (parsed === undefined) {
-          return { content: [{ type: "text", text: `ERROR: ${file} carries no recognised debug info` }], isError: true };
+        const segment = loadSeg ?? currentLoadInfo?.loadSeg ?? currentLoadSegment ?? 0;
+        const resp = await db.sendCommand({ cmd: "sym_load", file, loadSeg: segment, program: file });
+        if (resp["status"] !== "ok") {
+          return { content: [{ type: "text", text: `ERROR: ${String(resp["msg"] ?? j(resp))}` }], isError: true };
         }
-        autoDebugInfo = parsed;
-        autoDebugInfoPinned = true;
-        autoDebugInfoNote = `${parsed.format} ${parsed.version} from ${file} (explicit)`;
-        symbolIndex.addMany(parsed.symbols);
-      }
-
-      if (autoDebugInfo === undefined) {
-        return { content: [{ type: "text", text: j({ status: "none", note: autoDebugInfoNote, program: currentLoadInfo?.program, mounts: guestMounts, programSearchPaths }) }] };
-      }
-
-      if (op === "modules") {
-        return { content: [{ type: "text", text: j({ file: autoDebugInfo.file, modules: autoDebugInfo.modules }) }] };
+        await syncSocketSymbols(true);
+        return { content: [{ type: "text", text: j({ ...resp, loadSeg: segment, note: autoDebugInfoNote }) }] };
       }
 
       if (op === "lines") {
         const target = addr ?? await currentLinearAddress();
         if (target === undefined) return { content: [{ type: "text", text: "ERROR: no address; pass addr" }], isError: true };
-        return { content: [{ type: "text", text: j({ address: hex(target), source: autoDebugSourceLine(target) }) }] };
+        return { content: [{ type: "text", text: j({ address: hex(target), source: await autoDebugSourceLine(target) }) }] };
       }
 
+      await syncSocketSymbols(true);
+
+      if (op === "modules") {
+        const counts = new Map<string, number>();
+        for (const symbol of socketSymbols) {
+          if (symbol.module === undefined) continue;
+          counts.set(symbol.module, (counts.get(symbol.module) ?? 0) + 1);
+        }
+        const modules = [...counts.entries()]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([name, symbols]) => ({ name, symbols }));
+        return { content: [{ type: "text", text: j({ modules: modules.length, unnamed: socketSymbols.filter((symbol) => symbol.module === undefined).length, list: modules }) }] };
+      }
+
+      const bySource = new Map<string, number>();
+      for (const symbol of socketSymbols) bySource.set(symbol.source, (bySource.get(symbol.source) ?? 0) + 1);
       return {
         content: [{
           type: "text",
           text: j({
-            status: "ok",
-            file: autoDebugInfo.file,
-            format: autoDebugInfo.format,
-            version: autoDebugInfo.version,
-            modules: autoDebugInfo.modules.length,
-            symbols: autoDebugInfo.symbols.length,
-            lines: autoDebugInfo.lines.length,
-            warnings: autoDebugInfo.warnings,
+            status: socketSymbols.length === 0 ? "none" : "ok",
+            program: currentLoadInfo?.program,
+            symbols: socketSymbols.length,
+            bySource: Object.fromEntries(bySource),
+            mounts: guestMounts,
             note: autoDebugInfoNote,
           }),
         }],
@@ -2578,7 +2560,10 @@ server.tool(
     try {
       if (refreshLoadInfo) {
         const refreshed = await fetchLoadInfoFallback();
-        if (refreshed !== undefined) currentLoadInfo = refreshed;
+        if (refreshed !== undefined) {
+          currentLoadInfo = refreshed;
+          await syncSocketSymbols();
+        }
       }
 
       if (name !== undefined) {

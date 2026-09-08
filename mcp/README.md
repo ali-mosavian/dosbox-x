@@ -41,23 +41,25 @@ Examples:
 
 ## Debug Info In The Program Itself
 
-A `.MAP` is not needed when the EXE carries debug info. On every program load the
-server finds the host file the guest launched, parses whatever debug info is in it,
-and adds the symbols to the same index `dosbox_where`, `dosbox_symbols` and
-`dosbox_bp_set` already use. No load step.
+A `.MAP` is not needed when the EXE carries debug info. The emulator reads it as DOS
+EXEC loads the program, through its own DOS filesystem, and this server mirrors the
+result into the same index `dosbox_where`, `dosbox_symbols` and `dosbox_bp_set`
+already use. No load step, and nothing here parses a debug format any more: the
+readers live in `src/debug/debug_symfmt*.cpp` and are reached over the debug socket
+with `sym`, `sym_list`, `where` and `sym_load`.
 
-The host file is found through the guest's drive mounts — read from the launch
-config's `[autoexec]` and updated by `dosbox_mount` — and then confirmed against the
-MZ header fields `loadInfo` carries back, so two build directories holding the same
-`QRENDER.EXE` do not resolve to each other. Add more places to look with
-`dosbox_debuginfo {op:"paths", paths:[...]}`.
+Reading it inside the emulator is what makes the program's identity certain. There is
+no mount table to walk and no MZ header to fingerprint against the running image, and
+programs on image or zip drives work like any other.
 
 | format | how it is found | what comes out |
 |---|---|---|
-| Microsoft CodeView `NB05`–`NB11` | `NBxx` trailer at EOF, or the MZ image end | publics, module data, procedures, labels, object-module names, source line numbers |
-| Microsoft CodeView `NB00`–`NB02` | as above | the subsection directory only; the pre-CV4 record layouts are unread |
-| Borland TDINFO (`0x52FB`) | MZ image end; the format has no trailer | globals, module names. Line records are counted, not decoded — their layout is not published |
+| Microsoft CodeView `NB05`-`NB11` | `NBxx` trailer at EOF, or the MZ image end | publics, module data, procedures, labels, object-module names, source line numbers |
+| Microsoft CodeView `NB00`-`NB02` | as above | the subsection directory only; the pre-CV4 record layouts are unread |
+| Borland TDINFO (`0x52FB`) | MZ image end, or a `.TDS` beside the program; the format has no trailer | globals, module names. Line records are counted, not decoded -- their layout is not published |
 | Watcom (`0x8386`) | master header in the last 14 bytes | globals, module names |
+| LINK `.MAP` | beside the program, only when it carries none of the above | publics |
 
-`dosbox_debuginfo {op:"status"}` says what was found and which file it came from;
-`op:"modules"` lists the object modules; `op:"lines"` maps an address to file:line.
+`dosbox_debuginfo {op:"status"}` says what the emulator found; `op:"modules"` lists the
+object modules; `op:"lines"` maps an address to file:line; `op:"load"` has the emulator
+read another host file, an EXE or a `.MAP`.
