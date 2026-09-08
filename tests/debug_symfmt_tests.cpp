@@ -605,6 +605,51 @@ TEST_F(DebugSymFmtTest, BorlandTypesGiveAVariableItsSizeAndAFunctionItsExtent)
 	EXPECT_EQ(58u,byName["_main"]->size);
 }
 
+TEST_F(DebugSymFmtTest, BorlandScopesCarryParametersAndLocals)
+{
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("tdsprobe-stripped.exe").c_str(),0x8240,info));
+
+	/* Three functions, each with a block scope inside it. */
+	ASSERT_EQ(6u,info.scopes.size());
+
+	const uint32_t code = 0x1a3u << 4;
+	const DebugScope *sum = NULL,*sumBlock = NULL,*mainBlock = NULL;
+	for (size_t i = 0;i < info.scopes.size();i++) {
+		if (info.scopes[i].imageOffset == code + 14) sum = &info.scopes[i];
+		if (info.scopes[i].imageOffset == code + 17) sumBlock = &info.scopes[i];
+		if (info.scopes[i].imageOffset == code + 75) mainBlock = &info.scopes[i];
+	}
+	ASSERT_TRUE(sum != NULL && sumBlock != NULL && mainBlock != NULL);
+
+	/* tp_sum's parameter, at [bp+06] the way the far call passes it. */
+	EXPECT_EQ("_tp_sum",sum->function);
+	ASSERT_EQ(1u,sum->locals.size());
+	EXPECT_EQ("n",sum->locals[0].name);
+	EXPECT_EQ(DEBUG_STORAGE_FRAME,sum->locals[0].storage);
+	EXPECT_EQ(6,sum->locals[0].frameOffset);
+	EXPECT_EQ("int",sum->locals[0].typeName);
+
+	/* The block inside it nests, and its two counters live in registers:
+	 * total accumulates in CX and i counts in DX. */
+	EXPECT_TRUE(sumBlock->parent >= 0);
+	EXPECT_EQ(sum,&info.scopes[(size_t)sumBlock->parent]);
+	ASSERT_EQ(3u,sumBlock->locals.size());
+	EXPECT_EQ("total",sumBlock->locals[0].name);
+	EXPECT_EQ(DEBUG_STORAGE_REGISTER,sumBlock->locals[0].storage);
+	EXPECT_EQ(1u,sumBlock->locals[0].reg);
+	EXPECT_EQ("i",sumBlock->locals[1].name);
+	EXPECT_EQ(2u,sumBlock->locals[1].reg);
+
+	/* main keeps t on the stack at [bp-02] and s in SI. */
+	ASSERT_EQ(2u,mainBlock->locals.size());
+	EXPECT_EQ("t",mainBlock->locals[0].name);
+	EXPECT_EQ(-2,mainBlock->locals[0].frameOffset);
+	EXPECT_EQ("s",mainBlock->locals[1].name);
+	EXPECT_EQ(DEBUG_STORAGE_REGISTER,mainBlock->locals[1].storage);
+	EXPECT_EQ(6u,mainBlock->locals[1].reg);
+}
+
 TEST_F(DebugSymFmtTest, AStandaloneTdsParsesToTheBlockTdstripRemoved)
 {
 	std::vector<uint8_t> embeddedData,sidecarData;

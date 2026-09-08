@@ -357,3 +357,112 @@ TEST_F(DebugSymbolsTest, ALineIsFoundByBasenameAndWithoutRegardToCase)
 	/* _tp_scale is at 0x1a3:0x2b, and line 29 is its first statement. */
 	EXPECT_EQ(0x8240u + (0x1a3u << 4) + 0x2eu,at.linear);
 }
+
+TEST_F(DebugSymbolsTest, LocalsResolveByNameAtTheAddressTheyAreInScope)
+{
+	if (MapFixtureDir().empty()) GTEST_SKIP() << "mcp/test/fixtures not found; set DOSBOX_TEST_FIXTURES";
+
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(MapFixture("tdsprobe-stripped.exe").c_str(),0x8240,info));
+	DebugSymbolStore store;
+	store.AddDebugInfo(info,"TDSPROBE.EXE");
+
+	const uint32_t code = 0x8240u + (0x1a3u << 4);
+	DebugLocal local;
+	std::string function;
+
+	/* 0x9CA6 is tdsprobe.c:30, inside tp_scale's block. Its parameters come
+	 * from the scope around it, and they are the slots the disassembly
+	 * reads: v at [bp+06], k at [bp+08]. */
+	ASSERT_TRUE(store.ResolveLocal(code + 0x36,"v",local,function));
+	EXPECT_EQ(6,local.frameOffset);
+	ASSERT_TRUE(store.ResolveLocal(code + 0x36,"k",local,function));
+	EXPECT_EQ(8,local.frameOffset);
+	ASSERT_TRUE(store.ResolveLocal(code + 0x36,"r",local,function));
+	EXPECT_EQ(DEBUG_STORAGE_REGISTER,local.storage);
+	EXPECT_EQ(3u,local.reg);
+
+	/* A name only in another function is not in scope here, and the same
+	 * name in two functions resolves to the one being run. */
+	EXPECT_FALSE(store.ResolveLocal(code + 0x36,"total",local,function));
+	ASSERT_TRUE(store.ResolveLocal(code + 0x20,"n",local,function));
+	EXPECT_EQ("_tp_sum",function);
+
+	std::vector<DebugLocal> visible;
+	std::vector<std::string> functions;
+	store.LocalsAt(code + 0x36,visible,functions);
+	/* The block scope repeats its function's parameters, so all three come
+	 * from it and the copies in the scope around it are shadowed. */
+	ASSERT_EQ(3u,visible.size());
+	EXPECT_EQ("r",visible[0].name);
+	EXPECT_EQ("v",visible[1].name);
+	EXPECT_EQ("k",visible[2].name);
+
+	store.ClearProgram("TDSPROBE.EXE");
+	visible.clear();
+	functions.clear();
+	store.LocalsAt(code + 0x36,visible,functions);
+	EXPECT_EQ(0u,visible.size());
+}
+
+TEST_F(DebugSymbolsTest, AnInnerScopeSeesTheVariablesOfTheOneAroundIt)
+{
+	/* tdsprobe's block scopes repeat their function's parameters, so nothing
+	 * in it needs the walk out to enclosing scopes. These scopes do: a name
+	 * declared in the function is only reachable from the block through its
+	 * parent, and a name declared in both resolves to the inner one. */
+	DebugInfo info;
+	info.loadLinear = 0x1000;
+
+	DebugLocal outer;
+	outer.name = "count";
+	outer.frameOffset = 4;
+	DebugLocal shadowed;
+	shadowed.name = "value";
+	shadowed.frameOffset = 6;
+	DebugLocal inner;
+	inner.name = "value";
+	inner.frameOffset = -2;
+
+	DebugScope function;
+	function.imageOffset = 0;
+	function.endOffset = 0x100;
+	function.function = "run";
+	function.locals.push_back(outer);
+	function.locals.push_back(shadowed);
+
+	DebugScope block;
+	block.imageOffset = 0x50;
+	block.endOffset = 0x80;
+	block.parent = 0;
+	block.function = "run";
+	block.locals.push_back(inner);
+
+	info.scopes.push_back(function);
+	info.scopes.push_back(block);
+
+	DebugSymbolStore store;
+	store.AddDebugInfo(info,"RUN.EXE");
+
+	DebugLocal found;
+	std::string where;
+	ASSERT_TRUE(store.ResolveLocal(0x1060,"count",found,where));
+	EXPECT_EQ(4,found.frameOffset);
+	EXPECT_EQ("run",where);
+
+	ASSERT_TRUE(store.ResolveLocal(0x1060,"value",found,where));
+	EXPECT_EQ(-2,found.frameOffset);
+	ASSERT_TRUE(store.ResolveLocal(0x1090,"value",found,where));
+	EXPECT_EQ(6,found.frameOffset);
+
+	std::vector<DebugLocal> visible;
+	std::vector<std::string> functions;
+	store.LocalsAt(0x1060,visible,functions);
+	ASSERT_EQ(2u,visible.size());
+	EXPECT_EQ("value",visible[0].name);
+	EXPECT_EQ(-2,visible[0].frameOffset);
+	EXPECT_EQ("count",visible[1].name);
+
+	/* Outside the function nothing is in scope. */
+	EXPECT_FALSE(store.ResolveLocal(0x1200,"count",found,where));
+}

@@ -21,6 +21,16 @@ struct DebugSourceLine {
 	std::string program;
 };
 
+/* A scope as the store keeps it: the code it covers, in linear addresses. */
+struct DebugScopeEntry {
+	uint32_t begin = 0;
+	uint32_t end = 0;
+	int32_t parent = -1;		/* index into the store's own list */
+	std::string function;
+	std::string program;
+	std::vector<DebugLocal> locals;
+};
+
 /* Where a location spec landed, and what it went through to get there. */
 struct DebugLocation {
 	uint32_t linear = 0;
@@ -63,6 +73,15 @@ public:
 
 	const std::vector<DebugSourceLine> &Lines() const { return lines; }
 
+	/* Locals and parameters of the innermost scope covering an address,
+	 * then of each scope around it. A name declared twice resolves to the
+	 * innermost one, the way the language scopes it. */
+	bool ResolveLocal(uint32_t pcLinear,const std::string &name,DebugLocal &out,std::string &function) const;
+
+	/* Everything in scope at an address, innermost first. functions[i] names
+	 * the scope out[i] came from. */
+	void LocalsAt(uint32_t pcLinear,std::vector<DebugLocal> &out,std::vector<std::string> &functions) const;
+
 	/* The lowest address of a source line. A line with no code of its own
 	 * resolves forward to the next one that has some, the way a debugger
 	 * moves a breakpoint set on a blank line or a declaration; used says
@@ -86,8 +105,12 @@ public:
 	bool ResolveLocation(const std::string &spec,DebugLocation &out,std::string &error) const;
 
 private:
+	/* The innermost scope covering an address, or -1. */
+	int32_t InnermostScope(uint32_t pcLinear) const;
+
 	std::vector<DebugSymbol> symbols;
 	std::vector<DebugSourceLine> lines;
+	std::vector<DebugScopeEntry> scopes;
 };
 
 DebugSymbolStore &DEBUG_Symbols(void);

@@ -427,6 +427,36 @@ struct DebugLine {
 	uint32_t endOffset = 0;
 };
 
+/* Where a local lives while its function runs. */
+enum DebugStorage {
+	DEBUG_STORAGE_FRAME,		/* at a displacement from BP */
+	DEBUG_STORAGE_REGISTER
+};
+
+struct DebugLocal {
+	std::string name;
+	DebugStorage storage = DEBUG_STORAGE_FRAME;
+	int32_t frameOffset = 0;	/* BP-relative; negative for a local, positive for a parameter */
+	/* 0..7 = AX,CX,DX,BX,SP,BP,SI,DI, x86's own encoding order. Confirmed
+	 * against tdsprobe.exe's code: total(1) accumulates in CX, i(2) counts
+	 * in DX, r(3) lands in BX, s(6) in SI. Anything above 7 is left
+	 * undecoded rather than guessed at. */
+	uint16_t reg = 0;
+	std::string typeName;
+	uint32_t valueSize = 0;
+	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;
+	uint32_t elementSize = 0;
+};
+
+/* A function body or a block inside one, and the variables it holds. */
+struct DebugScope {
+	uint32_t imageOffset = 0;	/* load-relative, like DebugLine */
+	uint32_t endOffset = 0;
+	int32_t parent = -1;		/* index into DebugInfo::scopes; -1 = none */
+	std::string function;		/* the symbol the scope starts at, when there is one */
+	std::vector<DebugLocal> locals;
+};
+
 struct DebugInfo {
 	std::string file;
 	DebugFormatId format = DEBUG_FORMAT_CODEVIEW;
@@ -435,6 +465,7 @@ struct DebugInfo {
 	std::vector<DebugModule> modules;
 	std::vector<DebugSymbol> symbols;
 	std::vector<DebugLine> lines;
+	std::vector<DebugScope> scopes;
 	std::vector<std::string> warnings;
 };
 

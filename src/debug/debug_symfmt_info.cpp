@@ -179,6 +179,86 @@ static void BorlandFunctionSizes(const TdInfo &info,DebugInfo &out)
 	}
 }
 
+/* A scope's symbols are the locals and parameters of the function or block it
+ * covers; only the two classes that say where a variable lives are kept. */
+static void BorlandScopes(const TdInfo &info,DebugInfo &out)
+{
+	std::vector<int32_t> mapping(info.scopes.size(),-1);
+
+	for (size_t s = 0;s < info.segments.size();s++) {
+		const TdSegment &segment = info.segments[s];
+		const uint32_t base = (uint32_t)segment.codeSegment << 4u;
+
+		for (uint16_t i = 0;i < segment.scopeCount;i++) {
+			const size_t index = (size_t)segment.scopeIndex + i;
+			if (index < 1 || index > info.scopes.size()) continue;
+
+			const TdScope &scope = info.scopes[index-1];
+			DebugScope out_scope;
+			out_scope.imageOffset = base + scope.offset;
+			out_scope.endOffset = base + scope.offset + scope.length;
+			out_scope.parent = (int32_t)scope.parent;	/* still the TDINFO index */
+
+			for (uint16_t k = 0;k < scope.symbolCount;k++) {
+				const size_t at = (size_t)scope.symbolIndex + k;
+				if (at < 1 || at > info.symbols.size()) continue;
+
+				const TdSymbol &symbol = info.symbols[at-1];
+				if (symbol.symbolClass != TD_SYM_AUTO && symbol.symbolClass != TD_SYM_REGISTER) continue;
+
+				DebugLocal local;
+				local.name = symbol.name;
+				if (symbol.symbolClass == TD_SYM_REGISTER) {
+					local.storage = DEBUG_STORAGE_REGISTER;
+					local.reg = (uint16_t)symbol.offset;
+				} else {
+					local.storage = DEBUG_STORAGE_FRAME;
+					local.frameOffset = symbol.offset;
+				}
+
+				DebugSymbol typed;
+				local.typeName = BorlandTypeName(info,symbol.type,typed);
+				local.valueSize = typed.valueSize;
+				local.valueKind = typed.valueKind;
+				local.elementSize = typed.elementSize;
+				out_scope.locals.push_back(local);
+			}
+
+			mapping[index-1] = (int32_t)out.scopes.size();
+			out.scopes.push_back(out_scope);
+		}
+	}
+
+	/* Parents were written as TDINFO indices; turn them into our own, and
+	 * name each function scope after the symbol that starts it. */
+	for (size_t i = 0;i < out.scopes.size();i++) {
+		const int32_t parent = out.scopes[i].parent;
+		out.scopes[i].parent = parent >= 1 && (size_t)parent <= mapping.size() ? mapping[parent-1] : -1;
+
+		for (size_t k = 0;k < out.symbols.size();k++) {
+			if (!out.symbols[k].isFunction) continue;
+			const uint32_t begin = out.symbols[k].segmentBase + out.symbols[k].offset;
+			if (begin == out.scopes[i].imageOffset) {
+				out.scopes[i].function = out.symbols[k].name;
+				break;
+			}
+		}
+	}
+
+	/* A block inside a function reports that function: "in _tp_sum" is what
+	 * a stop inside its loop is, and only the outermost scope starts at the
+	 * entry point that names it. */
+	for (size_t i = 0;i < out.scopes.size();i++) {
+		if (!out.scopes[i].function.empty()) continue;
+
+		for (int32_t at = out.scopes[i].parent;at >= 0;at = out.scopes[(size_t)at].parent) {
+			if (out.scopes[(size_t)at].function.empty()) continue;
+			out.scopes[i].function = out.scopes[(size_t)at].function;
+			break;
+		}
+	}
+}
+
 /* Line offsets are counted in the code segment of the module they belong to,
  * and a segment record is what says which module owns which stretch of code. */
 static void BorlandLines(const TdInfo &info,DebugInfo &out)
@@ -362,6 +442,7 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 		}
 		BorlandSymbols(td,loadLinear,out);
 		BorlandLines(td,out);
+		BorlandScopes(td,out);
 		return true;
 	}
 

@@ -24,7 +24,12 @@
  *   {"cmd":"line_list","file":"cvprobe.bas"} - The line table, as addresses.
  *   {"cmd":"var","name":"g_counter"} - Read a variable by name. Its bytes
  *     always, and a decoded value when the debug info gave it a type; "len"
- *     overrides how much to read.
+ *     overrides how much to read. A name that is not a global is looked up
+ *     as a local or parameter of whatever is running at CS:EIP.
+ *   {"cmd":"locals"} - Every local and parameter in scope at CS:EIP,
+ *     innermost first, with values. A frame variable is only where BP says
+ *     it is once the function's prologue has run, so the frame each was read
+ *     through comes back with it.
  *   {"cmd":"sym_load","file":"/host/path.map","loadSeg":X} - Load symbols from
  *     a host file, either a LINK .MAP or a program with debug info in it. Each
  *     program's symbols load by themselves as DOS EXEC runs it, so this is for
@@ -698,6 +703,83 @@ static std::string decode_value(const std::vector<uint8_t>& bytes, size_t at, ui
     }
     snprintf(buf, sizeof(buf), "%llu", (unsigned long long)raw);
     return buf;
+}
+
+// Borland numbers registers the way x86 encodes them.
+static const char* register_name(uint16_t reg) {
+    static const char* const names[8] = {"AX","CX","DX","BX","SP","BP","SI","DI"};
+    return reg < 8 ? names[reg] : NULL;
+}
+
+static bool register_value(uint16_t reg, uint32_t& out) {
+    switch (reg) {
+    case 0: out = reg_ax; return true;
+    case 1: out = reg_cx; return true;
+    case 2: out = reg_dx; return true;
+    case 3: out = reg_bx; return true;
+    case 4: out = reg_sp; return true;
+    case 5: out = reg_bp; return true;
+    case 6: out = reg_si; return true;
+    case 7: out = reg_di; return true;
+    }
+    return false;
+}
+
+// A local or parameter, read where it lives right now. A frame variable is
+// only where BP says it is once the function's prologue has run, so the frame
+// this was read through is reported with it.
+static std::string local_json(const DebugLocal& local, const std::string& function) {
+    std::string out = json_str("name", local.name) + "," +
+                      json_str("storage", local.storage == DEBUG_STORAGE_REGISTER ? "register" : "frame");
+    if (!function.empty()) out += "," + json_str("function", function);
+    if (!local.typeName.empty()) out += "," + json_str("type", local.typeName);
+
+    if (local.storage == DEBUG_STORAGE_REGISTER) {
+        const char* name = register_name(local.reg);
+        out += "," + json_num("register_index", local.reg);
+        if (name == NULL) {
+            // Borland's numbering past the eight word registers is not
+            // decoded here, so say so instead of naming the wrong register.
+            out += "," + json_str("note", "register number not decoded");
+            return out;
+        }
+        uint32_t value = 0;
+        register_value(local.reg, value);
+        out += "," + json_str("register", name) + "," + json_num("value", (long long)(int16_t)value);
+        return out;
+    }
+
+    const uint16_t ss = SegValue(SegNames::ss);
+    const uint32_t at = (uint32_t)GetAddress(ss, (uint32_t)(((int32_t)reg_bp + local.frameOffset) & 0xFFFF));
+    uint32_t length = local.valueSize != 0 ? local.valueSize : 2;
+    if (length > 4096) length = 4096;
+
+    std::vector<uint8_t> bytes;
+    bool complete = true;
+    const std::string hex = read_guest_hex(at, length, bytes, complete);
+
+    char frame[64];
+    snprintf(frame, sizeof(frame), "%04X:%04X", ss, (unsigned int)reg_bp);
+    out += "," + json_num("frame_offset", local.frameOffset) +
+           "," + json_hex("linear", at) +
+           "," + json_str("frame", frame) +
+           "," + json_num("length", length) +
+           "," + json_bool("readable", complete) +
+           "," + json_str("bytes", hex);
+
+    if (local.valueKind != DEBUG_VALUE_UNKNOWN && local.elementSize > 0) {
+        std::string values;
+        for (uint32_t k = 0; k + local.elementSize <= length; k += local.elementSize) {
+            const std::string one = decode_value(bytes, k, local.elementSize, local.valueKind);
+            if (one.empty()) break;
+            if (!values.empty()) values += ",";
+            values += one;
+        }
+        out += ",\"values\":[" + values + "]";
+    } else if (local.valueKind != DEBUG_VALUE_UNKNOWN) {
+        out += "," + json_raw("value", decode_value(bytes, 0, length, local.valueKind));
+    }
+    return out;
 }
 
 static bool name_contains(const std::string& name, const std::string& needle) {
@@ -2559,6 +2641,14 @@ static void process_command(const std::string& json) {
         }
         const DebugSymbol* symbol = DEBUG_Symbols().Resolve(name);
         if (symbol == NULL) {
+            // Not a global: a local or parameter of whatever is running.
+            const uint32_t pc = (uint32_t)GetAddress(SegValue(SegNames::cs), reg_eip);
+            DebugLocal local;
+            std::string function;
+            if (DEBUG_Symbols().ResolveLocal(pc, name, local, function)) {
+                send_ok(local_json(local, function));
+                return;
+            }
             send_error("Unknown symbol");
             return;
         }
@@ -2601,6 +2691,27 @@ static void process_command(const std::string& json) {
                    "," + json_raw("as_signed", decode_value(bytes, 0, length, DEBUG_VALUE_SIGNED));
         }
         send_ok(out);
+        return;
+    }
+
+    if (cmd == "locals") {
+        long long linear = 0;
+        const uint32_t pc = json_get_int(json, "linear", linear)
+            ? (uint32_t)linear
+            : (uint32_t)GetAddress(SegValue(SegNames::cs), reg_eip);
+
+        std::vector<DebugLocal> locals;
+        std::vector<std::string> functions;
+        DEBUG_Symbols().LocalsAt(pc, locals, functions);
+
+        std::string arr;
+        for (size_t i = 0; i < locals.size(); i++) {
+            if (!arr.empty()) arr += ",";
+            arr += "{" + local_json(locals[i], functions[i]) + "}";
+        }
+        send_ok(json_hex("linear", pc) + "," +
+                json_num("count", (long long)locals.size()) + "," +
+                "\"locals\":[" + arr + "]");
         return;
     }
 

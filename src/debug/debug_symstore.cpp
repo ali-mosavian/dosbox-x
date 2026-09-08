@@ -48,6 +48,7 @@ void DebugSymbolStore::Clear()
 {
 	symbols.clear();
 	lines.clear();
+	scopes.clear();
 }
 
 void DebugSymbolStore::ClearProgram(const std::string &program)
@@ -61,6 +62,21 @@ void DebugSymbolStore::ClearProgram(const std::string &program)
 	for (size_t i = 0;i < lines.size();i++)
 		if (lines[i].program != program) keptLines.push_back(lines[i]);
 	lines.swap(keptLines);
+
+	/* Scopes point at each other by index, so dropping some renumbers the
+	 * rest; the parents are rewritten rather than left dangling. */
+	std::vector<int32_t> mapping(scopes.size(),-1);
+	std::vector<DebugScopeEntry> keptScopes;
+	for (size_t i = 0;i < scopes.size();i++) {
+		if (scopes[i].program == program) continue;
+		mapping[i] = (int32_t)keptScopes.size();
+		keptScopes.push_back(scopes[i]);
+	}
+	for (size_t i = 0;i < keptScopes.size();i++) {
+		const int32_t parent = keptScopes[i].parent;
+		keptScopes[i].parent = parent >= 0 && (size_t)parent < mapping.size() ? mapping[parent] : -1;
+	}
+	scopes.swap(keptScopes);
 }
 
 void DebugSymbolStore::Add(const DebugSymbol &symbol)
@@ -74,6 +90,20 @@ void DebugSymbolStore::AddDebugInfo(const DebugInfo &info,const std::string &pro
 		DebugSymbol symbol = info.symbols[i];
 		symbol.program = program;
 		symbols.push_back(symbol);
+	}
+
+	const size_t scopeBase = scopes.size();
+	for (size_t i = 0;i < info.scopes.size();i++) {
+		DebugScopeEntry scope;
+		scope.begin = info.loadLinear + info.scopes[i].imageOffset;
+		scope.end = info.loadLinear + info.scopes[i].endOffset;
+		scope.parent = info.scopes[i].parent < 0
+			? -1
+			: (int32_t)(scopeBase + (size_t)info.scopes[i].parent);
+		scope.function = info.scopes[i].function;
+		scope.locals = info.scopes[i].locals;
+		scope.program = program;
+		scopes.push_back(scope);
 	}
 
 	/* Line ranges arrive load-relative; the store answers in linear
@@ -314,6 +344,52 @@ bool DebugSymbolStore::ResolveLocation(const std::string &spec,DebugLocation &ou
 	error = "Unknown location: " + text +
 		" (expected file:line, a symbol, symbol+offset, or an address)";
 	return false;
+}
+
+int32_t DebugSymbolStore::InnermostScope(uint32_t pcLinear) const
+{
+	int32_t best = -1;
+	for (size_t i = 0;i < scopes.size();i++) {
+		if (pcLinear < scopes[i].begin || pcLinear >= scopes[i].end) continue;
+		if (best < 0 || (scopes[i].end - scopes[i].begin) <
+		    (scopes[(size_t)best].end - scopes[(size_t)best].begin))
+			best = (int32_t)i;
+	}
+	return best;
+}
+
+bool DebugSymbolStore::ResolveLocal(uint32_t pcLinear,const std::string &name,DebugLocal &out,
+                                    std::string &function) const
+{
+	const std::string upper = SymUpper(name);
+
+	for (int32_t at = InnermostScope(pcLinear);at >= 0;at = scopes[(size_t)at].parent) {
+		const DebugScopeEntry &scope = scopes[(size_t)at];
+		for (size_t i = 0;i < scope.locals.size();i++) {
+			if (scope.locals[i].name != name && SymUpper(scope.locals[i].name) != upper) continue;
+			out = scope.locals[i];
+			function = scope.function;
+			return true;
+		}
+	}
+	return false;
+}
+
+void DebugSymbolStore::LocalsAt(uint32_t pcLinear,std::vector<DebugLocal> &out,
+                                std::vector<std::string> &functions) const
+{
+	for (int32_t at = InnermostScope(pcLinear);at >= 0;at = scopes[(size_t)at].parent) {
+		const DebugScopeEntry &scope = scopes[(size_t)at];
+		for (size_t i = 0;i < scope.locals.size();i++) {
+			bool shadowed = false;
+			for (size_t k = 0;k < out.size();k++)
+				if (out[k].name == scope.locals[i].name) shadowed = true;
+			if (shadowed) continue;
+
+			out.push_back(scope.locals[i]);
+			functions.push_back(scope.function);
+		}
+	}
 }
 
 std::string DebugSymbolStore::Describe(uint32_t linear) const
