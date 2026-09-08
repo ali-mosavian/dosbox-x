@@ -485,4 +485,248 @@ TEST_F(DebugSymFmtTest, ParseDebugInfoAppliesTheLoadBaseAndReportsModulesAndLine
 	EXPECT_EQ("no sstSegMap entry for segment(s) 0",info.warnings[0]);
 }
 
+
+/* ---- Borland TDINFO ---- */
+
+bool LoadTdInfo(const char *name,std::vector<uint8_t> &data,TdInfo &info)
+{
+	return LoadFixture(name,data) && DEBUG_ParseBorland(DebugBytes(data.data(),data.size()),info);
+}
+
+TEST_F(DebugSymFmtTest, BorlandFindsTdInfoAtTheMzImageEnd)
+{
+	std::vector<uint8_t> data;
+	TdInfo info;
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",data,info));
+
+	EXPECT_EQ(8512u,info.base);
+	EXPECT_EQ("TDINFO 3.16",info.version);
+	ASSERT_EQ(1u,info.modules.size());
+	EXPECT_EQ(1u,info.modules[0].index);
+	EXPECT_EQ("TDSPROBE",info.modules[0].name);
+	EXPECT_TRUE(info.warnings.empty());
+}
+
+TEST_F(DebugSymFmtTest, TdInfoSymbolsLandWhereTdsprobeMapPutsThem)
+{
+	/* The EXE and the MAP come from the same TLINK run, so a differing address
+	 * can only be this parser. */
+	std::vector<uint8_t> data;
+	TdInfo info;
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",data,info));
+
+	const std::map<std::string,uint32_t> publics = LoadMapPublics(Fixture("tdsprobe.map"));
+	size_t agree = 0;
+	size_t disagree = 0;
+	for (size_t i = 0;i < info.symbols.size();i++) {
+		const TdSymbol &symbol = info.symbols[i];
+		const std::map<std::string,uint32_t>::const_iterator found = publics.find(symbol.name);
+		if (found == publics.end()) continue;
+		if (((uint32_t)symbol.segment << 4) + (uint32_t)symbol.offset == found->second) agree++;
+		else disagree++;
+	}
+	EXPECT_EQ(0u,disagree);
+	EXPECT_EQ(46u,agree);
+}
+
+TEST_F(DebugSymFmtTest, TheSegmentTableIsReachedByStridingTheTablesBeforeIt)
+{
+	/* There is no directory: the segment table is found only by stepping over
+	 * the symbol, module, source-file, line-number and scope tables at their
+	 * own record sizes. A wrong stride decodes garbage here and nowhere else,
+	 * which is why the counts either side of it are pinned too. */
+	std::vector<uint8_t> data;
+	TdInfo info;
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",data,info));
+
+	EXPECT_EQ(113u,info.symbols.size());
+	EXPECT_EQ(17u,info.lineRecordCount);
+
+	ASSERT_EQ(1u,info.segments.size());
+	EXPECT_EQ(1u,info.segments[0].module);
+	EXPECT_EQ(419u,info.segments[0].codeSegment);
+	EXPECT_EQ(14u,info.segments[0].codeOffset);
+	EXPECT_EQ(112u,info.segments[0].codeLength);
+}
+
+TEST_F(DebugSymFmtTest, AnAutoSymbolsBpDisplacementIsSigned)
+{
+	/* Read unsigned, tdsprobe's local `t` comes back as 65534 instead of -2. */
+	std::vector<uint8_t> data;
+	TdInfo info;
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",data,info));
+
+	const TdSymbol *local = NULL;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (info.symbols[i].symbolClass == TD_SYM_AUTO && info.symbols[i].name == "t")
+			local = &info.symbols[i];
+	ASSERT_TRUE(local != NULL);
+	EXPECT_EQ(-2,local->offset);
+}
+
+TEST_F(DebugSymFmtTest, AStandaloneTdsParsesToTheBlockTdstripRemoved)
+{
+	std::vector<uint8_t> embeddedData,sidecarData;
+	TdInfo embedded,sidecar;
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.exe",embeddedData,embedded));
+	ASSERT_TRUE(LoadTdInfo("tdsprobe.tds",sidecarData,sidecar));
+
+	EXPECT_EQ(0u,sidecar.base);
+	ASSERT_EQ(embedded.symbols.size(),sidecar.symbols.size());
+	for (size_t i = 0;i < embedded.symbols.size();i++) {
+		EXPECT_EQ(embedded.symbols[i].name,sidecar.symbols[i].name);
+		EXPECT_EQ(embedded.symbols[i].segment,sidecar.symbols[i].segment);
+		EXPECT_EQ(embedded.symbols[i].offset,sidecar.symbols[i].offset);
+		EXPECT_EQ(embedded.symbols[i].symbolClass,sidecar.symbols[i].symbolClass);
+		EXPECT_EQ(embedded.symbols[i].type,sidecar.symbols[i].type);
+	}
+}
+
+TEST_F(DebugSymFmtTest, ParseDebugInfoReadsAStrippedExeThroughItsTdsSidecar)
+{
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("tdsprobe-stripped.exe").c_str(),0x1000,info));
+	EXPECT_EQ(DEBUG_FORMAT_TDINFO,info.format);
+
+	const DebugSymbol *symbol = NULL;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (info.symbols[i].name == "_main") { symbol = &info.symbols[i]; break; }
+	ASSERT_TRUE(symbol != NULL);
+	EXPECT_EQ(0x1000u + (0x1a3u << 4) + 0x44u,symbol->linear);
+}
+
+TEST_F(DebugSymFmtTest, ACodeViewExeIsNotMistakenForBorlandTdInfo)
+{
+	/* Both formats put their block at the end of the MZ image, so detection
+	 * has to be by magic and nothing else. */
+	std::vector<uint8_t> data;
+	ASSERT_TRUE(LoadFixture("qrender-cv.exe",data));
+
+	uint64_t base = 0;
+	TdInfo info;
+	EXPECT_FALSE(DEBUG_FindTdInfoBase(DebugBytes(data.data(),data.size()),base));
+	EXPECT_FALSE(DEBUG_ParseBorland(DebugBytes(data.data(),data.size()),info));
+}
+
+/* ---- Watcom ---- */
+
+void PutU16(std::vector<uint8_t> &out,size_t at,uint16_t value)
+{
+	out[at] = (uint8_t)(value & 0xff);
+	out[at+1] = (uint8_t)(value >> 8);
+}
+
+void PutU32(std::vector<uint8_t> &out,size_t at,uint32_t value)
+{
+	for (int i = 0;i < 4;i++) out[at+(size_t)i] = (uint8_t)((value >> (8*i)) & 0xff);
+}
+
+std::vector<uint8_t> WatcomModuleRecord(const std::string &name)
+{
+	std::vector<uint8_t> out(21 + name.size(),0);
+	out[20] = (uint8_t)name.size();
+	for (size_t i = 0;i < name.size();i++) out[21+i] = (uint8_t)name[i];
+	return out;
+}
+
+/*
+ * A hand-built block, not a fixture: there is no OpenWatcom toolchain in this
+ * tree to link a real one with. It pins this reader's own arithmetic -- the
+ * table order and the V2/V3 mod difference -- and claims nothing about what
+ * wlink actually writes.
+ */
+std::vector<uint8_t> WatcomBlock(bool v2)
+{
+	const std::string symbolName = "_main";
+	const std::vector<uint8_t> first = WatcomModuleRecord("startup.c");
+	std::vector<uint8_t> module = first;
+	const std::vector<uint8_t> second = WatcomModuleRecord("hello.c");
+	module.insert(module.end(),second.begin(),second.end());
+
+	std::vector<uint8_t> symbol((v2 ? 9u : 10u) + symbolName.size(),0);
+	PutU32(symbol,0,0x1234);
+	PutU16(symbol,4,0x0abc);
+	/* The second module: V2 names it by byte offset into the module area, V3
+	 * by index. Two modules is what tells the two readings apart -- with one,
+	 * offset and index are both 0 and any reading passes. */
+	PutU16(symbol,6,v2 ? (uint16_t)first.size() : (uint16_t)1);
+	if (v2) {
+		symbol[8] = (uint8_t)symbolName.size();
+	} else {
+		symbol[8] = 0x04;
+		symbol[9] = (uint8_t)symbolName.size();
+	}
+	for (size_t i = 0;i < symbolName.size();i++) symbol[(v2 ? 9u : 10u)+i] = (uint8_t)symbolName[i];
+
+	std::vector<uint8_t> section(18,0);
+	section.insert(section.end(),module.begin(),module.end());
+	section.insert(section.end(),symbol.begin(),symbol.end());
+	section.insert(section.end(),4,0);
+	PutU32(section,0,18);
+	PutU32(section,4,(uint32_t)(18 + module.size()));
+	PutU32(section,8,(uint32_t)(18 + module.size() + symbol.size()));
+	PutU32(section,12,(uint32_t)section.size());
+
+	std::vector<uint8_t> master(14,0);
+	PutU16(master,0,0x8386);
+	master[2] = v2 ? 2 : 3;
+	master[4] = 1;
+	PutU16(master,6,2);	/* lang_size */
+	PutU16(master,8,2);	/* segment_size */
+	PutU32(master,10,(uint32_t)(4 + section.size() + 14));
+
+	std::vector<uint8_t> block;
+	block.push_back('C');
+	block.push_back(0);
+	block.insert(block.end(),2,0);
+	block.insert(block.end(),section.begin(),section.end());
+	block.insert(block.end(),master.begin(),master.end());
+	return block;
+}
+
+void ExpectWatcomBlockReadsBack(bool v2)
+{
+	const std::vector<uint8_t> block = WatcomBlock(v2);
+	WatInfo info;
+	ASSERT_TRUE(DEBUG_ParseWatcom(DebugBytes(block.data(),block.size()),info));
+
+	EXPECT_EQ(v2 ? "WAT 2.0" : "WAT 3.0",info.version);
+	ASSERT_EQ(2u,info.modules.size());
+	EXPECT_EQ(0,info.modules[0].index);
+	EXPECT_EQ("startup.c",info.modules[0].name);
+	EXPECT_EQ(1,info.modules[1].index);
+	EXPECT_EQ("hello.c",info.modules[1].name);
+
+	ASSERT_EQ(1u,info.symbols.size());
+	EXPECT_EQ("_main",info.symbols[0].name);
+	EXPECT_EQ(0x1234u,info.symbols[0].offset);
+	EXPECT_EQ(0x0abcu,info.symbols[0].segment);
+	EXPECT_EQ(1,info.symbols[0].moduleIndex);
+	EXPECT_EQ(v2 ? 0 : 0x04,info.symbols[0].kind);
+}
+
+TEST_F(DebugSymFmtTest, WatcomV3GlobalsResolveTheirModule)
+{
+	ExpectWatcomBlockReadsBack(false);
+}
+
+TEST_F(DebugSymFmtTest, WatcomV2GlobalsResolveTheirModule)
+{
+	ExpectWatcomBlockReadsBack(true);
+}
+
+TEST_F(DebugSymFmtTest, ACodeViewExeIsNotMistakenForWatcomDebugInfo)
+{
+	/* Watcom's master header is the last 14 bytes; CodeView's trailer is the
+	 * last 8, so both readers look at overlapping bytes and only the signature
+	 * separates them. */
+	const char * const files[2] = {"qrender-cv.exe","cvprobe.exe"};
+	for (int i = 0;i < 2;i++) {
+		std::vector<uint8_t> data;
+		ASSERT_TRUE(LoadFixture(files[i],data));
+		WatInfo info;
+		EXPECT_FALSE(DEBUG_ParseWatcom(DebugBytes(data.data(),data.size()),info));
+	}
+}
+
 }

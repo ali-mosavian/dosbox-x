@@ -163,6 +163,116 @@ bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out);
 /* A run of [length:u16][kind:u16][data] records. Exposed for the tests. */
 std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to);
 
+/* ---- Borland TDINFO ---- */
+
+/*
+ * Borland TLink symbolic debug info as it rides in a 16-bit DOS MZ EXE.
+ *
+ * This is TDINFO, magic 0x52FB -- not the 32-bit "TDS" (FB09/FB0A) that C++
+ * Builder writes, which is a different format under a similar name. There is
+ * no trailer to search back from: the block starts exactly where the MZ header
+ * says the load image ends, and the name pool sits at the very end of the file
+ * rather than with the tables it serves.
+ *
+ * Layouts from ramikg/tdinfo-parser's tdinfo_structs.py, the only complete
+ * open-source description of the 16-bit form. Its source-file and line-number
+ * records are skipped as padding there, so their fields are unknown and this
+ * reader carries no line numbers -- see lineRecordCount, which reports how many
+ * are present but unread.
+ */
+
+enum TdSymbolClass {
+	TD_SYM_STATIC,
+	TD_SYM_ABSOLUTE,
+	TD_SYM_AUTO,
+	TD_SYM_PASCAL_VAR,
+	TD_SYM_REGISTER,
+	TD_SYM_CONSTANT,
+	TD_SYM_TYPEDEF,
+	TD_SYM_STRUCT_UNION_ENUM
+};
+
+struct TdSymbol {
+	std::string name;
+	uint16_t segment = 0;
+	/* Signed: an AUTO symbol's offset is a BP-relative displacement, not an
+	 * address, and read unsigned it reports 65488 where -48 belongs. */
+	int32_t offset = 0;
+	TdSymbolClass symbolClass = TD_SYM_STATIC;
+	uint16_t type = 0;
+};
+
+struct TdModule {
+	uint16_t index = 0;
+	std::string name;
+};
+
+struct TdSegment {
+	uint16_t module = 0;
+	uint16_t codeSegment = 0;
+	uint16_t codeOffset = 0;
+	uint16_t codeLength = 0;
+};
+
+struct TdInfo {
+	std::string version;		/* e.g. "TDINFO 3.16" */
+	uint64_t base = 0;
+	std::vector<TdSymbol> symbols;
+	std::vector<TdModule> modules;
+	std::vector<TdSegment> segments;
+	/* Present in the file but not decoded; their layout is unknown. */
+	uint16_t lineRecordCount = 0;
+	std::vector<std::string> warnings;
+};
+
+/* Where the block starts: the MZ image end, or offset 0.
+ *
+ * TDSTRIP writes the block out byte-identical to what it removed, so a
+ * standalone .TDS is the same bytes with no MZ header in front -- measured on
+ * tdsprobe.tds, which matches tdsprobe.exe's appended 2545 bytes exactly. */
+bool DEBUG_FindTdInfoBase(const DebugBytes &data,uint64_t &base);
+bool DEBUG_ParseBorland(const DebugBytes &data,TdInfo &out);
+
+/* ---- Watcom ---- */
+
+/*
+ * Watcom ("WAT") debug info, as wlink appends it to a DOS EXE.
+ *
+ * Found from the END of the file, not from the MZ image end: the master header
+ * is the last 14 bytes, and other Watcom trailers (FOX/resource) may be stacked
+ * on top of it, each skipped by its own size. The MZ header's declared length
+ * deliberately excludes the block.
+ *
+ * Layouts from OpenWatcom's bld/watcom/h/wdbginfo.h and bld/dip/watcom/c/
+ * watldsym.c/watgbl.c. UNVERIFIED against a real Watcom binary -- there is no
+ * OpenWatcom toolchain in this tree to produce one -- so this reads the format
+ * as documented and reports what it finds rather than being proven against
+ * known addresses the way the CodeView reader is.
+ */
+
+struct WatSymbol {
+	std::string name;
+	uint16_t segment = 0;
+	uint32_t offset = 0;
+	int32_t moduleIndex = -1;
+	uint8_t kind = 0;
+};
+
+struct WatModule {
+	int32_t index = 0;
+	std::string name;
+};
+
+struct WatInfo {
+	std::string version;		/* e.g. "WAT 3.0" */
+	uint64_t base = 0;
+	std::vector<WatSymbol> symbols;
+	std::vector<WatModule> modules;
+	std::vector<std::string> warnings;
+};
+
+bool DEBUG_ParseWatcom(const DebugBytes &data,WatInfo &out);
+
 /* ---- format-independent layer ---- */
 
 enum DebugFormatId {
@@ -221,7 +331,8 @@ struct DebugInfo {
 std::map<uint16_t,uint32_t> DEBUG_CvSegmentBases(const CvInfo &info);
 
 /* Detection is by signature; the toolchain that produced the file is never
- * used to guess. TDINFO and Watcom are not ported yet. */
+ * used to guess. A stripped Borland EXE is read through its .TDS sidecar, so
+ * the path matters and not only the bytes. */
 bool DEBUG_ParseDebugInfo(const char *file,uint32_t loadLinear,DebugInfo &out);
 bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out);
 

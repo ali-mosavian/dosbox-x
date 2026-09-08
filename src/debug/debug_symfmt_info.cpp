@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <set>
+#include <string>
 
 static std::string SegKey(uint16_t moduleIndex,uint16_t segment)
 {
@@ -101,6 +102,69 @@ static void CodeViewLines(const CvInfo &info,DebugInfo &out)
 	}
 }
 
+static void BorlandSymbols(const TdInfo &info,uint32_t loadLinear,DebugInfo &out)
+{
+	/* A TDINFO segment is already a load-relative paragraph, unlike CodeView's
+	 * logical index, so there is no segment map to go through. A symbol record
+	 * carries no module index either -- modules are reached the other way,
+	 * from the segment table -- so these are not module-qualified. */
+	for (size_t i = 0;i < info.symbols.size();i++) {
+		const TdSymbol &symbol = info.symbols[i];
+		if (symbol.symbolClass != TD_SYM_STATIC && symbol.symbolClass != TD_SYM_ABSOLUTE) continue;
+
+		DebugSymbol out_symbol;
+		out_symbol.name = symbol.name;
+		out_symbol.offset = (uint32_t)symbol.offset;
+		out_symbol.segment = symbol.segment;
+		out_symbol.segmentBase = (uint32_t)symbol.segment << 4u;
+		out_symbol.linear = loadLinear + out_symbol.segmentBase + out_symbol.offset;
+		out_symbol.source = DEBUG_FORMAT_TDINFO;
+		out.symbols.push_back(out_symbol);
+	}
+}
+
+static void WatcomSymbols(const WatInfo &info,uint32_t loadLinear,DebugInfo &out)
+{
+	std::map<int32_t,std::string> moduleNames;
+	for (size_t i = 0;i < info.modules.size();i++)
+		moduleNames[info.modules[i].index] = info.modules[i].name;
+
+	for (size_t i = 0;i < info.symbols.size();i++) {
+		const WatSymbol &symbol = info.symbols[i];
+
+		DebugSymbol out_symbol;
+		out_symbol.name = symbol.name;
+		out_symbol.offset = symbol.offset;
+		out_symbol.segment = symbol.segment;
+		out_symbol.segmentBase = (uint32_t)symbol.segment << 4u;
+		out_symbol.linear = loadLinear + out_symbol.segmentBase + symbol.offset;
+		out_symbol.source = DEBUG_FORMAT_WATCOM;
+
+		const std::map<int32_t,std::string>::const_iterator found = moduleNames.find(symbol.moduleIndex);
+		if (found != moduleNames.end()) out_symbol.module = found->second;
+		out.symbols.push_back(out_symbol);
+	}
+}
+
+/* TDSTRIP moves the block into a .TDS beside the stripped EXE. */
+static bool ParseBorlandSidecar(const char *file,std::vector<uint8_t> &data,TdInfo &out)
+{
+	if (file == NULL) return false;
+
+	const std::string path = file;
+	const size_t dot = path.find_last_of('.');
+	if (dot == std::string::npos) return false;
+	if (path.find_first_of("/\\",dot) != std::string::npos) return false;
+
+	const char * const extensions[2] = {".tds",".TDS"};
+	for (int i = 0;i < 2;i++) {
+		const std::string candidate = path.substr(0,dot) + extensions[i];
+		if (candidate == path || !DEBUG_ReadHostFile(candidate.c_str(),data)) continue;
+		if (DEBUG_ParseBorland(DebugBytes(data.data(),data.size()),out)) return true;
+	}
+	return false;
+}
+
 std::map<uint16_t,uint32_t> DEBUG_CvSegmentBases(const CvInfo &info)
 {
 	std::map<uint16_t,uint32_t> bases;
@@ -131,6 +195,15 @@ std::string DEBUG_Hex(uint32_t value)
 
 std::string DEBUG_SymbolExplanation(const DebugInfo &info,const DebugSymbol &symbol)
 {
+	/* A CodeView segment index says nothing on its own, so its base is spelled
+	 * out; a TDINFO or Watcom segment is already the paragraph it loads at. */
+	if (symbol.source != DEBUG_FORMAT_CODEVIEW) {
+		char seg[24];
+		snprintf(seg,sizeof(seg),"0x%04X",(unsigned int)symbol.segment);
+		return symbol.name + " = loadLinear " + DEBUG_Hex(info.loadLinear) +
+		       " + " + seg + ":" + DEBUG_Hex(symbol.offset) + " (" + info.file + ")";
+	}
+
 	char seg[16];
 	snprintf(seg,sizeof(seg),"%u",(unsigned int)symbol.segment);
 	return symbol.name + " = loadLinear " + DEBUG_Hex(info.loadLinear) +
@@ -140,13 +213,51 @@ std::string DEBUG_SymbolExplanation(const DebugInfo &info,const DebugSymbol &sym
 
 bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out)
 {
+	out.file = file != NULL ? file : "";
+	out.loadLinear = loadLinear;
+
+	TdInfo td;
+	std::vector<uint8_t> sidecar;
+	if (DEBUG_ParseBorland(data,td) || ParseBorlandSidecar(file,sidecar,td)) {
+		out.format = DEBUG_FORMAT_TDINFO;
+		out.version = td.version;
+		out.warnings = td.warnings;
+		if (td.lineRecordCount != 0) {
+			char buf[96];
+			snprintf(buf,sizeof(buf),"%u TDINFO line records present but their layout is unknown",
+			         (unsigned int)td.lineRecordCount);
+			out.warnings.push_back(buf);
+		}
+		for (size_t i = 0;i < td.modules.size();i++) {
+			DebugModule module;
+			module.name = td.modules[i].name;
+			module.index = td.modules[i].index;
+			out.modules.push_back(module);
+		}
+		BorlandSymbols(td,loadLinear,out);
+		return true;
+	}
+
+	WatInfo wat;
+	if (DEBUG_ParseWatcom(data,wat)) {
+		out.format = DEBUG_FORMAT_WATCOM;
+		out.version = wat.version;
+		out.warnings = wat.warnings;
+		for (size_t i = 0;i < wat.modules.size();i++) {
+			DebugModule module;
+			module.name = wat.modules[i].name;
+			module.index = (uint16_t)wat.modules[i].index;
+			out.modules.push_back(module);
+		}
+		WatcomSymbols(wat,loadLinear,out);
+		return true;
+	}
+
 	CvInfo cv;
 	if (!DEBUG_ParseCodeView(data,cv)) return false;
 
-	out.file = file != NULL ? file : "";
 	out.format = DEBUG_FORMAT_CODEVIEW;
 	out.version = cv.signature;
-	out.loadLinear = loadLinear;
 	out.warnings = cv.warnings;
 
 	for (size_t i = 0;i < cv.modules.size();i++) {
