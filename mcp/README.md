@@ -54,12 +54,27 @@ programs on image or zip drives work like any other.
 
 | format | how it is found | what comes out |
 |---|---|---|
-| Microsoft CodeView `NB05`-`NB11` | `NBxx` trailer at EOF, or the MZ image end | publics, module data, procedures, labels, object-module names, source line numbers |
+| Microsoft CodeView `NB05`-`NB11` | `NBxx` trailer at EOF, or the MZ image end | publics, module data, procedures, labels, object-module names, source line numbers, types |
 | Microsoft CodeView `NB00`-`NB02` | as above | the subsection directory only; the pre-CV4 record layouts are unread |
-| Borland TDINFO (`0x52FB`) | MZ image end, or a `.TDS` beside the program; the format has no trailer | globals, module names. Line records are counted, not decoded -- their layout is not published |
+| Borland TDINFO (`0x52FB`) | MZ image end, or a `.TDS` beside the program; the format has no trailer | globals, module names, source files, line records, types, and scopes with their locals and parameters |
 | Watcom (`0x8386`) | master header in the last 14 bytes | globals, module names |
 | LINK `.MAP` | beside the program, only when it carries none of the above | publics |
 
 `dosbox_debuginfo {op:"status"}` says what the emulator found; `op:"modules"` lists the
 object modules; `op:"lines"` maps an address to file:line; `op:"load"` has the emulator
 read another host file, an EXE or a `.MAP`.
+
+## Lines, Locations And Variables
+
+`dosbox_bp_set` takes a gdb-style `location` instead of an address: `udtbas.bas:29`,
+`pr_add`, `pr_add+0x10`, `*0x82F4`. A line with no code of its own moves to the next
+line that has some.
+
+`dosbox_var` reads a variable by name -- a global, or a local or parameter of whatever
+is running at CS:EIP, out of the frame or the register it lives in. `dosbox_locals`
+lists every one in scope, innermost first.
+
+A value comes back decoded when the debug info gave it a type: a structure field by
+field, an array element by element. A BASIC array's symbol addresses a runtime
+descriptor rather than the elements, so it is followed through to them; the element
+width the type table declares is the guard against following what is not a descriptor.
