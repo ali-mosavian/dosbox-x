@@ -54,6 +54,15 @@ extern bool ctrlbrk, gbk, rtl, dbcs_sbcs;
 extern bool DOS_BreakFlag, DOS_BreakConioFlag;
 extern uint16_t cmd_line_seg;
 extern char char_yes, char_no; // YES NO CHARS in lower case
+static std::string debug_socket_pending_shell_command;
+static std::string debug_socket_last_consumed_shell_command;
+static std::string debug_socket_last_submitted_shell_command;
+static uint64_t debug_socket_shell_commands_queued = 0;
+static uint64_t debug_socket_shell_commands_woken = 0;
+static uint64_t debug_socket_shell_commands_consumed = 0;
+static uint64_t debug_socket_shell_commands_submitted = 0;
+static bool debug_socket_consumed_shell_command_submitted = true;
+static bool debug_socket_shell_command_executing = false;
 
 uint8_t prompt_col; // Column position after prompt is displayed
 void WriteChar(uint16_t col, uint16_t row, uint8_t page, uint16_t chr, uint8_t attr, bool useattr);
@@ -456,6 +465,79 @@ extern bool isDBCSCP();
 void ReadCharAttr(uint16_t col, uint16_t row, uint8_t page, uint16_t* result);
 bool read_lead_byte = false;
 uint8_t temp_lead_byte;
+
+bool DOS_Shell_QueueCommandFromDebugger(const char* command) {
+	if (!debug_socket_pending_shell_command.empty()) return false;
+	debug_socket_pending_shell_command = command ? command : "";
+	if (debug_socket_pending_shell_command.empty()) return false;
+	debug_socket_shell_commands_queued++;
+	return true;
+}
+
+bool DOS_Shell_HasQueuedCommandFromDebugger(void) {
+	return !debug_socket_pending_shell_command.empty();
+}
+
+void DOS_Shell_RecordDebuggerCommandWake(void) {
+	debug_socket_shell_commands_woken++;
+}
+
+uint64_t DOS_Shell_DebuggerCommandsQueued(void) {
+	return debug_socket_shell_commands_queued;
+}
+
+uint64_t DOS_Shell_DebuggerCommandsWoken(void) {
+	return debug_socket_shell_commands_woken;
+}
+
+uint64_t DOS_Shell_DebuggerCommandsConsumed(void) {
+	return debug_socket_shell_commands_consumed;
+}
+
+uint64_t DOS_Shell_DebuggerCommandsSubmitted(void) {
+	return debug_socket_shell_commands_submitted;
+}
+
+const char* DOS_Shell_DebuggerLastConsumedCommand(void) {
+	return debug_socket_last_consumed_shell_command.c_str();
+}
+
+const char* DOS_Shell_DebuggerLastSubmittedCommand(void) {
+	return debug_socket_last_submitted_shell_command.c_str();
+}
+
+bool DOS_Shell_RecordDebuggerCommandSubmitted(const char* command) {
+	if (debug_socket_consumed_shell_command_submitted) return false;
+	if (debug_socket_last_consumed_shell_command != (command ? command : "")) return false;
+	debug_socket_last_submitted_shell_command = debug_socket_last_consumed_shell_command;
+	debug_socket_consumed_shell_command_submitted = true;
+	debug_socket_shell_command_executing = true;
+	debug_socket_shell_commands_submitted++;
+	return true;
+}
+
+bool DOS_Shell_IsDebuggerCommandExecuting(void) {
+	return debug_socket_shell_command_executing;
+}
+
+void DOS_Shell_FinishDebuggerCommandSubmitted(void) {
+	debug_socket_shell_command_executing = false;
+}
+
+static bool take_debugger_queued_command(char* line, size_t line_size, uint16_t* command_len) {
+	if (debug_socket_pending_shell_command.empty()) return false;
+	if (line_size == 0) return false;
+
+	strncpy(line, debug_socket_pending_shell_command.c_str(), line_size - 1);
+	line[line_size - 1] = '\0';
+	if (command_len) *command_len = (uint16_t)strlen(line);
+	debug_socket_last_consumed_shell_command = line;
+	debug_socket_consumed_shell_command_submitted = false;
+	debug_socket_pending_shell_command.clear();
+	debug_socket_shell_commands_consumed++;
+	return true;
+}
+
 /* NTS: buffer pointed to by "line" must be at least CMD_MAXLINE+1 large */
 void DOS_Shell::InputCommand(char * line) {
 	Bitu size=CMD_MAXLINE-2; //lastcharacter+0
@@ -494,13 +576,23 @@ void DOS_Shell::InputCommand(char * line) {
 	line[0] = '\0';
 
 	std::list<std::string>::iterator it_history = l_history.begin(), it_completion = l_completion.begin();
+	const auto take_queued_command_as_line = [&]() {
+		if (!take_debugger_queued_command(line, CMD_MAXLINE, &str_len)) return false;
+		str_index = str_len;
+		size = 0;
+		return true;
+	};
+
+	take_queued_command_as_line();
 
 	while (size) {
+		if (take_queued_command_as_line()) break;
 		dos.echo=false;
 		if (!DOS_ReadFile(input_handle,&c,&n)) {
             LOG(LOG_MISC,LOG_ERROR)("SHELL: Lost the input handle, dropping shell input loop");
             n = 0;
         }
+		if (take_queued_command_as_line()) break;
 		if (!n) {
             input_eof = true;
 			size=0;			//Kill the while loop

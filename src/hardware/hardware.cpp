@@ -72,6 +72,7 @@ extern "C" {
 bool video_debug_overlay = false;
 bool skip_encoding_unchanged_frames = false, show_recorded_filename = true;
 std::string pathvid = "", pathwav = "", pathmtw = "", pathmid = "", pathopl = "", pathscr = "", pathprt = "", pathpcap = "";
+std::string capture_screenshot_override_path = "";
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
 
 FILE* pcap_fp = NULL;
@@ -575,7 +576,20 @@ FILE * OpenCaptureFile(const char * type,const char * ext) {
     if (!strcmp(type, "Raw Midi")) pathmid = "";
     if (!strcmp(type, "Raw Opl")) pathopl = "";
     if (!strcmp(type, "Screenshot")) pathscr = "";
+    if (!strcmp(type, "Raw Screenshot")) pathscr = "";
     if (!strcmp(type, "Parallel Port Stream")) pathprt = "";
+    if ((!strcmp(type, "Screenshot") || !strcmp(type, "Raw Screenshot")) && !capture_screenshot_override_path.empty()) {
+        const std::string file_name = capture_screenshot_override_path;
+        capture_screenshot_override_path.clear();
+        FILE * handle=fopen(file_name.c_str(),"wb");
+        if (handle) {
+            LOG_MSG("Capturing %s to %s",type,file_name.c_str());
+            pathscr = file_name;
+        } else {
+            LOG_MSG("Failed to open %s for capturing %s",file_name.c_str(),type);
+        }
+        return handle;
+    }
 	if(capturedir.empty()) {
 		LOG_MSG("Please specify a capture directory");
 		return nullptr;

@@ -436,6 +436,12 @@ static INLINE PhysPt64 PAGING_GetPhysicalAddress64(const LinearPt linAddr) {
 	return ((PhysPt64)(paging.tlb.phys_page[linAddr>>12]&PHYSPAGE_ADDR)<<(PhysPt64)12)|(linAddr&0xfff);
 }
 
+// Reverse checkpoint hook used by the normal core's inline write helpers.
+#if C_DEBUG
+extern uint32_t debug_reverse_trace_active;
+void DEBUG_RecordReverseWrite(uint32_t address, uint32_t size, uint32_t val);
+#endif
+
 /* Special inlined memory reading/writing */
 
 static INLINE uint8_t mem_readb_inline(const LinearPt address) {
@@ -461,12 +467,18 @@ static INLINE uint32_t mem_readd_inline(const LinearPt address) {
 }
 
 static INLINE void mem_writeb_inline(const LinearPt address,const uint8_t val) {
+#if C_DEBUG
+	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,1,(uint32_t)val);
+#endif
 	const HostPt tlb_addr=get_tlb_write(address);
 	if (tlb_addr) host_writeb(tlb_addr+address,val);
 	else (get_tlb_writehandler(address))->writeb(address,val);
 }
 
 static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val) {
+#if C_DEBUG
+	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,2,(uint32_t)val);
+#endif
 	if ((address & 0xfffu)<0xfffu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) host_writew(tlb_addr+address,val);
@@ -475,6 +487,9 @@ static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val) 
 }
 
 static INLINE void mem_writed_inline(const LinearPt address,const uint32_t val) {
+#if C_DEBUG
+	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,4,(uint32_t)val);
+#endif
 	if ((address & 0xfffu)<0xffdu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) host_writed(tlb_addr+address,val);
@@ -511,7 +526,19 @@ static INLINE bool mem_readd_checked(const LinearPt address, uint32_t * const va
 	} else return mem_unalignedreadd_checked(address, val);
 }
 
+// Debug write hooks (defined in debug_socket.cpp; zero cost when disabled)
+#if C_DEBUG
+extern uint32_t debug_watchpoint_count;
+extern uint32_t debug_reverse_trace_active;
+void DEBUG_CheckWriteWatch(uint32_t address, uint32_t size, uint32_t val);
+void DEBUG_RecordReverseWrite(uint32_t address, uint32_t size, uint32_t val);
+#endif
+
 static INLINE bool mem_writeb_checked(const LinearPt address,const uint8_t val) {
+#if C_DEBUG
+	if (debug_watchpoint_count) DEBUG_CheckWriteWatch((uint32_t)address,1,(uint32_t)val);
+	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,1,(uint32_t)val);
+#endif
 	const HostPt tlb_addr=get_tlb_write(address);
 	if (tlb_addr) {
 		host_writeb(tlb_addr+address,val);
@@ -520,6 +547,10 @@ static INLINE bool mem_writeb_checked(const LinearPt address,const uint8_t val) 
 }
 
 static INLINE bool mem_writew_checked(const LinearPt address,const uint16_t val) {
+#if C_DEBUG
+	if (debug_watchpoint_count) DEBUG_CheckWriteWatch((uint32_t)address,2,(uint32_t)val);
+	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,2,(uint32_t)val);
+#endif
 	if ((address & 0xfffu)<0xfffu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) {
@@ -530,6 +561,10 @@ static INLINE bool mem_writew_checked(const LinearPt address,const uint16_t val)
 }
 
 static INLINE bool mem_writed_checked(const LinearPt address,const uint32_t val) {
+#if C_DEBUG
+	if (debug_watchpoint_count) DEBUG_CheckWriteWatch((uint32_t)address,4,(uint32_t)val);
+	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,4,(uint32_t)val);
+#endif
 	if ((address & 0xfffu)<0xffdu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) {

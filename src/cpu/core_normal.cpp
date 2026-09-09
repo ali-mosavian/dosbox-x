@@ -45,13 +45,27 @@ extern bool ignore_opcode_63;
 #include "debug.h"
 #endif
 
+#if C_DEBUG
+extern uint32_t debug_reverse_trace_active;
+extern void DEBUG_RecordReverseWrite(uint32_t address, uint32_t size, uint32_t val);
+extern bool DEBUG_Socket_TraceIsEnabled(void);
+extern void DEBUG_Socket_TraceRecordBranch(uint32_t, uint32_t, uint32_t, uint32_t);
+#define DEBUG_REVERSE_WRITE(off,size,val) \
+	do { if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)(off),(uint32_t)(size),(uint32_t)(val)); } while (0)
+#define DEBUG_TRACE_BRANCH(from_cs,from_linear,to_cs,to_linear) \
+	do { if (DEBUG_Socket_TraceIsEnabled()) DEBUG_Socket_TraceRecordBranch((uint32_t)(from_cs),(uint32_t)(from_linear),(uint32_t)(to_cs),(uint32_t)(to_linear)); } while (0)
+#else
+#define DEBUG_REVERSE_WRITE(off,size,val) do { } while (0)
+#define DEBUG_TRACE_BRANCH(from_cs,from_linear,to_cs,to_linear) do { } while (0)
+#endif
+
 #define LoadMb(off) mem_readb_inline(off)
 #define LoadMw(off) mem_readw_inline(off)
 #define LoadMd(off) mem_readd_inline(off)
 #define LoadMq(off) (((uint64_t)mem_readd_inline(off+4)<<(uint64_t)32) | (uint64_t)mem_readd_inline(off))
-#define SaveMb(off,val)	mem_writeb_inline(off,val)
-#define SaveMw(off,val)	mem_writew_inline(off,val)
-#define SaveMd(off,val)	mem_writed_inline(off,val)
+#define SaveMb(off,val)	{ DEBUG_REVERSE_WRITE(off,1,val); mem_writeb_inline(off,val); }
+#define SaveMw(off,val)	{ DEBUG_REVERSE_WRITE(off,2,val); mem_writew_inline(off,val); }
+#define SaveMd(off,val)	{ DEBUG_REVERSE_WRITE(off,4,val); mem_writed_inline(off,val); }
 #define SaveMq(off,val) {mem_writed_inline(off,((uint32_t)(val))&0xffffffff);mem_writed_inline(off+4,(((uint64_t)(val))>>((uint64_t)32))&0xffffffff);}
 
 Bitu cycle_count;
@@ -177,6 +191,37 @@ Bits CPU_Core_Normal_Run(void) {
 		extern bool DEBUG_Socket_CheckLinearExecBreakpoint(uint16_t seg, uint32_t off);
 		extern bool DEBUG_Socket_CheckNormalBreakpoint(uint16_t seg, uint32_t off);
 		extern void DEBUG_Socket_FreezeWait(void);
+		extern bool DEBUG_Socket_CheckWatchpointFreeze(void);
+		extern bool DEBUG_Socket_TraceIsEnabled(void);
+		extern void DEBUG_Socket_TraceRecordBranch(uint32_t, uint32_t, uint32_t, uint32_t);
+		extern void DEBUG_Socket_ReverseInstructionCheckpoint(void);
+		extern uint32_t debug_socket_normal_core_hooks_active;
+		debug_socket_normal_core_hooks_active = 1;
+		// Branch trace: record non-sequential transfers between instructions.
+		// prev_cseip tracks the linear address at the start of the previous iteration.
+		// A difference > 15 bytes means a branch/call/ret/int occurred.
+		{
+			static uint32_t prev_cseip = 0;
+			static uint32_t prev_cs_val = 0;
+			static bool     prev_valid  = false;
+			uint32_t cur_cseip  = (uint32_t)core.cseip;
+			uint32_t cur_cs_val = SegValue(cs);
+			if (DEBUG_Socket_TraceIsEnabled() && prev_valid) {
+				if ((uint32_t)(cur_cseip - prev_cseip) > 15u) {
+					DEBUG_Socket_TraceRecordBranch(prev_cs_val, prev_cseip,
+					                               cur_cs_val,  cur_cseip);
+				}
+			}
+			prev_cseip  = cur_cseip;
+			prev_cs_val = cur_cs_val;
+			prev_valid  = true;
+		}
+		// Watchpoint pending: fired during previous instruction's memory write.
+		if (DEBUG_Socket_CheckWatchpointFreeze()) {
+			FillFlags();
+			DEBUG_Socket_FreezeWait();
+			continue;
+		}
 		// Step-arm: decrements each iteration; re-freezes when it reaches zero
 		// (exactly one instruction has been executed since the step was issued).
 		if (DEBUG_Socket_DecrStepArm()) {
@@ -198,6 +243,7 @@ Bits CPU_Core_Normal_Run(void) {
 			DEBUG_Socket_FreezeWait();
 			continue;
 		}
+		DEBUG_Socket_ReverseInstructionCheckpoint();
 #if C_HEAVY_DEBUG
 		if (DEBUG_HeavyIsBreakpoint()) {
 			FillFlags();

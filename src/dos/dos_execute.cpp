@@ -28,6 +28,7 @@
 #include "callback.h"
 #include "debug.h"
 #if C_DEBUG
+#include "debug/debug_socket.h"
 #include "debug/debug_symbols.h"
 #endif
 #include "cpu.h"
@@ -112,6 +113,12 @@ void DOS_UpdatePSPName(void) {
 }
 
 void DOS_Terminate(uint16_t pspseg,bool tsr,uint8_t exitcode) {
+#if C_DEBUG
+	{
+		extern void DEBUG_Socket_NotifyProcessExit(uint16_t, uint8_t, bool);
+		DEBUG_Socket_NotifyProcessExit(pspseg, exitcode, tsr);
+	}
+#endif
 
 	dos.return_code=exitcode;
 	dos.return_mode=tsr?(uint8_t)RETURN_TSR:(uint8_t)RETURN_EXIT;
@@ -306,6 +313,7 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint16_t flags) {
 	DOS_ParamBlock block(block_pt);
 	uint32_t checksum = 0;
 	uint32_t checksum_bytes = 0;
+	uint32_t image_size_bytes = 0;
 
 	/* OVERLAY: if the resident image extends past this point, fail. */
 	/*          This is only meaningful for the internal DOSEXEC_DEVICEDRIVER flag.
@@ -492,9 +500,11 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint16_t flags) {
 		DOS_ReadFile(fhandle,loadbuf,&readsize);
 		checksum = crc32(checksum, loadbuf, readsize);
 		checksum_bytes += readsize;
+		image_size_bytes = readsize;
 		MEM_BlockWrite(loadaddress,loadbuf,readsize);
 	} else {	/* EXE Load in 32kb blocks and then relocate */
 		if (imagesize > (unsigned int)(memsize*0x10)) E_Exit("DOS:Not enough memory for EXE image");
+		image_size_bytes = memimagesize;
 		pos=headersize;DOS_SeekFile(fhandle,&pos,DOS_SEEK_SET);	
 		while (imagesize>0x7FFF) {
 			readsize=0x8000;DOS_ReadFile(fhandle,loadbuf,&readsize);
@@ -863,6 +873,30 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint16_t flags) {
 	}
 
 #if C_DEBUG
+	DEBUG_Socket_RecordLoadInfo(name,
+	                            iscom,
+	                            pspseg,
+	                            loadseg,
+	                            RealSeg(csip),
+	                            RealOff(csip),
+	                            RealSeg(sssp),
+	                            RealOff(sssp),
+	                            image_size_bytes,
+	                            iscom ? 0 : head.signature,
+	                            iscom ? 0 : head.extrabytes,
+	                            iscom ? 0 : head.pages,
+	                            iscom ? 0 : head.headersize,
+	                            iscom ? 0 : head.relocations,
+	                            iscom ? 0 : head.reloctable,
+	                            iscom ? 0 : head.initCS,
+	                            iscom ? 0 : head.initIP,
+	                            iscom ? 0 : head.initSS,
+	                            iscom ? 0 : head.initSP,
+	                            iscom ? 0 : head.checksum,
+	                            iscom ? 0 : head.overlay,
+	                            iscom ? 0 : head.minmemory,
+	                            iscom ? 0 : head.maxmemory);
+
 	DEBUG_SymbolsOnProgramLoad(name,iscom,loadseg);
 #endif
 

@@ -35,6 +35,8 @@ extern bool DOS_BreakFlag;
 extern bool INT28_AllowOnce;
 extern bool DOS_BreakConioFlag;
 extern unsigned char pc98_function_row_mode;
+extern bool DOS_Shell_HasQueuedCommandFromDebugger(void);
+extern void DOS_Shell_RecordDebuggerCommandWake(void);
 
 Bitu INT10_Handler(void);
 Bitu INT16_Handler_Wrap(void);
@@ -853,6 +855,14 @@ bool device_CON::Read(uint8_t * data,uint16_t * size) {
             continue;
         }
 
+        if (DOS_Shell_HasQueuedCommandFromDebugger()) {
+            data[count++] = 0x0D;
+            *size = count;
+            reg_ax = oldax;
+            DOS_Shell_RecordDebuggerCommandWake();
+            return true;
+        }
+
         const uint8_t int16_poll_function=(IS_EGAVGA_ARCH)?0x11:0x1;
         const uint8_t int16_read_function=(IS_EGAVGA_ARCH)?0x10:0x0;
 
@@ -862,6 +872,14 @@ bool device_CON::Read(uint8_t * data,uint16_t * size) {
             // is no input (ZF=0) then call INT 28h to release the rest of our
             // timeslice to host system.
             while (true) {
+                if (DOS_Shell_HasQueuedCommandFromDebugger()) {
+                    data[count++] = 0x0D;
+                    *size = count;
+                    reg_ax = oldax;
+                    DOS_Shell_RecordDebuggerCommandWake();
+                    return true;
+                }
+
                 reg_ah=int16_poll_function;
                 if (IS_PC98_ARCH)
                     INT16_Handler_Wrap();

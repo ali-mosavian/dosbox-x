@@ -592,6 +592,7 @@ public:
 	static void				ActivateBreakpointsExceptAt(PhysPt adr);
 	static bool				CheckBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				CheckIntBreakpoint	(PhysPt adr, uint8_t intNr, uint16_t ahValue, uint16_t alValue);
+	static bool				HasIntBreakpoint	(uint8_t intNr);
 	static CBreakpoint*		FindPhysBreakpoint	(uint16_t seg, uint32_t off, bool once);
 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
@@ -834,6 +835,23 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 	return false;
 }
 
+bool CBreakpoint::HasIntBreakpoint(uint8_t intNr)
+{
+	if (BPoints.empty()) return false;
+
+	for (CBreakpoint* bp : BPoints) {
+		if (bp->GetType() == BKPNT_INTERRUPT &&
+		    bp->GetIntNr() == intNr)
+			return true;
+	}
+	return false;
+}
+
+bool DEBUG_HasIntBreakpoint(uint8_t intNum)
+{
+	return CBreakpoint::HasIntBreakpoint(intNum);
+}
+
 void CBreakpoint::DeleteAll()
 {
 	std::list<CBreakpoint*>::iterator i;
@@ -1072,6 +1090,8 @@ bool DEBUG_Socket_CheckNormalBreakpoint(uint16_t seg, uint32_t off)
 	return true;
 }
 
+extern void DEBUG_Socket_FreezeWait(void);
+
 bool DEBUG_IntBreakpoint(uint8_t intNum)
 {
 	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
@@ -1292,6 +1312,8 @@ void DrawRegistersUpdateOld(void) {
 
 	oldcpucpl=cpu.cpl;
 }
+
+bool ParseCommand(char* str);
 
 void DEBUG_ResumeNormalFromSocket(void)
 {
@@ -6364,7 +6386,12 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		return true;
 	}
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
+		CBreakpoint::DeactivateBreakpoints();
 		DEBUG_Socket_NotifyBreakpoint(SegValue(cs), reg_eip);
+		if (DEBUG_Socket_IsActive()) {
+			FillFlags();
+			DEBUG_Socket_FreezeWait();
+		}
 		return true;
 	}
 	return false;

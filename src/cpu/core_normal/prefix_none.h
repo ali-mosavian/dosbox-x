@@ -16,6 +16,18 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+#ifndef DEBUG_TRACE_BRANCH
+#if C_DEBUG
+extern bool DEBUG_Socket_TraceIsEnabled(void);
+extern void DEBUG_Socket_TraceRecordBranch(uint32_t, uint32_t, uint32_t, uint32_t);
+#define DEBUG_TRACE_BRANCH(from_cs,from_linear,to_cs,to_linear) \
+	do { if (DEBUG_Socket_TraceIsEnabled()) DEBUG_Socket_TraceRecordBranch((uint32_t)(from_cs),(uint32_t)(from_linear),(uint32_t)(to_cs),(uint32_t)(to_linear)); } while (0)
+#else
+#define DEBUG_TRACE_BRANCH(from_cs,from_linear,to_cs,to_linear) \
+	do { (void)(from_cs); (void)(from_linear); (void)(to_cs); (void)(to_linear); } while (0)
+#endif
+#endif
+
 	CASE_B(0x00)												/* ADD Eb,Gb */
 		RMEbGb(ADDB);break;
 	CASE_W(0x01)												/* ADD Ew,Gw */
@@ -1270,17 +1282,21 @@
 		{ 
 			/* must not adjust (E)IP until we have completed the instruction.
 			 * if interrupted by a page fault, EIP must be unmodified. */
+			uint32_t from_linear=(uint32_t)(SegBase(cs)+reg_eip);
 			uint16_t addip=(uint16_t)Fetchws();
 			uint16_t here=GETIP;
 			Push_16(here);
 			reg_eip=(uint16_t)(addip+here);
+			DEBUG_TRACE_BRANCH(SegValue(cs),from_linear,SegValue(cs),(uint32_t)(SegBase(cs)+reg_eip));
 			continue;
 		}
 	CASE_W(0xe9)												/* JMP Jw */
 		{ 
+			uint32_t from_linear=(uint32_t)(SegBase(cs)+reg_eip);
 			uint16_t addip=(uint16_t)Fetchws();
 			SAVEIP;
 			reg_eip=(uint16_t)(reg_eip+addip);
+			DEBUG_TRACE_BRANCH(SegValue(cs),from_linear,SegValue(cs),(uint32_t)(SegBase(cs)+reg_eip));
 			continue;
 		}
 	CASE_W(0xea)												/* JMP Ap */
@@ -1299,9 +1315,11 @@
 		}
 	CASE_W(0xeb)												/* JMP Jb */
 		{ 
+			uint32_t from_linear=(uint32_t)(SegBase(cs)+reg_eip);
 			int16_t addip=Fetchbs();
 			SAVEIP;
 			reg_eip=(uint16_t)(reg_eip+(uint32_t)addip);
+			DEBUG_TRACE_BRANCH(SegValue(cs),from_linear,SegValue(cs),(uint32_t)(SegBase(cs)+reg_eip));
 			continue;
 		}
 	CASE_B(0xec)												/* IN AL,DX */

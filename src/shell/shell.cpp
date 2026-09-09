@@ -70,6 +70,8 @@ extern int enablelfn, msgcodepage, lastmsgcp;
 extern uint16_t countryNo;
 extern unsigned int dosbox_shell_env_size;
 extern bool is_ttfswitched_on;
+extern bool DOS_Shell_RecordDebuggerCommandSubmitted(const char* command);
+extern void DOS_Shell_FinishDebuggerCommandSubmitted(void);
 bool outcon = true, usecon = true, pipetmpdev = true;
 bool shellrun = false, prepared = false, testerr = false;
 
@@ -1306,7 +1308,9 @@ void DOS_Shell::Run(void) {
 		/* do it */
 		if(strlen(input_line)!=0) {
 			if (bf == NULL/*not running a batch file*/ && shell_keyboard_flush) DOS_FlushSTDIN();
+			const bool debugger_command = DOS_Shell_RecordDebuggerCommandSubmitted(input_line);
 			ParseLine(input_line);
+			if (debugger_command) DOS_Shell_FinishDebuggerCommandSubmitted();
 			if (echo && !bf) WriteOut_NoParsing("\n");
 			if (bf == NULL/*not running a batch file*/ && shell_keyboard_flush) DOS_FlushSTDIN();
 		}
