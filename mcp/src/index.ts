@@ -2854,8 +2854,8 @@ server.tool(
   "Read a program variable by name. A name that is not a global is looked up as a " +
   "local or parameter of whatever is running at CS:EIP, read from the frame or the " +
   "register it lives in. Returns its bytes always, and a decoded value when the " +
-  "program's debug info gave it a type. A BASIC array's symbol addresses a runtime " +
-  "descriptor rather than its elements, so it comes back as bytes.",
+  "program's debug info gave it a type. A BASIC array is followed through its " +
+  "runtime descriptor to the elements, each decoded field by field.",
   {
     name: z.string().describe("Variable name, e.g. 'g_counter' or 'module!g_counter'."),
     len: z.number().int().min(1).max(4096).optional().describe(
