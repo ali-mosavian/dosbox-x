@@ -24,6 +24,7 @@ static const char * const CV_SIGNATURES[] = {
 /* CV4 (NB05/NB08/NB09) and CV5 (NB11) subsection kinds. */
 enum {
 	sstModule = 0x120,
+	sstTypes = 0x121,
 	sstPublicSym = 0x123,
 	sstSymbols = 0x124,
 	sstAlignSym = 0x125,
@@ -44,6 +45,11 @@ enum {
 	S_LPROC16 = 0x0104,
 	S_GPROC16 = 0x0105,
 	S_LABEL16 = 0x0109,
+	S_BPREL16 = 0x0100,
+	S_BPREL32 = 0x0200,
+	S_REGISTER = 0x0002,
+	S_ENDBLK  = 0x0006,
+	S_BLOCK16 = 0x0107,
 	S_LDATA32 = 0x0201,
 	S_GDATA32 = 0x0202,
 	S_PUB32   = 0x0203
@@ -199,6 +205,53 @@ static std::vector<CvMember> ParseFieldList(const DebugBytes &body,size_t at,siz
 	return members;
 }
 
+/* One [length:u16][leaf:u16][data] record, whether it was reached through the
+ * packed table's offset array or by walking a module's own run. */
+static CvType ParseTypeRecord(const DebugBytes &body,size_t record,uint16_t length)
+{
+	CvType type;
+	type.leaf = body.u16(record);
+
+	switch (type.leaf) {
+	case 0x0001:					/* LF_MODIFIER: const/volatile */
+		type.utype = body.u16(record + 4);
+		break;
+	case 0x0002:					/* LF_POINTER */
+		type.utype = body.u16(record + 4);
+		type.size = (body.u16(record + 2) & 0x1fu) == 0 ? 2u : 4u;
+		break;
+	case 0x0003: {					/* LF_ARRAY */
+		size_t next = 0;
+		type.utype = body.u16(record + 2);
+		type.size = ReadNumericLeaf(body,record + 6,next);
+		type.name = body.pstr(next);
+		break;
+	}
+	case 0x0004:					/* LF_CLASS */
+	case 0x0005:					/* LF_STRUCTURE */
+	case 0x0006: {					/* LF_UNION */
+		size_t next = 0;
+		const size_t at_size = type.leaf == 0x0006 ? record + 6 : record + 12;
+		type.fieldList = body.u16(record + 4);
+		type.size = ReadNumericLeaf(body,at_size,next);
+		type.name = body.pstr(next);
+		break;
+	}
+	case 0x0204:					/* LF_FIELDLIST */
+		type.members = ParseFieldList(body,record + 2,record + length);
+		break;
+	case 0x0008:					/* LF_PROCEDURE */
+		type.utype = body.u16(record + 2);	/* return type */
+		break;
+	case 0x000d:					/* LF_BARRAY: a BASIC array */
+		type.utype = body.u16(record + 2);
+		break;
+	default:
+		break;
+	}
+	return type;
+}
+
 /*
  * sstGlobalTypes: flags, a count, that many record offsets, then the records.
  * The offsets are counted from the start of the subsection -- the first one
@@ -219,47 +272,27 @@ static std::vector<CvType> ParseGlobalTypes(const DebugBytes &body)
 		const size_t record = (size_t)at + 2;
 		if (length < 2 || (uint64_t)record + length > body.size()) break;
 
-		CvType type;
-		type.leaf = body.u16(record);
+		types.push_back(ParseTypeRecord(body,record,length));
+	}
+	return types;
+}
 
-		switch (type.leaf) {
-		case 0x0001:					/* LF_MODIFIER: const/volatile */
-			type.utype = body.u16(record + 4);
-			break;
-		case 0x0002:					/* LF_POINTER */
-			type.utype = body.u16(record + 4);
-			type.size = (body.u16(record + 2) & 0x1fu) == 0 ? 2u : 4u;
-			break;
-		case 0x0003: {					/* LF_ARRAY */
-			size_t next = 0;
-			type.utype = body.u16(record + 2);
-			type.size = ReadNumericLeaf(body,record + 6,next);
-			type.name = body.pstr(next);
-			break;
-		}
-		case 0x0004:					/* LF_CLASS */
-		case 0x0005:					/* LF_STRUCTURE */
-		case 0x0006: {					/* LF_UNION */
-			size_t next = 0;
-			const size_t at_size = type.leaf == 0x0006 ? record + 6 : record + 12;
-			type.fieldList = body.u16(record + 4);
-			type.size = ReadNumericLeaf(body,at_size,next);
-			type.name = body.pstr(next);
-			break;
-		}
-		case 0x0204:					/* LF_FIELDLIST */
-			type.members = ParseFieldList(body,record + 2,record + length);
-			break;
-		case 0x0008:					/* LF_PROCEDURE */
-			type.utype = body.u16(record + 2);	/* return type */
-			break;
-		case 0x000d:					/* LF_BARRAY: a BASIC array */
-			type.utype = body.u16(record + 2);
-			break;
-		default:
-			break;
-		}
-		types.push_back(type);
+/*
+ * sstTypes: what a module carries before CVPACK gathers every module's types
+ * into one table. No offset array -- the records run back to back, opening
+ * with the same 4-byte version signature the symbol subsections use.
+ */
+static std::vector<CvType> ParseModuleTypes(const DebugBytes &body)
+{
+	std::vector<CvType> types;
+	size_t at = 0;
+	if (at + 4 <= body.size() && body.u16(at) < 2) at += 4;
+
+	while (at + 4 <= body.size()) {
+		const uint16_t length = body.u16(at);
+		if (length < 2 || (uint64_t)at + 2 + length > body.size()) break;
+		types.push_back(ParseTypeRecord(body,at + 2,length));
+		at += 2u + length;
 	}
 	return types;
 }
@@ -447,7 +480,8 @@ bool DEBUG_FindCvBase(const DebugBytes &data,uint64_t &base,std::string &signatu
  * covers at least the kind. Reading past it costs the whole subsection --
  * cvprobe.exe's two sstAlignSym blocks yielded 0 symbols before this.
  */
-std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to)
+std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to,
+                                             std::vector<CvScope> *scopes)
 {
 	std::vector<CvSymbol> out;
 	if (to > body.size()) to = body.size();
@@ -455,13 +489,66 @@ std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t mod
 	size_t at = from;
 	if (at + 4 <= to && body.u16(at) < 2) at += 4;
 
+	/* A proc's locals sit between it and its S_ENDBLK. Blocks inside it are
+	 * only counted, not opened: their locals join the proc's frame, which is
+	 * wider than the block but never points somewhere else. */
+	CvScope open;
+	unsigned int depth = 0;
+
 	while (at + 4 <= to) {
 		const uint16_t length = body.u16(at);
 		if (length < 2) break;
 		const uint16_t kindCode = body.u16(at + 2);
+		const size_t data = at + 4;
+
 		CvSymbol symbol;
-		if (ParseSymbol(body,at + 4,kindCode,moduleIndex,symbol) && !symbol.name.empty())
+		if (ParseSymbol(body,data,kindCode,moduleIndex,symbol) && !symbol.name.empty())
 			out.push_back(symbol);
+
+		if (scopes != NULL) {
+			CvLocal local;
+			switch (kindCode) {
+			case S_LPROC16:
+			case S_GPROC16:
+				if (depth == 0 && symbol.kind == CV_SYM_PROC) {
+					open = CvScope();
+					open.moduleIndex = moduleIndex;
+					open.segment = symbol.segment;
+					open.offset = symbol.offset;
+					open.length = symbol.size;
+					open.function = symbol.name;
+				}
+				depth++;
+				break;
+			case S_BLOCK16:
+				if (depth > 0) depth++;
+				break;
+			case S_ENDBLK:
+				if (depth > 0 && --depth == 0 && !open.function.empty()) scopes->push_back(open);
+				break;
+			case S_BPREL16:
+				local.frameOffset = (int32_t)(int16_t)body.u16(data);
+				local.type = body.u16(data + 2);
+				local.name = body.pstr(data + 4);
+				if (depth > 0 && !local.name.empty()) open.locals.push_back(local);
+				break;
+			case S_BPREL32:
+				local.frameOffset = (int32_t)body.u32(data);
+				local.type = body.u16(data + 4);
+				local.name = body.pstr(data + 6);
+				if (depth > 0 && !local.name.empty()) open.locals.push_back(local);
+				break;
+			case S_REGISTER:
+				local.storage = CV_LOCAL_REGISTER;
+				local.type = body.u16(data);
+				local.reg = body.u16(data + 2);
+				local.name = body.pstr(data + 4);
+				if (depth > 0 && !local.name.empty()) open.locals.push_back(local);
+				break;
+			default:
+				break;
+			}
+		}
 		at += 2u + length;
 	}
 	return out;
@@ -505,7 +592,8 @@ bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out)
 		case sstSymbols:
 		case sstAlignSym:
 		case sstStaticSym: {
-			const std::vector<CvSymbol> run = DEBUG_ParseCvSymbolRun(body,entry.moduleIndex,0,body.size());
+			const std::vector<CvSymbol> run =
+				DEBUG_ParseCvSymbolRun(body,entry.moduleIndex,0,body.size(),&out.scopes);
 			out.symbols.insert(out.symbols.end(),run.begin(),run.end());
 			break;
 		}
@@ -517,6 +605,9 @@ bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out)
 		}
 		case sstSegMap:
 			out.segments = ParseSegMap(body);
+			break;
+		case sstTypes:
+			out.moduleTypes[entry.moduleIndex] = ParseModuleTypes(body);
 			break;
 		case sstGlobalTypes:
 			out.types = ParseGlobalTypes(body);

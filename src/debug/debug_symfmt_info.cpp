@@ -83,7 +83,7 @@ static std::string CvPrimitiveName(uint16_t type,DebugSymbol &out)
 }
 
 /* Depth-limited: a type table is free to point back at itself. */
-static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol &out,int depth = 0)
+static std::string CodeViewTypeName(const std::vector<CvType> &types,uint16_t type,DebugSymbol &out,int depth = 0)
 {
 	out.valueSize = 0;
 	out.valueKind = DEBUG_VALUE_UNKNOWN;
@@ -95,12 +95,12 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 	if (type < 0x1000) return CvPrimitiveName(type,out);
 
 	const size_t index = (size_t)(type - 0x1000);
-	if (index >= info.types.size()) return std::string();
+	if (index >= types.size()) return std::string();
 
-	const CvType &record = info.types[index];
+	const CvType &record = types[index];
 	DebugSymbol inner;
 	const std::string underlying = record.leaf == 0x0201 ? std::string()
-		: CodeViewTypeName(info,record.utype,inner,depth + 1);
+		: CodeViewTypeName(types,record.utype,inner,depth + 1);
 
 	switch (record.leaf) {
 	case 0x0001:					/* LF_MODIFIER */
@@ -131,12 +131,12 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 
 		/* Unlike Borland's, a CodeView member says where it sits. */
 		const size_t list = (size_t)record.fieldList - 0x1000;
-		if (record.fieldList >= 0x1000 && list < info.types.size()) {
-			const CvType &fields = info.types[list];
+		if (record.fieldList >= 0x1000 && list < types.size()) {
+			const CvType &fields = types[list];
 			for (size_t i = 0;i < fields.members.size();i++) {
 				DebugSymbol member;
 				DebugField field;
-				field.typeName = CodeViewTypeName(info,fields.members[i].type,member,depth + 1);
+				field.typeName = CodeViewTypeName(types,fields.members[i].type,member,depth + 1);
 				field.name = fields.members[i].name;
 				field.offset = fields.members[i].offset;
 				field.size = member.valueSize;
@@ -159,6 +159,13 @@ static std::string CodeViewTypeName(const CvInfo &info,uint16_t type,DebugSymbol
 		return "BASIC array of " + (underlying.empty() ? std::string("?") : underlying);
 	}
 	return std::string();
+}
+
+/* Unpacked debug info has no global table; a symbol's types are its module's. */
+static const std::vector<CvType> &CvTypesFor(const CvInfo &info,uint16_t moduleIndex)
+{
+	const std::map<uint16_t,std::vector<CvType> >::const_iterator it = info.moduleTypes.find(moduleIndex);
+	return it == info.moduleTypes.end() ? info.types : it->second;
 }
 
 static void CodeViewSymbols(const CvInfo &info,uint32_t loadLinear,DebugInfo &out)
@@ -184,7 +191,8 @@ static void CodeViewSymbols(const CvInfo &info,uint32_t loadLinear,DebugInfo &ou
 		out_symbol.hasSize = symbol.hasSize;
 		out_symbol.module = symbol.module;
 		out_symbol.source = DEBUG_FORMAT_CODEVIEW;
-		out_symbol.typeName = CodeViewTypeName(info,symbol.type,out_symbol);
+		out_symbol.typeName = CodeViewTypeName(CvTypesFor(info,symbol.moduleIndex),
+		                                       symbol.type,out_symbol);
 		if (symbol.kind == CV_SYM_PROC) {
 			out_symbol.isFunction = true;
 			out_symbol.valueSize = 0;
@@ -202,6 +210,60 @@ static void CodeViewSymbols(const CvInfo &info,uint32_t loadLinear,DebugInfo &ou
 			list += buf;
 		}
 		out.warnings.push_back("no sstSegMap entry for segment(s) " + list);
+	}
+}
+
+/*
+ * CodeView numbers a 16-bit register 9 + its x86 encoding number, which is
+ * what DebugLocal wants. Measured on jwprobe.exe: its FASTCALL parameters k
+ * and m come back 11 and 9, and the code jwasm generated for them reads DX
+ * and AX. Only that range is translated -- an 8-bit or 32-bit register would
+ * land on the wrong one, so such a local is left out rather than misread.
+ */
+static bool CvRegisterNumber(uint16_t cv,uint16_t &out)
+{
+	const uint16_t low = (uint16_t)(cv & 0xffu);
+	if (low < 9 || low > 16) return false;
+	out = (uint16_t)(low - 9);
+	return true;
+}
+
+static void CodeViewScopes(const CvInfo &info,DebugInfo &out)
+{
+	const std::map<uint16_t,uint32_t> bases = DEBUG_CvSegmentBases(info);
+
+	for (size_t i = 0;i < info.scopes.size();i++) {
+		const CvScope &scope = info.scopes[i];
+		const std::map<uint16_t,uint32_t>::const_iterator base = bases.find(scope.segment);
+		if (base == bases.end()) continue;
+
+		DebugScope out_scope;
+		out_scope.imageOffset = base->second + scope.offset;
+		out_scope.endOffset = out_scope.imageOffset + scope.length;
+		out_scope.function = scope.function;
+
+		for (size_t k = 0;k < scope.locals.size();k++) {
+			const CvLocal &source = scope.locals[k];
+			DebugLocal local;
+			local.name = source.name;
+			if (source.storage == CV_LOCAL_REGISTER) {
+				if (!CvRegisterNumber(source.reg,local.reg)) continue;
+				local.storage = DEBUG_STORAGE_REGISTER;
+			} else {
+				local.storage = DEBUG_STORAGE_FRAME;
+				local.frameOffset = source.frameOffset;
+			}
+
+			DebugSymbol typed;
+			local.typeName = CodeViewTypeName(CvTypesFor(info,scope.moduleIndex),source.type,typed);
+			local.valueSize = typed.valueSize;
+			local.valueKind = typed.valueKind;
+			local.elementSize = typed.elementSize;
+			local.fields = typed.fields;
+			local.isBasicArray = typed.isBasicArray;
+			out_scope.locals.push_back(local);
+		}
+		out.scopes.push_back(out_scope);
 	}
 }
 
@@ -662,6 +724,7 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 
 	CodeViewSymbols(cv,loadLinear,out);
 	CodeViewLines(cv,out);
+	CodeViewScopes(cv,out);
 	return true;
 }
 

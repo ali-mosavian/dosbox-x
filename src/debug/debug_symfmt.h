@@ -101,6 +101,29 @@ struct CvSymbol {
 	std::string module;
 };
 
+/* A proc's frame: what CodeView records between the proc and its S_ENDBLK. */
+enum CvLocalStorage {
+	CV_LOCAL_FRAME,
+	CV_LOCAL_REGISTER
+};
+
+struct CvLocal {
+	std::string name;
+	CvLocalStorage storage = CV_LOCAL_FRAME;
+	int32_t frameOffset = 0;	/* BP-relative */
+	uint16_t reg = 0;		/* CodeView register number */
+	uint16_t type = 0;
+};
+
+struct CvScope {
+	uint16_t moduleIndex = 0;
+	uint16_t segment = 0;
+	uint32_t offset = 0;
+	uint32_t length = 0;
+	std::string function;
+	std::vector<CvLocal> locals;
+};
+
 struct CvSegInfo {
 	uint16_t segment = 0;
 	uint32_t offset = 0;
@@ -178,6 +201,11 @@ struct CvInfo {
 	std::vector<CvSegMapEntry> segments;
 	std::vector<CvLineTable> lines;
 	std::vector<CvType> types;	/* index 0x1000 + position */
+	/* Before CVPACK runs there is no one global table: each module carries
+	 * its own, and every one of them starts over at 0x1000. Keyed by module
+	 * index, and empty once the types have been packed. */
+	std::map<uint16_t,std::vector<CvType> > moduleTypes;
+	std::vector<CvScope> scopes;
 	std::vector<std::string> warnings;
 };
 
@@ -188,8 +216,10 @@ bool DEBUG_FindCvBase(const DebugBytes &data,uint64_t &base,std::string &signatu
 
 bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out);
 
-/* A run of [length:u16][kind:u16][data] records. Exposed for the tests. */
-std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to);
+/* A run of [length:u16][kind:u16][data] records. Exposed for the tests.
+ * scopes, when given, collects the frames the proc records open. */
+std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t moduleIndex,size_t from,size_t to,
+                                             std::vector<CvScope> *scopes = NULL);
 
 /* What a BASIC array's symbol addresses: a descriptor the runtime fills in,
  * not the elements. Measured on cvprobe.exe (2-byte elements, 16 of them)

@@ -530,6 +530,96 @@ TEST_F(DebugSymFmtTest, CodeViewVariablesGetASizeAndAReadableType)
 	EXPECT_EQ(34u,byName["pr_add"]->size);
 }
 
+static std::map<std::string,const DebugSymbol*> ByName(const DebugInfo &info)
+{
+	std::map<std::string,const DebugSymbol*> byName;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (byName.count(info.symbols[i].name) == 0 || info.symbols[i].valueSize != 0)
+			byName[info.symbols[i].name] = &info.symbols[i];
+	return byName;
+}
+
+TEST_F(DebugSymFmtTest, AJWasmProgramTypesReadTheSameBeforeAndAfterCvpack)
+{
+	/* jwasm + LINK leave every module carrying its own type table, which
+	 * starts over at 0x1000; only CVPACK gathers them into the one global
+	 * table. Reading just the global table left jwprobe.exe with no types at
+	 * all, so nothing it declares had a name, a width or a field. */
+	DebugInfo unpacked,packed;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("jwprobe.exe").c_str(),0x8240,unpacked));
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("jwpack.exe").c_str(),0x8240,packed));
+	EXPECT_EQ("NB05",unpacked.version);
+	EXPECT_EQ("NB08",packed.version);
+
+	const std::map<std::string,const DebugSymbol*> before = ByName(unpacked);
+	const std::map<std::string,const DebugSymbol*> after = ByName(packed);
+
+	static const char * const names[] = {"jw_home","jw_nodes","jw_name","jw_count","jw_total"};
+	for (size_t i = 0;i < sizeof(names)/sizeof(names[0]);i++) {
+		ASSERT_TRUE(before.count(names[i]) != 0) << names[i];
+		ASSERT_TRUE(after.count(names[i]) != 0) << names[i];
+		EXPECT_EQ(after.at(names[i])->typeName,before.at(names[i])->typeName) << names[i];
+		EXPECT_EQ(after.at(names[i])->valueSize,before.at(names[i])->valueSize) << names[i];
+		EXPECT_EQ(after.at(names[i])->fields.size(),before.at(names[i])->fields.size()) << names[i];
+	}
+
+	/* The source declares Vtx as two SWORDs and an SDWORD. */
+	EXPECT_EQ("Vtx",before.at("jw_home")->typeName);
+	EXPECT_EQ(8u,before.at("jw_home")->valueSize);
+	ASSERT_EQ(3u,before.at("jw_home")->fields.size());
+	EXPECT_EQ("vx",before.at("jw_home")->fields[0].name);
+	EXPECT_EQ(0u,before.at("jw_home")->fields[0].offset);
+	EXPECT_EQ("tag",before.at("jw_home")->fields[2].name);
+	EXPECT_EQ(4u,before.at("jw_home")->fields[2].offset);
+	EXPECT_EQ(4u,before.at("jw_home")->fields[2].size);
+
+	EXPECT_EQ("Vtx[4]",before.at("jw_nodes")->typeName);
+	EXPECT_EQ(32u,before.at("jw_nodes")->valueSize);
+	EXPECT_EQ("unsigned char[8]",before.at("jw_name")->typeName);
+	EXPECT_EQ("short",before.at("jw_count")->typeName);
+	EXPECT_EQ("long",before.at("jw_total")->typeName);
+}
+
+TEST_F(DebugSymFmtTest, ACodeViewProcCarriesTheLocalsBetweenItAndItsEndBlock)
+{
+	/* No CodeView program reported a local before this: only Borland built
+	 * scopes, so locals and locals-by-name answered nothing for jwasm, for
+	 * C and for BASIC alike. */
+	DebugInfo info;
+	ASSERT_TRUE(DEBUG_ParseDebugInfo(Fixture("jwprobe.exe").c_str(),0x8240,info));
+
+	std::map<std::string,const DebugScope*> byFunction;
+	for (size_t i = 0;i < info.scopes.size();i++) byFunction[info.scopes[i].function] = &info.scopes[i];
+
+	ASSERT_TRUE(byFunction.count("jw_fill") != 0);
+	ASSERT_EQ(1u,byFunction["jw_fill"]->locals.size());
+	EXPECT_EQ("i",byFunction["jw_fill"]->locals[0].name);
+	EXPECT_EQ(DEBUG_STORAGE_FRAME,byFunction["jw_fill"]->locals[0].storage);
+	EXPECT_EQ(-2,byFunction["jw_fill"]->locals[0].frameOffset);
+	EXPECT_EQ("short",byFunction["jw_fill"]->locals[0].typeName);
+
+	ASSERT_TRUE(byFunction.count("jw_sum") != 0);
+	ASSERT_EQ(2u,byFunction["jw_sum"]->locals.size());
+	EXPECT_EQ("acc",byFunction["jw_sum"]->locals[0].name);
+	EXPECT_EQ(-4,byFunction["jw_sum"]->locals[0].frameOffset);
+	EXPECT_EQ("long",byFunction["jw_sum"]->locals[0].typeName);
+	EXPECT_EQ("j",byFunction["jw_sum"]->locals[1].name);
+	EXPECT_EQ(-6,byFunction["jw_sum"]->locals[1].frameOffset);
+
+	/* The scope covers the proc, so an address inside it finds the frame. */
+	EXPECT_LT(byFunction["jw_sum"]->imageOffset,byFunction["jw_sum"]->endOffset);
+
+	/* FASTCALL puts k in DX and m in AX -- jwasm assembled "mov ax, k" as
+	 * "mov ax, dx". CodeView numbers those 11 and 9. */
+	ASSERT_TRUE(byFunction.count("jw_scale") != 0);
+	ASSERT_EQ(2u,byFunction["jw_scale"]->locals.size());
+	EXPECT_EQ("m",byFunction["jw_scale"]->locals[0].name);
+	EXPECT_EQ(DEBUG_STORAGE_REGISTER,byFunction["jw_scale"]->locals[0].storage);
+	EXPECT_EQ(0u,byFunction["jw_scale"]->locals[0].reg);		/* AX */
+	EXPECT_EQ("k",byFunction["jw_scale"]->locals[1].name);
+	EXPECT_EQ(2u,byFunction["jw_scale"]->locals[1].reg);		/* DX */
+}
+
 TEST_F(DebugSymFmtTest, ABasicTypeDecodesFieldByFieldAndAsAnArrayOfItself)
 {
 	/* udtbas.bas declares TYPE Vtx as two integers and a long, then one of

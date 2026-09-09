@@ -54,7 +54,7 @@ programs on image or zip drives work like any other.
 
 | format | how it is found | what comes out |
 |---|---|---|
-| Microsoft CodeView `NB05`-`NB11` | `NBxx` trailer at EOF, or the MZ image end | publics, module data, procedures, labels, object-module names, source line numbers, types |
+| Microsoft CodeView `NB05`-`NB11` | `NBxx` trailer at EOF, or the MZ image end | publics, module data, procedures, labels, object-module names, source line numbers, types, and each proc's frame. Types read whether CVPACK has gathered them into one table or each module still carries its own, as jwasm and LINK leave them |
 | Microsoft CodeView `NB00`-`NB02` | as above | the subsection directory only; the pre-CV4 record layouts are unread |
 | Borland TDINFO (`0x52FB`) | MZ image end, or a `.TDS` beside the program; the format has no trailer | globals, module names, source files, line records, types, and scopes with their locals and parameters |
 | Watcom (`0x8386`) | master header in the last 14 bytes | globals, module names |
