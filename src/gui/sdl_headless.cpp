@@ -116,16 +116,12 @@ void SDL_WaitThread(SDL_Thread *thread, int *status) {
 }
 
 SDL_threadID SDL_ThreadID(void) {
-    uint64_t id;
-    pthread_threadid_np(NULL, &id);
-    return (SDL_threadID)id;
+    return (SDL_threadID)(uintptr_t)pthread_self();
 }
 
 SDL_threadID SDL_GetThreadID(SDL_Thread *thread) {
     if (!thread) return SDL_ThreadID();
-    uint64_t id;
-    pthread_threadid_np(thread->handle, &id);
-    return (SDL_threadID)id;
+    return (SDL_threadID)(uintptr_t)thread->handle;
 }
 
 struct SDL_mutex { pthread_mutex_t m; };
@@ -510,6 +506,7 @@ void SDL_GetWindowSize(SDL_Window *window, int *w, int *h) {
     if (h) *h = window->h;
 }
 void SDL_SetWindowSize(SDL_Window *window, int w, int h) { window->w = w; window->h = h; }
+void SDL_SetWindowIcon(SDL_Window *, SDL_Surface *) {}
 void SDL_GetWindowPosition(SDL_Window *window, int *x, int *y) {
     if (x) *x = window->x;
     if (y) *y = window->y;
