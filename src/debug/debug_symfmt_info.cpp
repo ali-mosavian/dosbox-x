@@ -322,7 +322,9 @@ static void CodeViewLines(const CvInfo &info,DebugInfo &out)
 			line.file = table.file;
 			line.line = sorted[i].line;
 			line.imageOffset = base->second + sorted[i].offset;
-			line.endOffset = base->second + std::max(next,sorted[i].offset + 1);
+			/* A line sharing its address with the next has no code: jwasm
+			 * puts a PROC's line on its first instruction's address. */
+			line.endOffset = base->second + (i + 1 < sorted.size() ? next : std::max(next,sorted[i].offset + 1));
 			out.lines.push_back(line);
 		}
 	}
@@ -584,7 +586,7 @@ static void BorlandLines(const TdInfo &info,DebugInfo &out)
 			line.file = file.empty() ? module : file;
 			line.line = numbers[i];
 			line.imageOffset = base + offsets[i];
-			line.endOffset = base + std::max(next,offsets[i] + 1);
+			line.endOffset = base + (i + 1 < offsets.size() ? next : std::max(next,offsets[i] + 1));
 			out.lines.push_back(line);
 		}
 	}

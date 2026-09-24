@@ -137,13 +137,19 @@ void DebugSymbolStore::Flatten()
 
 static bool BeginsAfter(uint32_t linear,const DebugProgramSegment &piece) { return linear < piece.begin; }
 
-const DebugProgramSegment *DebugSymbolStore::ProgramDataAt(uint32_t linear) const
+const DebugProgramSegment *DebugSymbolStore::PieceAt(uint32_t linear) const
 {
 	std::vector<DebugProgramSegment>::const_iterator next =
 		std::upper_bound(pieces.begin(),pieces.end(),linear,BeginsAfter);
-	if (next == pieces.begin()) return NULL;
-	const DebugProgramSegment &piece = *(next - 1);
-	if (linear >= piece.end || piece.code) return NULL;
+	if (next == pieces.begin() || linear >= (next - 1)->end) return NULL;
+	return &*(next - 1);
+}
+
+const DebugProgramSegment *DebugSymbolStore::ProgramDataAt(uint32_t linear) const
+{
+	const DebugProgramSegment *found = PieceAt(linear);
+	if (found == NULL || found->code) return NULL;
+	const DebugProgramSegment &piece = *found;
 	/* Another program may have this memory now; its layout is not this one. */
 	uint16_t owner = 0, start = 0, end = 0;
 	if (!DOS_MemoryBlockAt((uint16_t)(linear >> 4),owner,start,end) || owner != piece.psp) return NULL;
@@ -258,6 +264,13 @@ const DebugSymbol *DebugSymbolStore::Nearest(uint32_t linear,uint32_t &delta) co
 			best = &symbol;
 			delta = distance;
 		}
+	}
+	/* Nor past the end of the segment it is in, when the layout says where
+	 * that is: a return into the stack named the last variable before it.
+	 * Pieces are disjoint, so no lower symbol can reach further. */
+	if (best != NULL && !(best->hasSize && best->size > 0)) {
+		const DebugProgramSegment *piece = PieceAt(best->linear);
+		if (piece != NULL && linear >= piece->end) return NULL;
 	}
 	return best;
 }

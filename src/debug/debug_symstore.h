@@ -127,6 +127,9 @@ public:
 	bool ResolveLocation(const std::string &spec,DebugLocation &out,std::string &error) const;
 
 private:
+	/* The layout piece covering an address, of any program, live or not. */
+	const DebugProgramSegment *PieceAt(uint32_t linear) const;
+
 	/* The innermost scope covering an address, or -1. */
 	int32_t InnermostScope(uint32_t pcLinear) const;
 
