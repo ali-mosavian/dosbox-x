@@ -18,6 +18,21 @@
 
 #if C_DEBUG
 
+#include <vector>
+
+// A control transfer the normal core observed, as linear addresses.
+struct BranchEntry {
+    uint32_t from_cs;
+    uint32_t from_linear;
+    uint32_t to_cs;
+    uint32_t to_linear;
+};
+
+// Record transfers into the branch ring without a socket client asking.
+void DEBUG_Socket_TraceEnable(void);
+// The newest n entries of the branch ring, oldest first.
+std::vector<BranchEntry> DEBUG_Socket_TraceRecent(size_t n);
+
 // Initialize the debug socket server
 // Returns true if started successfully
 bool DEBUG_Socket_Init(int port);

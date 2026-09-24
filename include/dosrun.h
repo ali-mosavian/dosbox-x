@@ -26,4 +26,16 @@ void DOSRUN_Tick(void);
  * nlines < 0 scrolls up, 0 clears. */
 void DOSRUN_BeforeScroll(uint8_t rul, uint8_t cul, uint8_t rlr, uint8_t clr, int8_t nlines, uint8_t page);
 
+/* True in a job's child: the core then reports where execution lands. */
+extern bool dosrun_watch;
+
+/* Execution arrived at CS:linear, after a transfer or on entering a page. */
+void DOSRUN_Executes(uint32_t cs, uint32_t linear);
+
+/* The CPU raised exception `which`. */
+void DOSRUN_Exception(uint8_t which);
+
+/* HLT is about to execute. */
+void DOSRUN_Halt(void);
+
 #endif

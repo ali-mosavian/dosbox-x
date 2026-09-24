@@ -22,6 +22,7 @@
 #include <stddef.h>
 
 #include "cpu.h"
+#include "dosrun.h"
 #include "debug.h"
 #include "mapper.h"
 #include "paging.h"
@@ -1219,6 +1220,7 @@ void On_Software_CPU_Reset();
 
 void CPU_Exception(Bitu which,Bitu error ) {
 	assert(which < 0x20);
+	DOSRUN_Exception((uint8_t)which);
 //	LOG_MSG("Exception %d error %x",which,error);
 
 #if C_DEBUG
@@ -3431,6 +3433,7 @@ void CPU_HLT(uint32_t oldeip) {
 	if (cpudecoder == &HLT_Decode) E_Exit("CPU_HLT attempted to set HLT_Decode while CPU decoder already HLT_Decode.\n\nIf you see this message while installing FreeDOS, please use the normal CPU core.");
 
 	reg_eip=oldeip;
+	DOSRUN_Halt();
 	CPU_IODelayRemoved += CPU_Cycles;
 	CPU_Cycles=0;
 	cpu.hlt.cs=SegValue(cs);

@@ -17,6 +17,7 @@
  */
 
 #include "cpu.h"
+#include "dosrun.h"
 #include "lazyflags.h"
 #include "callback.h"
 #include "pic.h"
@@ -206,11 +207,15 @@ Bits CPU_Core_Normal_Run(void) {
 			static bool     prev_valid  = false;
 			uint32_t cur_cseip  = (uint32_t)core.cseip;
 			uint32_t cur_cs_val = SegValue(cs);
-			if (DEBUG_Socket_TraceIsEnabled() && prev_valid) {
-				if ((uint32_t)(cur_cseip - prev_cseip) > 15u) {
+			if (prev_valid) {
+				const bool transfer = (uint32_t)(cur_cseip - prev_cseip) > 15u;
+				if (transfer && DEBUG_Socket_TraceIsEnabled())
 					DEBUG_Socket_TraceRecordBranch(prev_cs_val, prev_cseip,
 					                               cur_cs_val,  cur_cseip);
-				}
+				// A crash shows first where execution lands: after a transfer,
+				// or on running sequentially into another page.
+				if (dosrun_watch && (transfer || ((cur_cseip ^ prev_cseip) >> 12)))
+					DOSRUN_Executes(cur_cs_val, cur_cseip);
 			}
 			prev_cseip  = cur_cseip;
 			prev_cs_val = cur_cs_val;

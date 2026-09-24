@@ -298,12 +298,6 @@ static bool break_on_exit = false;
 // -----------------------------------------------------------------------
 // Branch trace ring buffer
 // -----------------------------------------------------------------------
-struct BranchEntry {
-    uint32_t from_cs;
-    uint32_t from_linear;
-    uint32_t to_cs;
-    uint32_t to_linear;
-};
 static const int BRANCH_RING_SIZE = 8192;
 static BranchEntry branch_ring[BRANCH_RING_SIZE];
 static uint32_t branch_ring_head  = 0;   // next write index (mod BRANCH_RING_SIZE)
@@ -1647,6 +1641,18 @@ void DEBUG_Socket_TraceRecordBranch(uint32_t from_cs, uint32_t from_linear,
     if (reverse_trace_enabled) {
         reverse_record_checkpoint(from_cs, from_linear);
     }
+}
+
+void DEBUG_Socket_TraceEnable(void) {
+    branch_trace_enabled = true;
+}
+
+std::vector<BranchEntry> DEBUG_Socket_TraceRecent(size_t n) {
+    size_t count = std::min<size_t>(n, branch_ring_count);
+    std::vector<BranchEntry> recent;
+    for (size_t i = count; i > 0; i--)
+        recent.push_back(branch_ring[(branch_ring_head - i) % BRANCH_RING_SIZE]);
+    return recent;
 }
 
 // Get all registers as JSON
