@@ -169,10 +169,10 @@ void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFi
 		}
 
 		if (section == SECTION_PUBLICS) {
-			/* Rows for absolute symbols put a class column between the
-			 * address and the name, so what lands here is "Abs" and the real
-			 * name is never keyed. Those symbols are not in the load image,
-			 * so nothing that resolves against a load base wants them. */
+			/* Rows for absolute symbols put "Abs" between the address and the
+			 * name. Their value is a constant, not in the load image: keyed
+			 * as "Abs", the first one named BC's main module code. */
+			if (tokens[1] == "Abs") continue;
 			LinkMapPublic symbol;
 			symbol.name = tokens[1];
 			symbol.address = address;

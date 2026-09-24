@@ -93,6 +93,14 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 			found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,loadLinear,info);
 	}
 
+	/* Debug info that names nothing does not shadow a .MAP that names
+	 * something: BC 4.5 and LINK 3.69 append NB00, which is read no further
+	 * than its directory. */
+	if (found && info.symbols.empty() && info.lines.empty()) {
+		LOG_MSG("DEBUG: %s carries %s with no symbols read; trying its .MAP",program,info.version.c_str());
+		found = false;
+	}
+
 	if (found) {
 		DEBUG_Symbols().ClearProgram(program);
 		DEBUG_Symbols().AddDebugInfo(info,program);
