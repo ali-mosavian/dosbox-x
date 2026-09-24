@@ -33,6 +33,11 @@ void DEBUG_Socket_TraceEnable(void);
 // The newest n entries of the branch ring, oldest first.
 std::vector<BranchEntry> DEBUG_Socket_TraceRecent(size_t n);
 
+// True while the server listens. Breakpoints, watchpoints, steps and reverse
+// checkpoints only stop or record for a client, so the CPU core checks this
+// before any of them.
+extern bool debug_socket_listening;
+
 // Initialize the debug socket server
 // Returns true if started successfully
 bool DEBUG_Socket_Init(int port);

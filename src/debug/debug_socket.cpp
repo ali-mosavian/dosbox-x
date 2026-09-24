@@ -219,6 +219,7 @@ void On_Software_CPU_Reset(void);
 
 // Socket state
 static int server_socket = -1;
+bool debug_socket_listening = false;
 static int client_socket = -1;
 static int socket_port = 0;
 static std::string recv_buffer;
@@ -4711,10 +4712,12 @@ bool DEBUG_Socket_Init(int port) {
 
     socket_port = port;
     LOG_MSG("DEBUG_Socket: Listening on port %d", port);
+    debug_socket_listening = true;
     return true;
 }
 
 void DEBUG_Socket_Shutdown(void) {
+    debug_socket_listening = false;
     if (client_socket >= 0) {
         close(client_socket);
         client_socket = -1;

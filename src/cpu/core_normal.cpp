@@ -226,34 +226,37 @@ Bits CPU_Core_Normal_Run(void) {
 			prev_cs_val = cur_cs_val;
 			prev_valid  = true;
 		}
-		// Watchpoint pending: fired during previous instruction's memory write.
-		if (DEBUG_Socket_CheckWatchpointFreeze()) {
-			FillFlags();
-			DEBUG_Socket_FreezeWait();
-			continue;
+		extern bool debug_socket_listening;
+		if (debug_socket_listening) {
+			// Watchpoint pending: fired during previous instruction's memory write.
+			if (DEBUG_Socket_CheckWatchpointFreeze()) {
+				FillFlags();
+				DEBUG_Socket_FreezeWait();
+				continue;
+			}
+			// Step-arm: decrements each iteration; re-freezes when it reaches zero
+			// (exactly one instruction has been executed since the step was issued).
+			if (DEBUG_Socket_DecrStepArm()) {
+				FillFlags();
+				DEBUG_Socket_NotifyStopped("step");
+				DEBUG_Socket_FreezeWait();
+				continue;
+			}
+			if (DEBUG_Socket_CheckLinearExecBreakpoint(SegValue(cs), reg_eip)) {
+				FillFlags();
+				// In-place stop: block here until the client continues, then resume
+				// this same instruction transparently. suppress_current (set by the
+				// check) prevents an immediate re-hit on the next loop iteration.
+				DEBUG_Socket_FreezeWait();
+				continue;
+			}
+			if (DEBUG_Socket_CheckNormalBreakpoint(SegValue(cs), reg_eip)) {
+				FillFlags();
+				DEBUG_Socket_FreezeWait();
+				continue;
+			}
+			DEBUG_Socket_ReverseInstructionCheckpoint();
 		}
-		// Step-arm: decrements each iteration; re-freezes when it reaches zero
-		// (exactly one instruction has been executed since the step was issued).
-		if (DEBUG_Socket_DecrStepArm()) {
-			FillFlags();
-			DEBUG_Socket_NotifyStopped("step");
-			DEBUG_Socket_FreezeWait();
-			continue;
-		}
-		if (DEBUG_Socket_CheckLinearExecBreakpoint(SegValue(cs), reg_eip)) {
-			FillFlags();
-			// In-place stop: block here until the client continues, then resume
-			// this same instruction transparently. suppress_current (set by the
-			// check) prevents an immediate re-hit on the next loop iteration.
-			DEBUG_Socket_FreezeWait();
-			continue;
-		}
-		if (DEBUG_Socket_CheckNormalBreakpoint(SegValue(cs), reg_eip)) {
-			FillFlags();
-			DEBUG_Socket_FreezeWait();
-			continue;
-		}
-		DEBUG_Socket_ReverseInstructionCheckpoint();
 #if C_HEAVY_DEBUG
 		if (DEBUG_HeavyIsBreakpoint()) {
 			FillFlags();
