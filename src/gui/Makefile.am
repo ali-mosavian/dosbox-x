@@ -20,8 +20,13 @@ libgui_a_SOURCES += \
 endif
 
 if MACOSX
+if C_HEADLESS
+libgui_a_SOURCES += \
+	menu_macos_headless.cpp
+else
 libgui_a_SOURCES += \
 	menu_macos.mm
+endif
 endif
 
 if C_HEADLESS

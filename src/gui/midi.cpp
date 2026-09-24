@@ -107,7 +107,11 @@ static struct {
 # include "midi_timidity.h"
 #endif
 
-#if defined(MACOSX)
+#if C_HEADLESS
+
+/* no host MIDI devices */
+
+#elif defined(MACOSX)
 
 #include "midi_coremidi.h"
 #include "midi_coreaudio.h"

@@ -551,6 +551,8 @@ if test x"$enable_headless" = xyes; then
     CPPFLAGS="$CPPFLAGS -I`cd $srcdir && pwd`/vs/sdl2/include -D_THREAD_SAFE"
     AC_DEFINE(C_SDL2,1)
     AC_DEFINE(C_HEADLESS,1)
+    dnl No host menus: the menu is drawn on a surface nobody sees.
+    AC_DEFINE(C_FORCE_MENU_SDLDRAW,1)
     AC_MSG_NOTICE([Building headless, without an SDL library])
 elif test x"$enable_sdl3" = xyes; then
     AC_MSG_NOTICE([--enable-sdl3 specified, trying SDL3])
@@ -725,7 +727,9 @@ case "$host" in
        macosx=1
        OBJCXXFLAGS="$OBJCXXFLAGS -std=gnu++14";
        AC_DEFINE(MACOSX, 1, [Compiling on Mac OS X])
-       LIBS="$LIBS -framework Carbon -framework CoreFoundation -framework CoreMIDI -framework AudioUnit -framework AudioToolbox -framework ApplicationServices -framework AppKit -framework IOKit "
+       if test x"$enable_headless" != xyes; then
+         LIBS="$LIBS -framework Carbon -framework CoreFoundation -framework CoreMIDI -framework AudioUnit -framework AudioToolbox -framework ApplicationServices -framework AppKit -framework IOKit "
+       fi
        dnl FEATURE: Whether to support direct serial port pass-through
        AC_DEFINE(C_DIRECTSERIAL, 1, [ Define to 1 if you want serial pass-through support (Win32, Posix and OS/2).])
        ;;

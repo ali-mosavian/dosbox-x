@@ -30,6 +30,11 @@
 #  define PHYSFS_PLATFORM_WINDOWS 1
 #elif defined(__OS2__) || defined(OS2)
 #  define PHYSFS_PLATFORM_OS2 1
+#elif ((defined __MACH__) && (defined __APPLE__)) && defined(C_HEADLESS)
+/* DOSBox-X headless: the Unix layer, without Foundation and IOKit */
+#  define PHYSFS_PLATFORM_UNIX 1
+#  define PHYSFS_PLATFORM_POSIX 1
+#  define PHYSFS_NO_CDROM_SUPPORT 1
 #elif ((defined __MACH__) && (defined __APPLE__))
 /* To check if iOS or not, we need to include this file */
 #  include <TargetConditionals.h>

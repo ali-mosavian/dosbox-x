@@ -10,6 +10,8 @@ libdos_a_SOURCES = dos.cpp dos_devices.cpp dos_execute.cpp dos_files.cpp dos_ioc
 		   cdrom_ioctl_os2.cpp eltorito.cpp
 
 if MACOSX
+if !C_HEADLESS
 libdos_a_SOURCES += \
 	../libs/physfs/physfs_platform_apple.mm
+endif
 endif

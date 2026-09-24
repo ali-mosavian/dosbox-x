@@ -32,7 +32,10 @@
 
 #if defined(C_SDL2)
 #include "../../vs/sdl/src/cdrom/SDL_cdrom.c"
-#if defined(WIN32)
+#if C_HEADLESS /* no host drives */
+#define SDL_CDROM_DUMMY
+#include "../../vs/sdl/src/cdrom/dummy/SDL_syscdrom.c"
+#elif defined(WIN32)
 #define SDL_CDROM_WIN32
 #include "../../vs/sdl/src/cdrom/win32/SDL_syscdrom.c"
 #elif defined(LINUX)
