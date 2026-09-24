@@ -24,3 +24,8 @@ libgui_a_SOURCES += \
 	menu_macos.mm
 endif
 
+if C_HEADLESS
+libgui_a_SOURCES += \
+	sdl_headless.cpp
+endif
+

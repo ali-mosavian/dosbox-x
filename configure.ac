@@ -518,6 +518,12 @@ AC_ARG_ENABLE([sdl2],
   [enable_sdl2=no]
 )
 
+AC_ARG_ENABLE([headless],
+  [AS_HELP_STRING([--enable-headless],[Build DOSBox-X with no display, input or sound device, and no SDL library])],
+  [enable_headless=yes],
+  [enable_headless=no]
+)
+
 AC_ARG_ENABLE([sdl3],
   [AS_HELP_STRING([--enable-sdl3],[Build DOSBox-X using SDL3])],
   [enable_sdl3=yes],
@@ -538,7 +544,15 @@ AM_PATH_SDL($SDL_VERSION)
 
 dnl LIBRARY USE: SDL selection
 
-if test x"$enable_sdl3" = xyes; then
+AH_TEMPLATE(C_HEADLESS,[Define to 1 to implement SDL2 in-tree, with no devices])
+if test x"$enable_headless" = xyes; then
+    dnl SDL2's headers from the tree give the types; src/gui/sdl_headless.cpp the functions.
+    SDL_STRING="SDL2"
+    CPPFLAGS="$CPPFLAGS -I`cd $srcdir && pwd`/vs/sdl2/include -D_THREAD_SAFE"
+    AC_DEFINE(C_SDL2,1)
+    AC_DEFINE(C_HEADLESS,1)
+    AC_MSG_NOTICE([Building headless, without an SDL library])
+elif test x"$enable_sdl3" = xyes; then
     AC_MSG_NOTICE([--enable-sdl3 specified, trying SDL3])
     if test -n "$SDL3_LIBS"; then
         SDL_STRING="SDL3"
@@ -585,6 +599,7 @@ else
 fi
 
 AC_SUBST([SDL_STRING])
+AM_CONDITIONAL(C_HEADLESS, test x"$enable_headless" = xyes)
 
 AH_TEMPLATE(C_GAMELINK,[Define to 1 to enable game link headless mode])
 AC_CHECK_LIB(rt, main, have_rt_lib=yes, have_rt_lib=no , )
@@ -649,8 +664,9 @@ AC_MSG_CHECKING([for Metal support])
 
 have_metal=no
 
-case "$host_os" in
-  darwin*)
+dnl A headless build has no display to render to.
+case "$enable_headless:$host_os" in
+  no:darwin*)
     AC_LANG_PUSH([Objective C++])
     save_LIBS="$LIBS"
     LIBS="$LIBS -framework Metal -framework QuartzCore"
