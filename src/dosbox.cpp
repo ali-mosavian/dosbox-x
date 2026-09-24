@@ -54,6 +54,7 @@
 #include "dosbox.h"
 #include "debug.h"
 #include "debug/debug_socket.h"
+#include "dosrun.h"
 #include "cpu.h"
 #include "logging.h"
 #include "menudef.h"
@@ -521,6 +522,7 @@ static Bitu Normal_Loop(void) {
                 GFX_Events();
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
                     TIMER_AddTick();
+                    DOSRUN_Tick();
                     ticksRemain--;
                 } else {
                     increaseticks();

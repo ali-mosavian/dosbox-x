@@ -28,6 +28,7 @@
 #include "regs.h"
 #include "control.h"
 #include "shell.h"
+#include "dosrun.h"
 #include "menu.h"
 #include "cpu.h"
 #include "callback.h"
@@ -1295,14 +1296,17 @@ void DOS_Shell::Run(void) {
 			}
 #endif
 
-			if (echo) ShowPrompt();
-			InputCommand(input_line);
-			if (echo && !input_eof) WriteOut("\n");
+			if (DOSRUN_ShellInput(input_line, CMD_MAXLINE)) {
+			} else {
+				if (echo) ShowPrompt();
+				InputCommand(input_line);
+				if (echo && !input_eof) WriteOut("\n");
 
-			/* Bugfix: CTTY NUL will return immediately, the shell input will return
-			 *         immediately, and if we don't consume CPU cycles to compensate,
-			 *         will leave DOSBox-X running in an endless loop, hung. */
-			if (input_eof) CALLBACK_Idle();
+				/* Bugfix: CTTY NUL will return immediately, the shell input will return
+				 *         immediately, and if we don't consume CPU cycles to compensate,
+				 *         will leave DOSBox-X running in an endless loop, hung. */
+				if (input_eof) CALLBACK_Idle();
+			}
 		}
 
 		/* do it */

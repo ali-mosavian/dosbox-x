@@ -25,6 +25,7 @@
 #include "mem.h"
 #include "inout.h"
 #include "int10.h"
+#include "dosrun.h"
 #include "shiftjis.h"
 #include "callback.h"
 #include "dos_inc.h"
@@ -1039,6 +1040,7 @@ void INT10_ScrollWindow(uint8_t rul,uint8_t cul,uint8_t rlr,uint8_t clr,int8_t n
     if(cul>clr) return;
     if(rlr>=nrows) rlr=(uint8_t)nrows-1;
     if(clr>=ncols) clr=(uint8_t)ncols-1;
+    DOSRUN_BeforeScroll(rul,cul,rlr,clr,nlines,page);
     clr++;
 
     /* Get the correct page: current start address for current page (0xFF),
