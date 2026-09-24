@@ -104,7 +104,15 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 	if (found) {
 		DEBUG_Symbols().ClearProgram(program);
 		DEBUG_Symbols().AddDebugInfo(info,program);
-		DEBUG_Symbols().AddSegments(info.segments,loadLinear,imageBytes,program,psp);
+		/* The layout is the linker's: its .MAP lists every segment with its
+		 * class, where debug info may list some -- CV3 one per module. */
+		LinkMapFile map;
+		std::vector<DebugSegment> layout = info.segments;
+		if (ReadSidecar(program,".MAP",data)) {
+			DEBUG_ParseLinkMap(std::string((const char*)data.data(),data.size()),program,map);
+			if (!map.segments.empty()) layout = DEBUG_LinkMapSegments(map);
+		}
+		DEBUG_Symbols().AddSegments(layout,loadLinear,imageBytes,program,psp);
 		LOG_MSG("DEBUG: %s carries %u %s symbols, loaded at segment %04X",
 		        program,(unsigned int)info.symbols.size(),info.version.c_str(),loadSeg);
 		dos.errorcode = saved_errorcode;

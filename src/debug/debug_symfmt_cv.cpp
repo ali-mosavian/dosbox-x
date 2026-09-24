@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 
 static const char * const CV_SIGNATURES[] = {
 	"NB00","NB01","NB02","NB03","NB04","NB05","NB06","NB07","NB08","NB09","NB10","NB11"
@@ -86,13 +87,14 @@ static std::vector<CvDirEntry> ReadDirectory(const DebugBytes &data,uint64_t bas
 		return entries;
 	}
 
-	/* CV3 has no directory header: a bare u16 count followed by 12-byte
-	 * entries whose length field is 16-bit. */
+	/* CV3 has no directory header: a bare u16 count followed by 10-byte
+	 * entries whose length field is 16-bit (Open Watcom's cv3_dir_entry;
+	 * measured on BC 4.5 + LINK 3.69). */
 	if (isCv3) {
 		const uint16_t count = data.u16((size_t)at);
 		for (uint16_t i = 0;i < count;i++) {
-			const uint64_t off = at + 2u + (uint64_t)i * 12u;
-			if (off + 12u > data.size()) break;
+			const uint64_t off = at + 2u + (uint64_t)i * 10u;
+			if (off + 10u > data.size()) break;
 			CvDirEntry entry;
 			entry.subsection = data.u16((size_t)off);
 			entry.moduleIndex = data.u16((size_t)off + 2);
@@ -554,6 +556,242 @@ std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t mod
 	return out;
 }
 
+/*
+ * CV3 (NB00-NB02), in the layouts of Open Watcom's hll.h (cv3_*), measured
+ * against BC 4.5 + LINK 3.69. A segment here is a paragraph of the load
+ * image, not an index into a segment map, and records are relative to their
+ * module's code segment. The reader builds the segment map CV3 lacks, so the
+ * rest of the pipeline addresses CV3 and CV4 alike.
+ */
+enum {
+	sst3Modules = 0x101,
+	sst3Publics = 0x102,
+	sst3Symbols = 0x104,
+	sst3SrcLines = 0x105,
+	sst3SrcLnSeg = 0x109
+};
+
+enum {
+	S3_BLOCK = 0x00,
+	S3_PROC = 0x01,
+	S3_END = 0x02,
+	S3_BPREL = 0x04,
+	S3_STATIC = 0x05,
+	S3_LABEL = 0x0B,
+	S3_REGISTER = 0x0D,
+	S3_CHANGESEG = 0x11
+};
+
+/* SegInfo {seg, offset, cb}, ovl, iLib, cSeg, reserved, name, then the
+ * other cSeg-1 SegInfos. LINK 3.69 writes cSeg 0 with SegInfo filled in. */
+static bool ParseModule3(const DebugBytes &body,uint16_t index,CvModule &out)
+{
+	if (body.size() < 13) return false;
+	out.index = index;
+	CvSegInfo first;
+	first.segment = body.u16(0);
+	first.offset = body.u16(2);
+	first.length = body.u16(4);
+	if (first.length != 0) out.segments.push_back(first);
+	const uint8_t cSeg = body.u8(10);
+	size_t at = 0;
+	out.name = body.pstr(12,&at);
+	for (uint8_t i = 1;i < cSeg && at + 6 <= body.size();i++,at += 6) {
+		CvSegInfo more;
+		more.segment = body.u16(at);
+		more.offset = body.u16(at + 2);
+		more.length = body.u16(at + 4);
+		out.segments.push_back(more);
+	}
+	return true;
+}
+
+/* LINK 3.69 gives an absolute public type 1 -- every row its .MAP marks
+ * Abs, and nothing else (CV3's own types start at 0x80). Its value is a
+ * constant, not an address: kept, B$LENDRW named BC's main module code. */
+static const uint16_t CV3_ABSOLUTE_PUBLIC = 0x0001;
+
+static void ParsePublics3(const DebugBytes &body,uint16_t moduleIndex,std::vector<CvSymbol> &out)
+{
+	for (size_t at = 0;at + 7 <= body.size();) {
+		CvSymbol symbol;
+		symbol.offset = body.u16(at);
+		symbol.segment = body.u16(at + 2);
+		const uint16_t type = body.u16(at + 4);
+		symbol.kind = CV_SYM_PUBLIC;
+		symbol.moduleIndex = moduleIndex;
+		symbol.name = body.pstr(at + 6,&at);
+		if (!symbol.name.empty() && type != CV3_ABSOLUTE_PUBLIC) out.push_back(symbol);
+	}
+}
+
+/* Records are {length, code, fields}, the length counting from the code.
+ * A proc's locals sit between it and its end; blocks around and inside it
+ * are only counted, as in the CV4 reader. */
+static void ParseSymbols3(const DebugBytes &body,uint16_t moduleIndex,uint16_t codeSegment,CvInfo &out)
+{
+	uint16_t segment = codeSegment;
+	std::vector<bool> nesting;	/* true for a proc */
+	CvScope open;
+	bool inProc = false;
+
+	for (size_t at = 0;at + 2 <= body.size();) {
+		const uint8_t length = body.u8(at);
+		if (length == 0) break;
+		const uint8_t code = body.u8(at + 1);
+		const size_t data = at + 2;
+		CvSymbol symbol;
+		symbol.moduleIndex = moduleIndex;
+		CvLocal local;
+
+		switch (code) {
+		case S3_BLOCK:
+			nesting.push_back(false);
+			break;
+		case S3_PROC:
+			symbol.kind = CV_SYM_PROC;
+			symbol.segment = segment;
+			symbol.offset = body.u16(data);
+			symbol.size = body.u16(data + 4);
+			symbol.hasSize = true;
+			symbol.name = body.pstr(data + 13);
+			out.symbols.push_back(symbol);
+			if (!inProc) {
+				open = CvScope();
+				open.moduleIndex = moduleIndex;
+				open.segment = segment;
+				open.offset = symbol.offset;
+				open.length = symbol.size;
+				open.function = symbol.name;
+				inProc = true;
+			}
+			nesting.push_back(true);
+			break;
+		case S3_END:
+			if (nesting.empty()) break;
+			if (nesting.back() && inProc &&
+			    std::find(nesting.begin(),nesting.end() - 1,true) == nesting.end() - 1) {
+				out.scopes.push_back(open);
+				inProc = false;
+			}
+			nesting.pop_back();
+			break;
+		case S3_BPREL:
+			local.frameOffset = (int32_t)(int16_t)body.u16(data);
+			local.name = body.pstr(data + 4);
+			if (inProc && !local.name.empty()) open.locals.push_back(local);
+			break;
+		case S3_REGISTER:
+			local.storage = CV_LOCAL_REGISTER;
+			local.reg = body.u8(data + 2);
+			local.name = body.pstr(data + 3);
+			if (inProc && !local.name.empty()) open.locals.push_back(local);
+			break;
+		case S3_STATIC:
+			symbol.kind = inProc ? CV_SYM_LOCAL_DATA : CV_SYM_GLOBAL_DATA;
+			symbol.offset = body.u16(data);
+			symbol.segment = body.u16(data + 2);
+			symbol.name = body.pstr(data + 6);
+			if (!symbol.name.empty()) out.symbols.push_back(symbol);
+			break;
+		case S3_LABEL:
+			symbol.kind = CV_SYM_LABEL;
+			symbol.segment = segment;
+			symbol.offset = body.u16(data);
+			symbol.name = body.pstr(data + 3);
+			if (!symbol.name.empty()) out.symbols.push_back(symbol);
+			break;
+		case S3_CHANGESEG:
+			segment = body.u16(data);
+			break;
+		default:
+			break;
+		}
+		at += 1u + length;
+	}
+}
+
+/* sstSrcLines: {file, count, {line, offset}...} repeated, in the module's
+ * code segment. sstSrcLnSeg names the segment after the file. */
+static void ParseLines3(const DebugBytes &body,uint16_t moduleIndex,uint16_t codeSegment,bool withSegment,
+                        std::vector<CvLineTable> &out)
+{
+	for (size_t at = 0;at < body.size();) {
+		CvLineTable table;
+		table.moduleIndex = moduleIndex;
+		table.file = body.pstr(at,&at);
+		table.segment = codeSegment;
+		if (withSegment) {
+			table.segment = body.u16(at);
+			at += 2;
+		}
+		const uint16_t count = body.u16(at);
+		at += 2;
+		if (at + (size_t)count * 4u > body.size()) break;
+		for (uint16_t i = 0;i < count;i++,at += 4) {
+			CvLine line;
+			line.line = body.u16(at);
+			line.offset = body.u16(at + 2);
+			table.lines.push_back(line);
+		}
+		if (!table.lines.empty()) out.push_back(table);
+	}
+}
+
+static void ParseCodeView3(const DebugBytes &data,uint64_t base,CvInfo &out)
+{
+	std::map<uint16_t,uint16_t> codeSegment;	/* module -> paragraph */
+	std::set<uint16_t> paragraphs;
+	std::vector<std::pair<const CvDirEntry *,DebugBytes> > rest;
+
+	for (size_t i = 0;i < out.directory.size();i++) {
+		const CvDirEntry &entry = out.directory[i];
+		const uint64_t at = base + entry.offset;
+		if (at + entry.length > data.size()) {
+			out.warnings.push_back(SymFormat("subsection %x runs past end of file",(unsigned int)entry.subsection));
+			continue;
+		}
+		const DebugBytes body = data.sub((size_t)at,entry.length);
+		CvModule module;
+		if (entry.subsection == sst3Modules && ParseModule3(body,entry.moduleIndex,module)) {
+			for (size_t s = 0;s < module.segments.size();s++) {
+				if (s == 0) codeSegment[module.index] = module.segments[s].segment;
+				paragraphs.insert(module.segments[s].segment);
+			}
+			out.modules.push_back(module);
+		} else {
+			rest.push_back(std::make_pair(&entry,body));
+		}
+	}
+
+	for (size_t i = 0;i < rest.size();i++) {
+		const CvDirEntry &entry = *rest[i].first;
+		const DebugBytes &body = rest[i].second;
+		const uint16_t code = codeSegment[entry.moduleIndex];
+		switch (entry.subsection) {
+		case sst3Publics: ParsePublics3(body,entry.moduleIndex,out.symbols); break;
+		case sst3Symbols: ParseSymbols3(body,entry.moduleIndex,code,out); break;
+		case sst3SrcLines: ParseLines3(body,entry.moduleIndex,code,false,out.lines); break;
+		case sst3SrcLnSeg: ParseLines3(body,entry.moduleIndex,code,true,out.lines); break;
+		default: break;
+		}
+	}
+
+	/* The segment map CV3 lacks, for addressing only: every paragraph
+	 * anything is addressed in. No extents, so no layout: a module lists one
+	 * segment, and rtinit.asm's code in INIT_CODE went unlisted, so what CV3
+	 * calls code is not all the code. */
+	for (size_t i = 0;i < out.symbols.size();i++) paragraphs.insert(out.symbols[i].segment);
+	for (size_t i = 0;i < out.lines.size();i++) paragraphs.insert(out.lines[i].segment);
+	for (std::set<uint16_t>::const_iterator it = paragraphs.begin();it != paragraphs.end();++it) {
+		CvSegMapEntry entry;
+		entry.index = *it;
+		entry.frame = *it;
+		out.segments.push_back(entry);
+	}
+	out.warnings.push_back(out.signature + " types are not read");
+}
+
 bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out)
 {
 	uint64_t base = 0;
@@ -565,15 +803,9 @@ bool DEBUG_ParseCodeView(const DebugBytes &data,CvInfo &out)
 
 	const bool isCv3 = signature == "NB00" || signature == "NB01" || signature == "NB02";
 	out.directory = ReadDirectory(data,base,isCv3,out.warnings);
-	if (isCv3) {
-		/* The CV3 subsection numbers are known; their record layouts are not,
-		 * and no CV3 binary was available to measure against. Say so rather
-		 * than reporting whatever the CV4 readers make of the bytes. */
-		out.warnings.push_back(signature + " is a pre-CV4 layout; only the subsection directory is read");
-		return true;
-	}
+	if (isCv3) ParseCodeView3(data,base,out);
 
-	for (size_t i = 0;i < out.directory.size();i++) {
+	for (size_t i = 0;i < out.directory.size() && !isCv3;i++) {
 		const CvDirEntry &entry = out.directory[i];
 		const uint64_t at = base + entry.offset;
 		if (at + entry.length > data.size()) {
