@@ -26,6 +26,9 @@ void DOSRUN_Tick(void);
  * nlines < 0 scrolls up, 0 clears. */
 void DOSRUN_BeforeScroll(uint8_t rul, uint8_t cul, uint8_t rlr, uint8_t clr, int8_t nlines, uint8_t page);
 
+/* A program wrote n bytes to its handle `entry`, open on `name`. */
+void DOSRUN_Wrote(uint16_t entry, const char *name, bool device, const uint8_t *data, uint16_t n);
+
 /* True in a job's child: the core then reports where execution lands. */
 extern bool dosrun_watch;
 

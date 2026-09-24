@@ -31,6 +31,7 @@
 #include "mem.h"
 #include "regs.h"
 #include "dos_inc.h"
+#include "dosrun.h"
 #include "drives.h"
 #include "cross.h"
 #include "control.h"
@@ -863,6 +864,8 @@ bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fc
 	uint16_t towrite=*amount;
 	bool ret=Files[handle]->Write(data,&towrite);
 	*amount=towrite;
+	if (ret && !fcb)
+		DOSRUN_Wrote(entry,Files[handle]->GetName(),(Files[handle]->GetInformation() & 0x80) != 0,data,towrite);
 	return ret;
 }
 

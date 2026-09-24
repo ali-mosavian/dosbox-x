@@ -10,6 +10,10 @@
  * Events, one JSON object per line on DOSRUN_FD:
  *   {"ev":"ready"}                        from the server, once booted
  *   {"ev":"line","text":...}             a line of screen output, as it is finished
+ *   {"ev":"out","handle":N,"file":...,"text":...}
+ *                                        bytes written to standard output or error
+ *                                        redirected to a file, sent within an
+ *                                        emulated millisecond of being written
  *   {"ev":"screen","rows":[...]}         the screen when the job ends
  *   {"ev":"crash","kind":...,"at":{...}} execution went where code cannot be
  *   {"ev":"state",...}                   registers, source line and last branches,
@@ -69,6 +73,9 @@ std::deque<std::string> lines;
 uint64_t limit_ms = 0, ran_ms = 0;
 volatile sig_atomic_t wall_expired = 0;
 int upto = 0; /* rows above this one are in the transcript */
+/* Redirected output not yet sent: programs write it a byte at a time. */
+uint16_t out_handle = 0;
+std::string out_file, out_text;
 bool watch = true;
 uint32_t booted_ivt[8];
 uint32_t owned_lo = 1, owned_hi = 0; /* the last owned block found, [lo, hi) */
@@ -126,6 +133,13 @@ void follow_cursor() {
     int cur = cursor_row();
     for (int row = upto; row < cur; row++) emit_row(row, true);
     upto = cur;
+}
+
+void flush_output() {
+    if (out_text.empty()) return;
+    emit("{\"ev\":\"out\",\"handle\":" + std::to_string(out_handle) + ",\"file\":" + quoted(out_file) +
+         ",\"text\":" + quoted(out_text) + "}");
+    out_text.clear();
 }
 
 std::string hex(uint32_t value) {
@@ -207,6 +221,7 @@ bool owned(uint32_t linear) {
 }
 
 [[noreturn]] void finish(const char *reason) {
+    flush_output();
     follow_cursor();
     emit_row(upto, false);
     std::string screen = "{\"ev\":\"screen\",\"rows\":[";
@@ -304,9 +319,21 @@ void DOSRUN_Halt(void) {
     if (!GETFLAG(IF)) crash("halt with interrupts off", SegValue(cs), SegPhys(cs) + reg_eip);
 }
 
+void DOSRUN_Wrote(uint16_t entry, const char *name, bool device, const uint8_t *data, uint16_t n) {
+    /* on a device, the output is on the screen and in the transcript already */
+    if (!child || device || (entry != 1 && entry != 2) || n == 0) return;
+    std::string file = name ? name : "";
+    if (entry != out_handle || file != out_file) flush_output();
+    out_handle = entry;
+    out_file = file;
+    out_text.append((const char *)data, n);
+    if (out_text.size() >= 4096) flush_output();
+}
+
 void DOSRUN_Tick(void) {
     if (!child) return;
     ran_ms++;
+    flush_output();
     follow_cursor();
     if (limit_ms && ran_ms >= limit_ms) finish("limit");
     if (wall_expired) finish("wall");
