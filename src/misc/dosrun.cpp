@@ -5,6 +5,12 @@
  *   :ms N      stop after N emulated milliseconds
  *   :wall N    stop after N host seconds
  *   :nowatch   do not stop on a crash
+ *   :keep      on a clean exit, keep the machine: the child becomes the server
+ *              and later jobs fork from its state -- mounts, current
+ *              directory, environment, anything resident
+ *   :pop       alone in a job: drop the kept machine, back to the one before
+ *   :cwd, :env, :drives, :ls [PATTERN]
+ *              queries, answered in order with the command lines
  *   anything else is a shell command line, run in order
  *
  * Events, one JSON object per line on DOSRUN_FD:
@@ -20,7 +26,10 @@
  *                                        unless the job simply exited
  *   {"ev":"end","reason":...,...}        exit | crash | limit | wall, with emulated ms,
  *                                        host CPU ms and CS:EIP
- *   {"ev":"done","status":N,"signal":N}  from the server, once the child is reaped
+ *   {"ev":"query","q":...,"result":...}  a query's answer, from DOS's own state
+ *   {"ev":"done","status":N,"signal":N}  from the server, once the child is reaped;
+ *                                        with "kept":true from a :keep child
+ *                                        that now serves
  *
  * The transcript follows the cursor and the BIOS scroll, not any output call:
  * a program may write video memory directly, but its cursor still moves and
@@ -81,6 +90,9 @@ int upto = 0; /* rows above this one are in the transcript */
 uint16_t out_handle = 0;
 std::string out_file, out_text;
 bool watch = true;
+bool keep = false;
+bool forked = false; /* this process shares an older one's host state */
+unsigned depth = 0;  /* kept machines below this one */
 double fork_cpu_ms = 0; /* a child's rusage starts at zero on Linux, not everywhere */
 uint32_t booted_ivt[8];
 uint32_t owned_lo = 1, owned_hi = 0; /* the last owned block found, [lo, hi) */
@@ -209,7 +221,14 @@ bool owned(uint32_t linear) {
     return linear >= 0xC0000;
 }
 
+void report(const char *reason);
+
 [[noreturn]] void finish(const char *reason) {
+    report(reason);
+    _exit(0); /* the child shares the server's host state; run no destructors */
+}
+
+void report(const char *reason) {
     flush_output();
     follow_cursor();
     emit_row(upto, false);
@@ -226,37 +245,119 @@ bool owned(uint32_t linear) {
     snprintf(end, sizeof end, "{\"ev\":\"end\",\"reason\":\"%s\",\"exit_code\":%u,\"ms\":%llu,\"cpu_ms\":%.1f,\"cs\":%u,\"eip\":%u}",
              reason, (unsigned)dos.return_code, (unsigned long long)ran_ms, cpu_ms, (unsigned)SegValue(cs), (unsigned)reg_eip);
     emit(end);
-    _exit(0); /* the child shares the server's host state; run no destructors */
 }
 
 void on_alarm(int) { wall_expired = 1; }
 
+/* Unbuffered: a kept child takes over reading, and a stdio buffer would
+ * leave each process a different copy of what was read ahead. */
+bool read_line(std::string &line) {
+    line.clear();
+    char c;
+    for (;;) {
+        ssize_t n = read(0, &c, 1);
+        if (n <= 0) return false;
+        if (c == '\n') return true;
+        if (c != '\r') line += c;
+    }
+}
+
 /* False at end of input. */
-bool read_job(unsigned &wall) {
+bool read_job(unsigned &wall, bool &pop) {
     lines.clear();
     limit_ms = 0;
     wall = 0;
     watch = true;
-    char buf[1024];
-    while (fgets(buf, sizeof buf, stdin)) {
-        buf[strcspn(buf, "\r\n")] = 0;
-        if (!strcmp(buf, ".")) return true;
-        if (!strncmp(buf, ":ms ", 4)) limit_ms = strtoull(buf + 4, NULL, 10);
-        else if (!strncmp(buf, ":wall ", 6)) wall = (unsigned)strtoul(buf + 6, NULL, 10);
-        else if (!strcmp(buf, ":nowatch")) watch = false;
+    keep = false;
+    pop = false;
+    std::string buf;
+    while (read_line(buf)) {
+        if (buf == ".") return true;
+        if (!buf.compare(0, 4, ":ms ")) limit_ms = strtoull(buf.c_str() + 4, NULL, 10);
+        else if (!buf.compare(0, 6, ":wall ")) wall = (unsigned)strtoul(buf.c_str() + 6, NULL, 10);
+        else if (buf == ":nowatch") watch = false;
+        else if (buf == ":keep") keep = true;
+        else if (buf == ":pop") pop = true;
         else lines.push_back(buf);
     }
     return false;
 }
 
+std::string two(unsigned value) {
+    char b[8];
+    snprintf(b, sizeof b, "%02u", value % 100);
+    return b;
+}
+
+/* A query line's answer, as JSON, or empty when the line is not a query. */
+std::string query(const std::string &line) {
+    const std::string name = line.substr(1, line.find(' ') == std::string::npos ? std::string::npos : line.find(' ') - 1);
+    const std::string arg = line.find(' ') == std::string::npos ? "" : line.substr(line.find(' ') + 1);
+    std::string result;
+    if (name == "cwd") {
+        char dir[DOS_PATHLENGTH] = {0};
+        const uint8_t drive = DOS_GetDefaultDrive();
+        DOS_GetCurrentDir(0, dir, false);
+        result = quoted(std::string(1, (char)('A' + drive)) + ":\\" + dir);
+    } else if (name == "env") {
+        result = "{";
+        PhysPt at = PhysMake(DOS_PSP(dos.psp()).GetEnvironment(), 0);
+        for (bool first = true; mem_readb(at); first = false) {
+            std::string entry;
+            for (uint8_t c; (c = mem_readb(at++)) != 0;) entry += (char)c;
+            const size_t eq = entry.find('=');
+            result += (first ? "" : ",") + quoted(entry.substr(0, eq)) + ":" +
+                      quoted(eq == std::string::npos ? "" : entry.substr(eq + 1));
+        }
+        result += "}";
+    } else if (name == "drives") {
+        result = "{";
+        for (int i = 0, n = 0; i < DOS_DRIVES; i++)
+            if (Drives[i]) result += (n++ ? "," : "") + quoted(std::string(1, (char)('A' + i))) + ":" + quoted(Drives[i]->GetInfo());
+        result += "}";
+    } else if (name == "ls") {
+        /* the search leaves no trace: its own DTA, and DOS's error code as it was */
+        const uint16_t saved_error = dos.errorcode;
+        const RealPt saved_dta = dos.dta();
+        dos.dta(dos.tables.tempdta);
+        result = "[";
+        bool more = DOS_FindFirst(arg.empty() ? "*.*" : arg.c_str(), DOS_ATTR_DIRECTORY | DOS_ATTR_HIDDEN | DOS_ATTR_SYSTEM);
+        for (int n = 0; more; n++, more = DOS_FindNext()) {
+            char fname[DOS_NAMELENGTH_ASCII], lname[LFN_NAMELENGTH + 1];
+            uint32_t size, hsize;
+            uint16_t date, time;
+            uint8_t attr;
+            DOS_DTA(dos.dta()).GetResult(fname, lname, size, hsize, date, time, attr);
+            result += (n ? "," : "") + std::string("{\"name\":") + quoted(fname) + ",\"size\":" + std::to_string(size) +
+                      ",\"attr\":" + std::to_string(attr) + ",\"dir\":" + ((attr & DOS_ATTR_DIRECTORY) ? "true" : "false") +
+                      ",\"date\":\"" + std::to_string(((date >> 9) & 0x7f) + 1980) + "-" + two((date >> 5) & 0xf) + "-" +
+                      two(date & 0x1f) + "\",\"time\":\"" + two(time >> 11) + ":" + two((time >> 5) & 0x3f) + ":" +
+                      two((time & 0x1f) * 2) + "\"}";
+        }
+        result += "]";
+        dos.dta(saved_dta);
+        dos.errorcode = saved_error;
+    } else {
+        return "";
+    }
+    return "{\"ev\":\"query\",\"q\":" + quoted(name) + (arg.empty() ? "" : ",\"arg\":" + quoted(arg)) +
+           ",\"result\":" + result + "}";
+}
+
 void serve() {
-    emit("{\"ev\":\"ready\"}");
     for (;;) {
         unsigned wall;
-        if (!read_job(wall)) _exit(0);
+        bool pop;
+        if (!read_job(wall, pop)) _exit(0);
+        if (pop) {
+            if (depth) _exit(0); /* the server below reports it, as its child's end */
+            emit("{\"ev\":\"done\",\"status\":-1,\"signal\":0,\"error\":\"nothing kept to pop\"}");
+            continue;
+        }
         pid_t pid = fork();
         if (pid == 0) {
             child = true;
+            forked = true;
             struct rusage usage;
             getrusage(RUSAGE_SELF, &usage);
             fork_cpu_ms = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e3 +
@@ -285,8 +386,29 @@ void serve() {
 
 bool DOSRUN_ShellInput(char *line, unsigned int size) {
     if (!active()) return false;
-    if (!child) serve();
-    if (lines.empty()) finish("exit");
+    if (!child) {
+        emit("{\"ev\":\"ready\"}");
+        serve();
+    }
+    for (;;) {
+        while (!lines.empty() && lines.front()[0] == ':') {
+            const std::string answer = query(lines.front());
+            emit(answer.empty() ? "{\"ev\":\"query\",\"q\":" + quoted(lines.front()) + ",\"error\":\"unknown\"}" : answer);
+            lines.pop_front();
+        }
+        if (!lines.empty()) break;
+        if (!keep) finish("exit");
+        /* Kept: this machine serves from here, at the prompt it reached. */
+        report("exit");
+        emit("{\"ev\":\"done\",\"status\":0,\"signal\":0,\"kept\":true}");
+        child = false;
+        dosrun_watch = false;
+        alarm(0);
+        wall_expired = 0;
+        ran_ms = 0;
+        depth++;
+        serve(); /* returns in the child of the next job */
+    }
     snprintf(line, size, "%s", lines.front().c_str());
     lines.pop_front();
     return true;
@@ -294,7 +416,7 @@ bool DOSRUN_ShellInput(char *line, unsigned int size) {
 
 bool dosrun_watch = false;
 
-bool DOSRUN_Child(void) { return child; }
+bool DOSRUN_Forked(void) { return forked; }
 
 void DOSRUN_Executes(uint32_t cs, uint32_t linear) {
     if (cpu.pmode) return;

@@ -5886,7 +5886,7 @@ bool gfx_in_mapper = false;
 #endif
 
 void GFX_Events() {
-    if (DOSRUN_Child()) return; /* a forked child has no host front end */
+    if (DOSRUN_Forked()) return; /* a forked process has no host front end */
     CheckMapperKeyboardLayout();
 #if defined(C_SDL2) /* SDL 2.x---------------------------------- */
     //Don't poll too often. This can be heavy on the OS, especially Macs.

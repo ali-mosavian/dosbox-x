@@ -15,9 +15,11 @@
 /* The shell wants a console line. True when dosrun supplied one. */
 bool DOSRUN_ShellInput(char *line, unsigned int size);
 
-/* True in a job's child. It shares the server's host state, so it must not
- * touch the host front end: macOS kills a forked child that enters a run loop. */
-bool DOSRUN_Child(void);
+/* True in any process forked from the booted one: a job's child, or a kept
+ * machine serving jobs. It shares an older process's host state, so it must
+ * not touch the host front end: macOS kills a forked process that enters a
+ * run loop. */
+bool DOSRUN_Forked(void);
 
 /* One emulated millisecond passed. */
 void DOSRUN_Tick(void);
