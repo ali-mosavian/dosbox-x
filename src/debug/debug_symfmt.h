@@ -421,6 +421,10 @@ struct LinkMapPublic {
 	LinkMapAddress address;
 };
 
+/* The linkers' convention, MS LINK's, TLINK's and WLINK's alike: a segment
+ * whose class name ends in CODE holds code. */
+bool DEBUG_IsCodeClass(const std::string &className);
+
 struct LinkMapFile {
 	std::string sourceName;
 	std::vector<LinkMapSegment> segments;
@@ -555,6 +559,15 @@ struct DebugScope {
 	std::vector<DebugLocal> locals;
 };
 
+/* A segment the program was linked with, load-relative. `code` is the format's
+ * own statement that it holds instructions; each reader translates its
+ * format's way of saying so. */
+struct DebugSegment {
+	uint32_t imageOffset = 0;
+	uint32_t endOffset = 0;
+	bool code = false;
+};
+
 struct DebugInfo {
 	std::string file;
 	DebugFormatId format = DEBUG_FORMAT_CODEVIEW;
@@ -564,6 +577,7 @@ struct DebugInfo {
 	std::vector<DebugSymbol> symbols;
 	std::vector<DebugLine> lines;
 	std::vector<DebugScope> scopes;
+	std::vector<DebugSegment> segments;
 	std::vector<std::string> warnings;
 };
 
@@ -582,6 +596,9 @@ std::map<uint16_t,uint32_t> DEBUG_CvSegmentBases(const CvInfo &info);
  * the path matters and not only the bytes. */
 bool DEBUG_ParseDebugInfo(const char *file,uint32_t loadLinear,DebugInfo &out);
 bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out);
+
+/* A map's segments, load-relative, code by DEBUG_IsCodeClass. */
+std::vector<DebugSegment> DEBUG_LinkMapSegments(const LinkMapFile &map);
 
 /* The source line covering a load-relative offset, if any line covers it. */
 const DebugLine *DEBUG_SourceLineAt(const DebugInfo &info,uint32_t imageOffset);

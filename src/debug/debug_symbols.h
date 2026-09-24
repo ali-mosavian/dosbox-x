@@ -14,7 +14,7 @@
 /* Called by the DOS EXEC loader once the image is in memory: reads whatever
  * debug info the program carries and registers it at the address it loaded
  * at. Silent and harmless when there is none. */
-void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg);
+void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes);
 
 #endif
 

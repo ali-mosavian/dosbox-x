@@ -897,7 +897,7 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint16_t flags) {
 	                            iscom ? 0 : head.minmemory,
 	                            iscom ? 0 : head.maxmemory);
 
-	DEBUG_SymbolsOnProgramLoad(name,iscom,loadseg);
+	DEBUG_SymbolsOnProgramLoad(name,iscom,loadseg,pspseg,image_size_bytes);
 #endif
 
 	if ((flags == LOAD) || (flags == LOADNGO)) {

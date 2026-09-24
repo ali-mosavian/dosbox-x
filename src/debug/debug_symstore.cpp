@@ -3,7 +3,9 @@
  */
 
 #include "debug_symstore.h"
+#include "dos_inc.h"
 
+#include <algorithm>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +51,8 @@ void DebugSymbolStore::Clear()
 	symbols.clear();
 	lines.clear();
 	scopes.clear();
+	segments.clear();
+	pieces.clear();
 }
 
 void DebugSymbolStore::ClearProgram(const std::string &program)
@@ -77,6 +81,73 @@ void DebugSymbolStore::ClearProgram(const std::string &program)
 		keptScopes[i].parent = parent >= 0 && (size_t)parent < mapping.size() ? mapping[parent] : -1;
 	}
 	scopes.swap(keptScopes);
+
+	std::vector<DebugProgramSegment> keptSegments;
+	for (size_t i = 0;i < segments.size();i++)
+		if (segments[i].program != program) keptSegments.push_back(segments[i]);
+	segments.swap(keptSegments);
+	Flatten();
+}
+
+void DebugSymbolStore::AddSegments(const std::vector<DebugSegment> &from,uint32_t loadLinear,uint32_t imageBytes,
+                                   const std::string &program,uint16_t psp)
+{
+	if (from.empty()) return;
+	DebugProgramSegment image;
+	image.begin = loadLinear;
+	image.end = loadLinear + imageBytes;
+	image.program = program;
+	image.psp = psp;
+	if (imageBytes) segments.push_back(image);
+	for (size_t i = 0;i < from.size();i++) {
+		DebugProgramSegment segment = image;
+		segment.begin = loadLinear + from[i].imageOffset;
+		segment.end = loadLinear + from[i].endOffset;
+		segment.code = from[i].code;
+		segments.push_back(segment);
+	}
+	Flatten();
+}
+
+void DebugSymbolStore::Flatten()
+{
+	std::vector<uint32_t> bounds;
+	for (size_t i = 0;i < segments.size();i++) {
+		bounds.push_back(segments[i].begin);
+		bounds.push_back(segments[i].end);
+	}
+	std::sort(bounds.begin(),bounds.end());
+	bounds.erase(std::unique(bounds.begin(),bounds.end()),bounds.end());
+
+	pieces.clear();
+	for (size_t b = 0;b + 1 < bounds.size();b++) {
+		const DebugProgramSegment *cover = NULL;
+		for (size_t i = 0;i < segments.size();i++) {
+			const DebugProgramSegment &segment = segments[i];
+			if (segment.begin > bounds[b] || segment.end < bounds[b+1]) continue;
+			if (cover == NULL || (segment.code && !cover->code)) cover = &segment;
+		}
+		if (cover == NULL) continue;
+		DebugProgramSegment piece = *cover;
+		piece.begin = bounds[b];
+		piece.end = bounds[b+1];
+		pieces.push_back(piece);
+	}
+}
+
+static bool BeginsAfter(uint32_t linear,const DebugProgramSegment &piece) { return linear < piece.begin; }
+
+const DebugProgramSegment *DebugSymbolStore::ProgramDataAt(uint32_t linear) const
+{
+	std::vector<DebugProgramSegment>::const_iterator next =
+		std::upper_bound(pieces.begin(),pieces.end(),linear,BeginsAfter);
+	if (next == pieces.begin()) return NULL;
+	const DebugProgramSegment &piece = *(next - 1);
+	if (linear >= piece.end || piece.code) return NULL;
+	/* Another program may have this memory now; its layout is not this one. */
+	uint16_t owner = 0, start = 0, end = 0;
+	if (!DOS_MemoryBlockAt((uint16_t)(linear >> 4),owner,start,end) || owner != piece.psp) return NULL;
+	return &piece;
 }
 
 void DebugSymbolStore::Add(const DebugSymbol &symbol)

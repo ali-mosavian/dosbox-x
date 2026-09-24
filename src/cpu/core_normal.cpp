@@ -172,6 +172,11 @@ static INLINE uint32_t Fetchd() {
 
 #define EALookupTable (core.ea_table)
 
+#if C_DEBUG
+/* Where the last sequential instruction ended, linear. */
+static uint32_t debug_sequential_next = 0;
+#endif
+
 Bits CPU_Core_Normal_Run(void) {
 	if (CPU_Cycles <= 0)
 		return CBRET_NONE;
@@ -198,9 +203,9 @@ Bits CPU_Core_Normal_Run(void) {
 		extern void DEBUG_Socket_ReverseInstructionCheckpoint(void);
 		extern uint32_t debug_socket_normal_core_hooks_active;
 		debug_socket_normal_core_hooks_active = 1;
-		// Branch trace: record non-sequential transfers between instructions.
-		// prev_cseip tracks the linear address at the start of the previous iteration.
-		// A difference > 15 bytes means a branch/call/ret/int occurred.
+		// A transfer is execution that does not start where the previous
+		// instruction ended: a sequential one records its end at SAVEIP
+		// below, and every branch, call, return and interrupt skips it.
 		{
 			static uint32_t prev_cseip = 0;
 			static uint32_t prev_cs_val = 0;
@@ -208,7 +213,7 @@ Bits CPU_Core_Normal_Run(void) {
 			uint32_t cur_cseip  = (uint32_t)core.cseip;
 			uint32_t cur_cs_val = SegValue(cs);
 			if (prev_valid) {
-				const bool transfer = (uint32_t)(cur_cseip - prev_cseip) > 15u;
+				const bool transfer = cur_cseip != debug_sequential_next;
 				if (transfer && DEBUG_Socket_TraceIsEnabled())
 					DEBUG_Socket_TraceRecordBranch(prev_cs_val, prev_cseip,
 					                               cur_cs_val,  cur_cseip);
@@ -290,6 +295,9 @@ restart_opcode:
 			continue;
 		}
 		SAVEIP;
+#if C_DEBUG
+		debug_sequential_next = (uint32_t)core.cseip;
+#endif
 	}
     FillFlags();
     return CBRET_NONE;

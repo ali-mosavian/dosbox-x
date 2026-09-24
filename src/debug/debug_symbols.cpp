@@ -70,7 +70,7 @@ static bool HasAppendedData(const char *program)
 	return size > DEBUG_MzAppendedOffset(mz);
 }
 
-void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg)
+void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes)
 {
 	if (program == NULL) return;
 
@@ -96,6 +96,7 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg)
 	if (found) {
 		DEBUG_Symbols().ClearProgram(program);
 		DEBUG_Symbols().AddDebugInfo(info,program);
+		DEBUG_Symbols().AddSegments(info.segments,loadLinear,imageBytes,program,psp);
 		LOG_MSG("DEBUG: %s carries %u %s symbols, loaded at segment %04X",
 		        program,(unsigned int)info.symbols.size(),info.version.c_str(),loadSeg);
 		dos.errorcode = saved_errorcode;
@@ -111,10 +112,11 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg)
 	if (!isCom && ReadSidecar(program,".MAP",data)) {
 		LinkMapFile map;
 		DEBUG_ParseLinkMap(std::string((const char*)data.data(),data.size()),program,map);
-		if (!map.publics.empty()) {
+		if (!map.publics.empty() || !map.segments.empty()) {
 			DEBUG_Symbols().ClearProgram(program);
 			const size_t before = DEBUG_Symbols().Size();
 			DEBUG_Symbols().AddLinkMap(map,loadLinear,program);
+			DEBUG_Symbols().AddSegments(DEBUG_LinkMapSegments(map),loadLinear,imageBytes,program,psp);
 			LOG_MSG("DEBUG: %s has no appended debug info; its .MAP gives %u symbols at segment %04X",
 			        program,(unsigned int)(DEBUG_Symbols().Size() - before),loadSeg);
 		}

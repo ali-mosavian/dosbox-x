@@ -335,6 +335,11 @@ uint16_t DOS_GetMaximumFreeSize(uint16_t minBlocks);
 bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks);
 bool DOS_ResizeMemory(uint16_t segment,uint16_t * blocks);
 bool DOS_FreeMemory(uint16_t segment);
+/* The DOS memory block holding paragraph `para`, from the conventional chain
+ * or the UMB chain: its owner (0 when free, or when `para` is the block's own
+ * MCB) and its paragraphs [start, end). False when no chain covers `para`: the
+ * kernel below the first MCB, ROM, or past a chain's end. */
+bool DOS_MemoryBlockAt(uint16_t para,uint16_t &owner,uint16_t &start,uint16_t &end);
 void DOS_FreeProcessMemory(uint16_t pspseg);
 uint16_t DOS_GetMemory(uint16_t pages,const char *who=NULL);
 void DOS_Private_UMB_Lock(const bool lock);
@@ -901,7 +906,8 @@ enum DOSDEVERR {
 class DOS_DEVHDR : public MemStruct{/*device driver header*/
 public:
 	DOS_DEVHDR(uint16_t seg) { SetPt(seg); }
-	uint32_t GetNextDriver(void) { return (uint32_t)sGet(hdr,nextdev); }; /* NONEXTDEV if end of list */
+	uint32_t GetNextDriver(void) { return (uint32_t)sGet(hdr,nextdev); };
+ /* NONEXTDEV if end of list */
 	void SetNextDriver(const uint32_t p) { sSave(hdr,nextdev,p); };
 	uint16_t GetAttributes(void) { return (uint16_t)sGet(hdr,attributes); };
 	uint16_t GetStrategyOffset(void) { return (uint16_t)sGet(hdr,strategy_entry); };

@@ -18,7 +18,8 @@
  *   {"ev":"crash","kind":...,"at":{...}} execution went where code cannot be
  *   {"ev":"state",...}                   registers, source line and last branches,
  *                                        unless the job simply exited
- *   {"ev":"end","reason":...,...}        exit | crash | limit | wall, with emulated ms and CS:EIP
+ *   {"ev":"end","reason":...,...}        exit | crash | limit | wall, with emulated ms,
+ *                                        host CPU ms and CS:EIP
  *   {"ev":"done","status":N,"signal":N}  from the server, once the child is reaped
  *
  * The transcript follows the cursor and the BIOS scroll, not any output call:
@@ -34,6 +35,8 @@
  * every transfer and on entering a new page, in real mode:
  *   - memory no one owns: a free DOS block, an MCB header, video memory, or
  *     conventional memory past the end of the chain
+ *   - a program's data: memory its debug info or link map lays out as data,
+ *     or its load image outside any code, while the program still owns it
  *   - empty memory: four bytes of 00 or of FF, which no code starts with
  *   - a fault (#DE, #BR, #UD, #NM) whose vector is still the one the booted
  *     machine had, so the program never meant to handle it
@@ -60,6 +63,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 
 extern bool ticksLocked;
 Bitu FillFlags(void);
@@ -77,6 +81,7 @@ int upto = 0; /* rows above this one are in the transcript */
 uint16_t out_handle = 0;
 std::string out_file, out_text;
 bool watch = true;
+double fork_cpu_ms = 0; /* a child's rusage starts at zero on Linux, not everywhere */
 uint32_t booted_ivt[8];
 uint32_t owned_lo = 1, owned_hi = 0; /* the last owned block found, [lo, hi) */
 
@@ -187,37 +192,21 @@ std::string state() {
     finish("crash");
 }
 
-/* The DOS chain's verdict on a paragraph: 1 owned, 0 free or a header, -1 past its end. */
-int chain_owner(uint16_t first, uint16_t para) {
-    for (uint32_t m = first, blocks = 0; blocks < 4096; blocks++) {
-        DOS_MCB mcb((uint16_t)m);
-        uint8_t type = mcb.GetType();
-        if (type != 'M' && type != 'Z') return 1; /* a broken chain is DOS's report, not this one */
-        uint32_t start = m + 1, end = start + mcb.GetSize();
-        if (para == m) return 0;
-        if (para >= start && para < end) {
-            if (mcb.GetPSPSeg() == 0) return 0;
-            owned_lo = start << 4;
-            owned_hi = end << 4;
-            return 1;
-        }
-        if (type == 'Z' || end > 0xFFFF) return -1;
-        m = end;
-    }
-    return 1;
-}
-
 bool owned(uint32_t linear) {
     if (linear >= 0xA0000 && linear < 0xC0000) return false; /* video memory is never code */
     if (linear >= 0xF0000 || (linear >= owned_lo && linear < owned_hi)) return true;
-    uint16_t para = (uint16_t)(linear >> 4);
+    uint16_t para = (uint16_t)(linear >> 4), owner = 0, start = 0, end = 0;
     if (para < dos.firstMCB) return true; /* the IVT, BIOS data and the DOS kernel */
-    int conventional = chain_owner(dos.firstMCB, para);
-    if (conventional >= 0) return conventional == 1;
-    if (linear < 0xA0000) return false; /* conventional memory past the chain */
-    uint16_t umb = dos_infoblock.GetStartOfUMBChain();
-    /* upper memory outside the UMBs is ROM, the EMS frame or DOS's own */
-    return (umb != 0xFFFF ? chain_owner(umb, para) : -1) != 0;
+    if (DOS_MemoryBlockAt(para, owner, start, end)) {
+        if (owner) {
+            owned_lo = (uint32_t)start << 4;
+            owned_hi = (uint32_t)end << 4;
+        }
+        return owner != 0;
+    }
+    /* past the chain: in conventional memory no one's; above it ROM, the EMS
+     * frame or DOS's own */
+    return linear >= 0xC0000;
 }
 
 [[noreturn]] void finish(const char *reason) {
@@ -228,9 +217,14 @@ bool owned(uint32_t linear) {
     for (int row = 0; row < rows(); row++) screen += (row ? "," : "") + quoted(row_text(row));
     emit(screen + "]}");
     if (strcmp(reason, "exit")) emit(state());
-    char end[160];
-    snprintf(end, sizeof end, "{\"ev\":\"end\",\"reason\":\"%s\",\"exit_code\":%u,\"ms\":%llu,\"cs\":%u,\"eip\":%u}",
-             reason, (unsigned)dos.return_code, (unsigned long long)ran_ms, (unsigned)SegValue(cs), (unsigned)reg_eip);
+    /* host CPU time, not wall time: other load on the host does not count */
+    struct rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+    const double cpu_ms = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e3 +
+                          (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e3 - fork_cpu_ms;
+    char end[200];
+    snprintf(end, sizeof end, "{\"ev\":\"end\",\"reason\":\"%s\",\"exit_code\":%u,\"ms\":%llu,\"cpu_ms\":%.1f,\"cs\":%u,\"eip\":%u}",
+             reason, (unsigned)dos.return_code, (unsigned long long)ran_ms, cpu_ms, (unsigned)SegValue(cs), (unsigned)reg_eip);
     emit(end);
     _exit(0); /* the child shares the server's host state; run no destructors */
 }
@@ -263,6 +257,10 @@ void serve() {
         pid_t pid = fork();
         if (pid == 0) {
             child = true;
+            struct rusage usage;
+            getrusage(RUSAGE_SELF, &usage);
+            fork_cpu_ms = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e3 +
+                          (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e3;
             ticksLocked = true; /* emulated time runs free of host time */
             upto = cursor_row();
             lines.push_front("@echo off"); /* a job runs as a batch file does */
@@ -303,6 +301,7 @@ void DOSRUN_Executes(uint32_t cs, uint32_t linear) {
     uint32_t head = mem_readd(linear);
     if (head == 0 || head == 0xFFFFFFFFu) crash("empty memory", cs, linear);
     if (!owned(linear)) crash("unowned memory", cs, linear);
+    if (DEBUG_Symbols().ProgramDataAt(linear)) crash("program data", cs, linear);
 }
 
 void DOSRUN_Exception(uint8_t which) {

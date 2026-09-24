@@ -486,6 +486,29 @@ bool DOS_ResizeMemory(uint16_t segment,uint16_t * blocks) {
 }
 
 
+static bool BlockInChain(uint16_t first,uint16_t para,uint16_t &owner,uint16_t &start,uint16_t &end) {
+	for (uint32_t m = first, blocks = 0; blocks < 4096; blocks++) {
+		DOS_MCB mcb((uint16_t)m);
+		const uint8_t type = mcb.GetType();
+		if (type != 'M' && type != 'Z') return false;
+		const uint32_t from = m + 1, to = from + mcb.GetSize();
+		if (para == m) { owner = 0; start = (uint16_t)m; end = (uint16_t)from; return true; }
+		if (para >= from && para < to) {
+			owner = mcb.GetPSPSeg(); start = (uint16_t)from; end = (uint16_t)std::min<uint32_t>(to,0xFFFF);
+			return true;
+		}
+		if (type == 'Z' || to > 0xFFFF) return false;
+		m = to;
+	}
+	return false;
+}
+
+bool DOS_MemoryBlockAt(uint16_t para,uint16_t &owner,uint16_t &start,uint16_t &end) {
+	if (para >= dos.firstMCB && BlockInChain(dos.firstMCB,para,owner,start,end)) return true;
+	const uint16_t umb = dos_infoblock.GetStartOfUMBChain();
+	return umb != 0xFFFF && para >= umb && BlockInChain(umb,para,owner,start,end);
+}
+
 bool DOS_FreeMemory(uint16_t segment) {
 	//TODO Check if allowed to free this segment
 	if (segment < DOS_MEM_START+1) {

@@ -168,6 +168,24 @@ static const std::vector<CvType> &CvTypesFor(const CvInfo &info,uint16_t moduleI
 	return it == info.moduleTypes.end() ? info.types : it->second;
 }
 
+/* sstSegMap flags: bit 1 write, bit 2 execute. Code is executable and not
+ * writable: MS LINK sets execute on data segments too, JWlink does not, and
+ * neither sets write on code. */
+static void CodeViewSegments(const CvInfo &info,DebugInfo &out)
+{
+	const std::map<uint16_t,uint32_t> bases = DEBUG_CvSegmentBases(info);
+	for (size_t i = 0;i < info.segments.size();i++) {
+		const CvSegMapEntry &entry = info.segments[i];
+		const std::map<uint16_t,uint32_t>::const_iterator base = bases.find(entry.index);
+		if (entry.length == 0 || base == bases.end()) continue;
+		DebugSegment segment;
+		segment.imageOffset = base->second;
+		segment.endOffset = base->second + entry.length;
+		segment.code = (entry.flags & 0x4) && !(entry.flags & 0x2);
+		out.segments.push_back(segment);
+	}
+}
+
 static void CodeViewSymbols(const CvInfo &info,uint32_t loadLinear,DebugInfo &out)
 {
 	const std::map<uint16_t,uint32_t> bases = DEBUG_CvSegmentBases(info);
@@ -398,6 +416,20 @@ static std::string BorlandTypeName(const TdInfo &info,uint16_t typeIndex,DebugSy
 	}
 
 	return std::string();
+}
+
+/* TDINFO's segment records are the modules' code, and nothing else. */
+static void BorlandSegments(const TdInfo &info,DebugInfo &out)
+{
+	for (size_t s = 0;s < info.segments.size();s++) {
+		const TdSegment &record = info.segments[s];
+		if (record.codeLength == 0) continue;
+		DebugSegment segment;
+		segment.imageOffset = ((uint32_t)record.codeSegment << 4u) + record.codeOffset;
+		segment.endOffset = segment.imageOffset + record.codeLength;
+		segment.code = true;
+		out.segments.push_back(segment);
+	}
 }
 
 /* A scope with no parent is a function body, and its length is the only place
@@ -690,6 +722,7 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 		BorlandSymbols(td,loadLinear,out);
 		BorlandLines(td,out);
 		BorlandScopes(td,out);
+		BorlandSegments(td,out);
 		return true;
 	}
 
@@ -725,6 +758,7 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 	CodeViewSymbols(cv,loadLinear,out);
 	CodeViewLines(cv,out);
 	CodeViewScopes(cv,out);
+	CodeViewSegments(cv,out);
 	return true;
 }
 

@@ -1,5 +1,6 @@
 /*
- * debug_symfmt_map.cpp - Microsoft LINK .MAP files.
+ * debug_symfmt_map.cpp - linker .MAP files: Microsoft LINK's layout, which
+ * TLINK shares, and WLINK's, which JWlink writes.
  *
  * Not debug info the linker appends to the image: a separate text file the
  * user supplies. Every address in it is load-relative, so it needs the same
@@ -82,8 +83,13 @@ void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFi
 	static const char * const SEGMENT_HEADER[5] = {"START","STOP","LENGTH","NAME","CLASS"};
 	static const char * const GROUP_HEADER[2] = {"ORIGIN","GROUP"};
 	static const char * const ENTRY_HEADER[4] = {"PROGRAM","ENTRY","POINT","AT"};
+	/* WLINK: rows name first, addresses as seg:off, sizes as bare hex. */
+	static const char * const WLINK_SEGMENT_HEADER[5] = {"SEGMENT","CLASS","GROUP","ADDRESS","SIZE"};
+	static const char * const WLINK_GROUP_HEADER[3] = {"GROUP","ADDRESS","SIZE"};
+	static const char * const WLINK_SYMBOL_HEADER[2] = {"ADDRESS","SYMBOL"};
 
-	enum { SECTION_NONE, SECTION_SEGMENTS, SECTION_GROUPS, SECTION_PUBLICS } section = SECTION_NONE;
+	enum { SECTION_NONE, SECTION_SEGMENTS, SECTION_GROUPS, SECTION_PUBLICS,
+	       SECTION_WLINK_SEGMENTS, SECTION_WLINK_GROUPS } section = SECTION_NONE;
 	out.sourceName = sourceName != NULL ? sourceName : "<memory>";
 
 	size_t at = 0;
@@ -98,6 +104,9 @@ void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFi
 		if (tokens.empty()) continue;
 
 		if (IsHeader(tokens,SEGMENT_HEADER,5)) { section = SECTION_SEGMENTS; continue; }
+		if (IsHeader(tokens,WLINK_SEGMENT_HEADER,5)) { section = SECTION_WLINK_SEGMENTS; continue; }
+		if (IsHeader(tokens,WLINK_GROUP_HEADER,3)) { section = SECTION_WLINK_GROUPS; continue; }
+		if (IsHeader(tokens,WLINK_SYMBOL_HEADER,2)) { section = SECTION_PUBLICS; continue; }
 		if (IsHeader(tokens,GROUP_HEADER,2)) { section = SECTION_GROUPS; continue; }
 		if (UpperOf(line).find("PUBLICS BY VALUE") != std::string::npos) { section = SECTION_PUBLICS; continue; }
 
@@ -119,10 +128,37 @@ void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFi
 			}
 		}
 
+		if (section == SECTION_WLINK_SEGMENTS && tokens.size() >= 5) {
+			LinkMapSegment segment;
+			LinkMapAddress start;
+			if (ParseColonAddress(tokens[3],start) && ParseMapHex(tokens[4],segment.length)) {
+				segment.name = tokens[0];
+				segment.className = tokens[1];
+				segment.start = start.mapOffset;
+				segment.stop = segment.start + (segment.length ? segment.length - 1 : 0);
+				out.segments.push_back(segment);
+				continue;
+			}
+		}
+
+		if (section == SECTION_WLINK_GROUPS && tokens.size() >= 3) {
+			LinkMapGroup group;
+			if (ParseColonAddress(tokens[1],group.address)) {
+				group.name = tokens[0];
+				out.groups.push_back(group);
+				continue;
+			}
+		}
+
 		if (tokens.size() < 2) continue;
 
+		/* WLINK marks an unreferenced symbol's address with *, a locally
+		 * referenced one's with +. */
+		std::string first = tokens[0];
+		if (!first.empty() && (first[first.size()-1] == '*' || first[first.size()-1] == '+')) first.erase(first.size()-1);
+
 		LinkMapAddress address;
-		if (!ParseColonAddress(tokens[0],address)) continue;
+		if (!ParseColonAddress(first,address)) continue;
 
 		if (section == SECTION_GROUPS) {
 			LinkMapGroup group;
@@ -145,6 +181,27 @@ void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFi
 			if (out.publics.find(upper) == out.publics.end()) out.publics[upper] = symbol;
 		}
 	}
+}
+
+bool DEBUG_IsCodeClass(const std::string &className)
+{
+	const std::string upper = UpperOf(className);
+	return upper.size() >= 4 && upper.compare(upper.size() - 4,4,"CODE") == 0;
+}
+
+std::vector<DebugSegment> DEBUG_LinkMapSegments(const LinkMapFile &map)
+{
+	std::vector<DebugSegment> out;
+	for (size_t i = 0;i < map.segments.size();i++) {
+		const LinkMapSegment &segment = map.segments[i];
+		if (segment.length == 0) continue;
+		DebugSegment range;
+		range.imageOffset = segment.start;
+		range.endOffset = segment.start + segment.length;
+		range.code = DEBUG_IsCodeClass(segment.className);
+		out.push_back(range);
+	}
+	return out;
 }
 
 bool DEBUG_ReadLinkMapFile(const char *path,LinkMapFile &out)

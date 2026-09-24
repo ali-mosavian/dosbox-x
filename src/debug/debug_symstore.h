@@ -11,6 +11,15 @@
 
 #include "debug_symfmt.h"
 
+/* A program's segment, made linear, and the process whose memory it is. */
+struct DebugProgramSegment {
+	uint32_t begin = 0;
+	uint32_t end = 0;
+	bool code = false;
+	std::string program;
+	uint16_t psp = 0;
+};
+
 /* A source line, with the address range it covers already made linear. */
 struct DebugSourceLine {
 	uint32_t begin = 0;
@@ -73,6 +82,19 @@ public:
 
 	const std::vector<DebugSourceLine> &Lines() const { return lines; }
 
+	/* A program's layout, from its debug info or map, for the process at
+	 * `psp`. The load image [loadLinear, loadLinear + imageBytes) backs the
+	 * segments: a format that lists only code, as TDINFO does, still says
+	 * the rest of the image is not. */
+	void AddSegments(const std::vector<DebugSegment> &segments,uint32_t loadLinear,uint32_t imageBytes,
+	                 const std::string &program,uint16_t psp);
+
+	/* The data segment covering an address, while the process that loaded it
+	 * still owns that memory; NULL for code, where code and data overlap, and
+	 * where no live layout covers it. Cheap for code: the core asks on every
+	 * transfer. */
+	const DebugProgramSegment *ProgramDataAt(uint32_t linear) const;
+
 	/* Locals and parameters of the innermost scope covering an address,
 	 * then of each scope around it. A name declared twice resolves to the
 	 * innermost one, the way the language scopes it. */
@@ -111,6 +133,10 @@ private:
 	std::vector<DebugSymbol> symbols;
 	std::vector<DebugSourceLine> lines;
 	std::vector<DebugScopeEntry> scopes;
+	std::vector<DebugProgramSegment> segments;
+	/* segments flattened: sorted, disjoint, code winning where they overlap */
+	std::vector<DebugProgramSegment> pieces;
+	void Flatten();
 };
 
 DebugSymbolStore &DEBUG_Symbols(void);
