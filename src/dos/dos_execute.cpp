@@ -24,6 +24,7 @@
 #include "logging.h"
 #include "mem.h"
 #include "dos_inc.h"
+#include "dosrun.h"
 #include "regs.h"
 #include "callback.h"
 #include "debug.h"
@@ -119,6 +120,8 @@ void DOS_Terminate(uint16_t pspseg,bool tsr,uint8_t exitcode) {
 		DEBUG_Socket_NotifyProcessExit(pspseg, exitcode, tsr);
 	}
 #endif
+
+	DOSRUN_Terminated(pspseg);
 
 	dos.return_code=exitcode;
 	dos.return_mode=tsr?(uint8_t)RETURN_TSR:(uint8_t)RETURN_EXIT;

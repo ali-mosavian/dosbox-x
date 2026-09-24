@@ -64,6 +64,7 @@
 #include "debug/debug_socket.h"
 #include "debug/debug_symstore.h"
 
+#include <algorithm>
 #include <deque>
 #include <string>
 #include <signal.h>
@@ -96,6 +97,20 @@ unsigned depth = 0;  /* kept machines below this one */
 double fork_cpu_ms = 0; /* a child's rusage starts at zero on Linux, not everywhere */
 uint32_t booted_ivt[8];
 uint32_t owned_lo = 1, owned_hi = 0; /* the last owned block found, [lo, hi) */
+
+/* The call stack, as execution built it: a frame lives while its return
+ * address is still on the stack. Knows no instruction, so it holds calls,
+ * INTs and interrupted code alike. */
+struct Frame {
+    uint16_t psp; /* the process that called */
+    uint16_t ss;
+    uint32_t slot; /* linear address of the return address */
+    uint32_t site_cs, site; /* the instruction that called */
+    uint32_t callee_cs, callee;
+};
+std::vector<Frame> frames;
+const size_t max_frames = 1u << 16;
+size_t dropped_frames = 0; /* the oldest, past max_frames */
 
 bool active() {
     if (out_fd == -2) {
@@ -187,7 +202,11 @@ std::string state() {
         {"cs", SegValue(cs)}, {"ds", SegValue(ds)}, {"es", SegValue(es)}, {"ss", SegValue(ss)},
         {"fs", SegValue(fs)}, {"gs", SegValue(gs)}};
     for (const auto &reg : regs) json += (reg.first == regs[0].first ? "\"" : ",\"") + std::string(reg.first) + "\":" + hex(reg.second);
-    json += "},\"where\":" + place(SegValue(cs), SegPhys(cs) + reg_eip) + ",\"branches\":[";
+    json += "},\"where\":" + place(SegValue(cs), SegPhys(cs) + reg_eip) + ",\"stack\":[";
+    for (size_t i = frames.size(); i-- > 0 && frames.size() - i <= 32;)
+        json += (i + 1 == frames.size() ? "" : ",") + std::string("{\"site\":") + place(frames[i].site_cs, frames[i].site) +
+                ",\"callee\":" + place(frames[i].callee_cs, frames[i].callee) + "}";
+    json += "],\"depth\":" + std::to_string(frames.size() + dropped_frames) + ",\"branches\":[";
     bool first = true;
     for (const BranchEntry &b : DEBUG_Socket_TraceRecent(16)) {
         json += (first ? "" : ",") + std::string("{\"from\":") + place(b.from_cs, b.from_linear) +
@@ -205,6 +224,7 @@ std::string state() {
 }
 
 bool owned(uint32_t linear) {
+    if (linear < 0x500) return false; /* the interrupt table and BIOS data are never code */
     if (linear >= 0xA0000 && linear < 0xC0000) return false; /* video memory is never code */
     if (linear >= 0xF0000 || (linear >= owned_lo && linear < owned_hi)) return true;
     uint16_t para = (uint16_t)(linear >> 4), owner = 0, start = 0, end = 0;
@@ -367,6 +387,8 @@ void serve() {
             lines.push_front("@echo off"); /* a job runs as a batch file does */
             for (unsigned vec = 0; vec < 8; vec++) booted_ivt[vec] = real_readd(0, vec * 4);
             DEBUG_Socket_TraceEnable();
+            frames.clear();
+            dropped_frames = 0;
             dosrun_watch = watch;
             signal(SIGALRM, on_alarm);
             alarm(wall);
@@ -424,6 +446,34 @@ void DOSRUN_Executes(uint32_t cs, uint32_t linear) {
     if (head == 0 || head == 0xFFFFFFFFu) crash("empty memory", cs, linear);
     if (!owned(linear)) crash("unowned memory", cs, linear);
     if (DEBUG_Symbols().ProgramDataAt(linear)) crash("program data", cs, linear);
+}
+
+void DOSRUN_Transferred(uint32_t from_cs, uint32_t from_linear, uint32_t from_sp, uint32_t cs, uint32_t linear) {
+    if (cpu.pmode) return;
+    const uint16_t ss = SegValue(::ss), sp = reg_sp;
+    const uint32_t top = ((uint32_t)ss << 4) + sp;
+    /* A call leaves on the stack an address just past the instruction that
+     * made it: a CALL's own end, or where an interrupt broke in. */
+    const uint32_t pushed = ((from_cs & 0xFFFFu) << 4) + mem_readw(top);
+    const bool call = sp < (uint16_t)from_sp && pushed > from_linear && pushed - from_linear <= 15;
+    /* A call can unwind a little, after code popped its own return address,
+     * but only a stack that wrapped around its segment unwinds by half of it. */
+    if (call && !frames.empty() && frames.back().ss == ss && top >= frames.back().slot + 0x8000)
+        crash("stack overflow", cs, linear);
+    /* A frame ends when its return address is popped, or overwritten. */
+    while (!frames.empty() && frames.back().ss == ss && (frames.back().slot < top || (call && frames.back().slot == top)))
+        frames.pop_back();
+    if (!call) return;
+    if (frames.size() == max_frames) {
+        frames.erase(frames.begin(), frames.begin() + max_frames / 2);
+        dropped_frames += max_frames / 2;
+    }
+    frames.push_back(Frame{dos.psp(), ss, top, from_cs, from_linear, cs, linear});
+}
+
+void DOSRUN_Terminated(uint16_t pspseg) {
+    frames.erase(std::remove_if(frames.begin(), frames.end(), [pspseg](const Frame &f) { return f.psp == pspseg; }),
+                 frames.end());
 }
 
 void DOSRUN_Exception(uint8_t which) {

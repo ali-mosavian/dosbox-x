@@ -37,6 +37,13 @@ extern bool dosrun_watch;
 /* Execution arrived at CS:linear, after a transfer or on entering a page. */
 void DOSRUN_Executes(uint32_t cs, uint32_t linear);
 
+/* Execution moved from the instruction at from_cs:from_linear, with SP at
+ * from_sp before it, to cs:linear. After DOSRUN_Executes accepted cs:linear. */
+void DOSRUN_Transferred(uint32_t from_cs, uint32_t from_linear, uint32_t from_sp, uint32_t cs, uint32_t linear);
+
+/* The process at pspseg ended: its frames will never return. */
+void DOSRUN_Terminated(uint16_t pspseg);
+
 /* The CPU raised exception `which`. */
 void DOSRUN_Exception(uint8_t which);
 

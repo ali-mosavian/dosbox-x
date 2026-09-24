@@ -49,15 +49,10 @@ extern bool ignore_opcode_63;
 #if C_DEBUG
 extern uint32_t debug_reverse_trace_active;
 extern void DEBUG_RecordReverseWrite(uint32_t address, uint32_t size, uint32_t val);
-extern bool DEBUG_Socket_TraceIsEnabled(void);
-extern void DEBUG_Socket_TraceRecordBranch(uint32_t, uint32_t, uint32_t, uint32_t);
 #define DEBUG_REVERSE_WRITE(off,size,val) \
 	do { if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)(off),(uint32_t)(size),(uint32_t)(val)); } while (0)
-#define DEBUG_TRACE_BRANCH(from_cs,from_linear,to_cs,to_linear) \
-	do { if (DEBUG_Socket_TraceIsEnabled()) DEBUG_Socket_TraceRecordBranch((uint32_t)(from_cs),(uint32_t)(from_linear),(uint32_t)(to_cs),(uint32_t)(to_linear)); } while (0)
 #else
 #define DEBUG_REVERSE_WRITE(off,size,val) do { } while (0)
-#define DEBUG_TRACE_BRANCH(from_cs,from_linear,to_cs,to_linear) do { } while (0)
 #endif
 
 #define LoadMb(off) mem_readb_inline(off)
@@ -210,6 +205,7 @@ Bits CPU_Core_Normal_Run(void) {
 			static uint32_t prev_cseip = 0;
 			static uint32_t prev_cs_val = 0;
 			static bool     prev_valid  = false;
+			static uint32_t prev_esp    = 0;
 			uint32_t cur_cseip  = (uint32_t)core.cseip;
 			uint32_t cur_cs_val = SegValue(cs);
 			if (prev_valid) {
@@ -219,11 +215,14 @@ Bits CPU_Core_Normal_Run(void) {
 					                               cur_cs_val,  cur_cseip);
 				// A crash shows first where execution lands: after a transfer,
 				// or on running sequentially into another page.
-				if (dosrun_watch && (transfer || ((cur_cseip ^ prev_cseip) >> 12)))
+				if (dosrun_watch && (transfer || ((cur_cseip ^ prev_cseip) >> 12))) {
 					DOSRUN_Executes(cur_cs_val, cur_cseip);
+					if (transfer) DOSRUN_Transferred(prev_cs_val, prev_cseip, prev_esp, cur_cs_val, cur_cseip);
+				}
 			}
 			prev_cseip  = cur_cseip;
 			prev_cs_val = cur_cs_val;
+			prev_esp    = reg_esp;
 			prev_valid  = true;
 		}
 		extern bool debug_socket_listening;
