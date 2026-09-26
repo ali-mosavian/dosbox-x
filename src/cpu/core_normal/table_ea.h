@@ -1,3 +1,4 @@
+#include "dosrun.h"
 /*
  *  Copyright (C) 2002-2021  The DOSBox Team
  *
@@ -196,6 +197,7 @@ static GetEAHandler EATable[512]={
 
 #define GetEADirect(sz)						\
 	PhysPt eaa;						\
+	dosrun_memory+=dosrun_counting;				\
 	if (TEST_PREFIX_ADDR)					\
 		eaa=Fetchd();					\
 	else							\

@@ -1,3 +1,4 @@
+#include "dosrun.h"
 /*
  *  Copyright (C) 2002-2021  The DOSBox Team
  *
@@ -26,11 +27,11 @@
 #endif
 
 #define GetEAa												\
-	PhysPt eaa=EALookupTable[rm]();									\
+	PhysPt eaa=(dosrun_memory+=dosrun_counting,EALookupTable[rm]());									\
 	(void)eaa
 
 #define GetEAa8086												\
-	PhysPt eaa=EATable8086[rm]();									\
+	PhysPt eaa=(dosrun_memory+=dosrun_counting,EATable8086[rm]());									\
 	(void)eaa
 
 #define GetEAaNDEF											\
@@ -38,10 +39,10 @@
 	(void)eaa
 
 #define GetEAaN												\
-	eaa=EALookupTable[rm]();
+	eaa=(dosrun_memory+=dosrun_counting,EALookupTable[rm]());
 
 #define GetEAaN8086												\
-	eaa=EATable8086[rm]();
+	eaa=(dosrun_memory+=dosrun_counting,EATable8086[rm]());
 
 #define GetRMEAa											\
 	GetRM;													\

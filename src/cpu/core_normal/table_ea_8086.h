@@ -1,3 +1,4 @@
+#include "dosrun.h"
 /*
  *  Copyright (C) 2002-2021  The DOSBox Team
  *
@@ -122,6 +123,7 @@ static GetEAHandler EATable8086[512]={
 #if CPU_CORE <= CPU_ARCHTYPE_8086
 #define GetEADirect(sz)						\
 	PhysPt eaa;						\
+	dosrun_memory+=dosrun_counting;				\
 	eaa=Fetchw();						\
 	eaa += BaseDS;
 #endif

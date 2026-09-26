@@ -261,9 +261,10 @@ void report(const char *reason) {
     getrusage(RUSAGE_SELF, &usage);
     const double cpu_ms = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e3 +
                           (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e3 - fork_cpu_ms;
-    char end[200];
-    snprintf(end, sizeof end, "{\"ev\":\"end\",\"reason\":\"%s\",\"exit_code\":%u,\"ms\":%llu,\"cpu_ms\":%.1f,\"cs\":%u,\"eip\":%u}",
-             reason, (unsigned)dos.return_code, (unsigned long long)ran_ms, cpu_ms, (unsigned)SegValue(cs), (unsigned)reg_eip);
+    char end[320];
+    snprintf(end, sizeof end, "{\"ev\":\"end\",\"reason\":\"%s\",\"exit_code\":%u,\"ms\":%llu,\"cpu_ms\":%.1f,\"cs\":%u,\"eip\":%u,\"instructions\":%llu,\"memory\":%llu}",
+             reason, (unsigned)dos.return_code, (unsigned long long)ran_ms, cpu_ms, (unsigned)SegValue(cs), (unsigned)reg_eip,
+             (unsigned long long)dosrun_instructions, (unsigned long long)dosrun_memory);
     emit(end);
 }
 
@@ -389,6 +390,8 @@ void serve() {
             DEBUG_Socket_TraceEnable();
             frames.clear();
             dropped_frames = 0;
+            dosrun_counting = false;
+            dosrun_instructions = dosrun_memory = 0;
             dosrun_watch = watch;
             signal(SIGALRM, on_alarm);
             alarm(wall);
@@ -440,8 +443,25 @@ bool dosrun_watch = false;
 
 bool DOSRUN_Forked(void) { return forked; }
 
+bool dosrun_counting = false;
+uint64_t dosrun_instructions = 0, dosrun_memory = 0;
+
+/* Whether linear is in the memory block the running program owns. */
+static bool in_program(uint32_t linear) {
+    static uint32_t lo = 1, hi = 0;
+    static uint16_t psp = 0;
+    if (psp == dos.psp() && linear >= lo && linear < hi) return true;
+    uint16_t owner = 0, start = 0, end = 0;
+    if (!DOS_MemoryBlockAt((uint16_t)(linear >> 4), owner, start, end) || owner != dos.psp()) return false;
+    psp = owner;
+    lo = (uint32_t)start << 4;
+    hi = (uint32_t)end << 4;
+    return true;
+}
+
 void DOSRUN_Executes(uint32_t cs, uint32_t linear) {
     if (cpu.pmode) return;
+    dosrun_counting = in_program(linear);
     uint32_t head = mem_readd(linear);
     if (head == 0 || head == 0xFFFFFFFFu) crash("empty memory", cs, linear);
     if (!owned(linear)) crash("unowned memory", cs, linear);

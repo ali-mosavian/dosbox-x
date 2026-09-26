@@ -220,6 +220,7 @@ Bits CPU_Core_Normal_Run(void) {
 					if (transfer) DOSRUN_Transferred(prev_cs_val, prev_cseip, prev_esp, cur_cs_val, cur_cseip);
 				}
 			}
+			dosrun_instructions += dosrun_counting;
 			prev_cseip  = cur_cseip;
 			prev_cs_val = cur_cs_val;
 			prev_esp    = reg_esp;

@@ -34,6 +34,12 @@ void DOSRUN_Wrote(uint16_t entry, const char *name, bool device, const uint8_t *
 /* True in a job's child: the core then reports where execution lands. */
 extern bool dosrun_watch;
 
+/* While execution is in the running program's own memory block: each
+ * instruction the core executes there, and each memory operand it reads or
+ * writes, reported with the job's end. */
+extern bool dosrun_counting;
+extern uint64_t dosrun_instructions, dosrun_memory;
+
 /* Execution arrived at CS:linear, after a transfer or on entering a page. */
 void DOSRUN_Executes(uint32_t cs, uint32_t linear);
 
