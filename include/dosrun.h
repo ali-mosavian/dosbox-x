@@ -47,6 +47,12 @@ void DOSRUN_Executes(uint32_t cs, uint32_t linear);
  * from_sp before it, to cs:linear. After DOSRUN_Executes accepted cs:linear. */
 void DOSRUN_Transferred(uint32_t from_cs, uint32_t from_linear, uint32_t from_sp, uint32_t cs, uint32_t linear);
 
+/* True while a job watches for writes to some linear range. */
+extern bool dosrun_writes;
+
+/* size bytes of value are about to be written at linear. */
+void DOSRUN_Writes(uint32_t linear, unsigned size, uint32_t value);
+
 /* The process at pspseg ended: its frames will never return. */
 void DOSRUN_Terminated(uint16_t pspseg);
 

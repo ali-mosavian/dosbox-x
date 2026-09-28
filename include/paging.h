@@ -23,6 +23,7 @@
 #include <exception>
 
 #include "mem.h"
+#include "dosrun.h"
 #include "bitop.h"
 
 class PageHandler;
@@ -470,6 +471,7 @@ static INLINE void mem_writeb_inline(const LinearPt address,const uint8_t val) {
 #if C_DEBUG
 	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,1,(uint32_t)val);
 #endif
+	if (GCC_UNLIKELY(dosrun_writes)) DOSRUN_Writes((uint32_t)address,1,(uint32_t)val);
 	const HostPt tlb_addr=get_tlb_write(address);
 	if (tlb_addr) host_writeb(tlb_addr+address,val);
 	else (get_tlb_writehandler(address))->writeb(address,val);
@@ -479,6 +481,7 @@ static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val) 
 #if C_DEBUG
 	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,2,(uint32_t)val);
 #endif
+	if (GCC_UNLIKELY(dosrun_writes)) DOSRUN_Writes((uint32_t)address,2,(uint32_t)val);
 	if ((address & 0xfffu)<0xfffu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) host_writew(tlb_addr+address,val);
@@ -490,6 +493,7 @@ static INLINE void mem_writed_inline(const LinearPt address,const uint32_t val) 
 #if C_DEBUG
 	if (debug_reverse_trace_active) DEBUG_RecordReverseWrite((uint32_t)address,4,(uint32_t)val);
 #endif
+	if (GCC_UNLIKELY(dosrun_writes)) DOSRUN_Writes((uint32_t)address,4,(uint32_t)val);
 	if ((address & 0xfffu)<0xffdu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) host_writed(tlb_addr+address,val);
