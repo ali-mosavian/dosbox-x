@@ -112,6 +112,33 @@ std::vector<Frame> frames;
 const size_t max_frames = 1u << 16;
 size_t dropped_frames = 0; /* the oldest, past max_frames */
 
+/* The last transfers, and the calls they made, matched to their returns by
+ * return address rather than stack slot: a stack the program overwrote
+ * still unwinds through what really ran, and the return that went
+ * somewhere no call left is where it went wrong. */
+enum TransferKind : uint8_t { TRANSFER_OTHER, TRANSFER_CALL, TRANSFER_RET };
+struct Transfer {
+    uint32_t from_cs, from, to_cs, to;
+    uint16_t ss, sp; /* after it */
+    TransferKind kind;
+};
+const size_t ring_size = 10000;
+Transfer ring[ring_size];
+uint64_t transfers = 0; /* ever recorded; the ring holds the last ring_size */
+struct Call {
+    uint32_t site_cs, site, callee_cs, callee;
+    uint32_t back; /* the linear address it returns to */
+};
+std::vector<Call> calls;
+const size_t max_calls = 4096;
+size_t dropped_calls = 0;
+struct BadReturn {
+    uint64_t transfer;
+    uint32_t from_cs, from, to_cs, to;
+    uint32_t expected; /* where the innermost call returns to; 0 with none */
+};
+std::deque<BadReturn> bad_returns; /* the last 16 */
+
 bool active() {
     if (out_fd == -2) {
         const char *fd = getenv("DOSRUN_FD");
@@ -206,7 +233,17 @@ std::string state() {
     for (size_t i = frames.size(); i-- > 0 && frames.size() - i <= 32;)
         json += (i + 1 == frames.size() ? "" : ",") + std::string("{\"site\":") + place(frames[i].site_cs, frames[i].site) +
                 ",\"callee\":" + place(frames[i].callee_cs, frames[i].callee) + "}";
-    json += "],\"depth\":" + std::to_string(frames.size() + dropped_frames) + ",\"branches\":[";
+    json += "],\"depth\":" + std::to_string(frames.size() + dropped_frames) + ",\"calls\":[";
+    for (size_t i = calls.size(); i-- > 0 && calls.size() - i <= 64;)
+        json += (i + 1 == calls.size() ? "" : ",") + std::string("{\"site\":") + place(calls[i].site_cs, calls[i].site) +
+                ",\"callee\":" + place(calls[i].callee_cs, calls[i].callee) + "}";
+    json += "],\"calls_depth\":" + std::to_string(calls.size() + dropped_calls) + ",\"bad_returns\":[";
+    for (size_t i = 0; i < bad_returns.size(); i++) {
+        const BadReturn &b = bad_returns[i];
+        json += (i ? "," : "") + std::string("{\"transfer\":") + std::to_string(b.transfer) + ",\"from\":" + place(b.from_cs, b.from) +
+                ",\"to\":" + place(b.to_cs, b.to) + ",\"expected\":" + (b.expected ? place(b.expected >> 4, b.expected) : "null") + "}";
+    }
+    json += "],\"branches\":[";
     bool first = true;
     for (const BranchEntry &b : DEBUG_Socket_TraceRecent(16)) {
         json += (first ? "" : ",") + std::string("{\"from\":") + place(b.from_cs, b.from_linear) +
@@ -214,6 +251,42 @@ std::string state() {
         first = false;
     }
     return json + "]}";
+}
+
+/* The ring, oldest first: each transfer's kind, source and target. */
+std::string trace() {
+    static const char *kinds[] = {"jump", "call", "ret"};
+    const size_t held = transfers < ring_size ? (size_t)transfers : ring_size;
+    std::string json = "{\"ev\":\"trace\",\"transfers\":" + std::to_string(transfers) + ",\"entries\":[";
+    for (size_t n = 0; n < held; n++) {
+        const Transfer &t = ring[(transfers - held + n) % ring_size];
+        json += (n ? "," : "") + std::string("{\"kind\":\"") + kinds[t.kind] + "\",\"from\":" + place(t.from_cs, t.from) +
+                ",\"to\":" + place(t.to_cs, t.to) + ",\"ss\":" + hex(t.ss) + ",\"sp\":" + hex(t.sp) + "}";
+    }
+    return json + "]}";
+}
+
+/* A transfer, into the ring and the call stack it builds. */
+void traced(uint32_t from_cs, uint32_t from, uint32_t to_cs, uint32_t to, TransferKind kind, uint32_t back) {
+    ring[transfers % ring_size] = Transfer{from_cs, from, to_cs, to, (uint16_t)SegValue(ss), (uint16_t)reg_sp, kind};
+    transfers++;
+    if (kind == TRANSFER_CALL) {
+        if (calls.size() == max_calls) {
+            calls.erase(calls.begin(), calls.begin() + max_calls / 2);
+            dropped_calls += max_calls / 2;
+        }
+        calls.push_back(Call{from_cs, from, to_cs, to, back});
+    } else if (kind == TRANSFER_RET) {
+        /* the innermost call it returns from; frames above it were abandoned, as a longjmp does */
+        size_t i = calls.size();
+        while (i-- > 0 && calls[i].back != to) {}
+        if (i < calls.size()) {
+            calls.resize(i);
+            return;
+        }
+        if (bad_returns.size() == 16) bad_returns.pop_front();
+        bad_returns.push_back(BadReturn{transfers - 1, from_cs, from, to_cs, to, calls.empty() ? 0 : calls.back().back});
+    }
 }
 
 [[noreturn]] void finish(const char *reason);
@@ -255,7 +328,10 @@ void report(const char *reason) {
     std::string screen = "{\"ev\":\"screen\",\"rows\":[";
     for (int row = 0; row < rows(); row++) screen += (row ? "," : "") + quoted(row_text(row));
     emit(screen + "]}");
-    if (strcmp(reason, "exit")) emit(state());
+    if (strcmp(reason, "exit")) {
+        emit(state());
+        emit(trace());
+    }
     /* host CPU time, not wall time: other load on the host does not count */
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
@@ -390,6 +466,10 @@ void serve() {
             DEBUG_Socket_TraceEnable();
             frames.clear();
             dropped_frames = 0;
+            calls.clear();
+            dropped_calls = 0;
+            bad_returns.clear();
+            transfers = 0;
             dosrun_counting = false;
             dosrun_instructions = dosrun_memory = 0;
             dosrun_watch = watch;
@@ -476,6 +556,9 @@ void DOSRUN_Transferred(uint32_t from_cs, uint32_t from_linear, uint32_t from_sp
      * made it: a CALL's own end, or where an interrupt broke in. */
     const uint32_t pushed = ((from_cs & 0xFFFFu) << 4) + mem_readw(top);
     const bool call = sp < (uint16_t)from_sp && pushed > from_linear && pushed - from_linear <= 15;
+    /* A return pops the address it goes to. */
+    const bool ret = !call && sp > (uint16_t)from_sp && mem_readw(((uint32_t)ss << 4) + (uint16_t)from_sp) == (uint16_t)(linear - ((uint32_t)cs << 4));
+    traced(from_cs, from_linear, cs, linear, call ? TRANSFER_CALL : ret ? TRANSFER_RET : TRANSFER_OTHER, call ? pushed : 0);
     /* A call can unwind a little, after code popped its own return address,
      * but only a stack that wrapped around its segment unwinds by half of it. */
     if (call && !frames.empty() && frames.back().ss == ss && top >= frames.back().slot + 0x8000)
