@@ -9,6 +9,9 @@
  *              and later jobs fork from its state -- mounts, current
  *              directory, environment, anything resident
  *   :pop       alone in a job: drop the kept machine, back to the one before
+ *   :write A[-B]
+ *              stop when anything writes linear A, or A..B inclusive (hex),
+ *              and report where, the value, and the state as a crash does
  *   :cwd, :env, :drives, :ls [PATTERN]
  *              queries, answered in order with the command lines
  *   anything else is a shell command line, run in order
@@ -22,9 +25,11 @@
  *                                        emulated millisecond of being written
  *   {"ev":"screen","rows":[...]}         the screen when the job ends
  *   {"ev":"crash","kind":...,"at":{...}} execution went where code cannot be
+ *   {"ev":"write","address":...,"size":N,"value":...,"at":{...}}
+ *                                        a write a :write range caught
  *   {"ev":"state",...}                   registers, source line and last branches,
  *                                        unless the job simply exited
- *   {"ev":"end","reason":...,...}        exit | crash | limit | wall, with emulated ms,
+ *   {"ev":"end","reason":...,...}        exit | crash | write | limit | wall, with emulated ms,
  *                                        host CPU ms and CS:EIP
  *   {"ev":"query","q":...,"result":...}  a query's answer, from DOS's own state
  *   {"ev":"done","status":N,"signal":N}  from the server, once the child is reaped;
@@ -91,6 +96,8 @@ int upto = 0; /* rows above this one are in the transcript */
 uint16_t out_handle = 0;
 std::string out_file, out_text;
 bool watch = true;
+/* The :write ranges, [lo, hi] linear. */
+std::vector<std::pair<uint32_t, uint32_t>> write_breaks;
 bool keep = false;
 bool forked = false; /* this process shares an older one's host state */
 unsigned depth = 0;  /* kept machines below this one */
@@ -367,6 +374,7 @@ bool read_job(unsigned &wall, bool &pop) {
     watch = true;
     keep = false;
     pop = false;
+    write_breaks.clear();
     std::string buf;
     while (read_line(buf)) {
         if (buf == ".") return true;
@@ -375,6 +383,12 @@ bool read_job(unsigned &wall, bool &pop) {
         else if (buf == ":nowatch") watch = false;
         else if (buf == ":keep") keep = true;
         else if (buf == ":pop") pop = true;
+        else if (!buf.compare(0, 7, ":write ")) {
+            char *end = NULL;
+            const uint32_t lo = (uint32_t)strtoul(buf.c_str() + 7, &end, 16);
+            const uint32_t hi = (end && *end == '-') ? (uint32_t)strtoul(end + 1, NULL, 16) : lo;
+            write_breaks.push_back(std::make_pair(lo, hi));
+        }
         else lines.push_back(buf);
     }
     return false;
@@ -473,6 +487,7 @@ void serve() {
             dosrun_counting = false;
             dosrun_instructions = dosrun_memory = 0;
             dosrun_watch = watch;
+            dosrun_writes = !write_breaks.empty();
             signal(SIGALRM, on_alarm);
             alarm(wall);
             return;
@@ -572,6 +587,19 @@ void DOSRUN_Transferred(uint32_t from_cs, uint32_t from_linear, uint32_t from_sp
         dropped_frames += max_frames / 2;
     }
     frames.push_back(Frame{dos.psp(), ss, top, from_cs, from_linear, cs, linear});
+}
+
+bool dosrun_writes = false;
+
+void DOSRUN_Writes(uint32_t linear, unsigned size, uint32_t value) {
+    for (const auto &range : write_breaks) {
+        if (linear > range.second || linear + size - 1 < range.first) continue;
+        const uint32_t cs = SegValue(::cs);
+        emit("{\"ev\":\"write\",\"address\":" + hex(linear) + ",\"size\":" + std::to_string(size) + ",\"value\":" + hex(value) +
+             ",\"at\":" + place(cs, SegPhys(::cs) + reg_eip) + "}");
+        dosrun_writes = false; /* reporting reads and writes nothing it could catch, but stop here once */
+        finish("write");
+    }
 }
 
 void DOSRUN_Terminated(uint16_t pspseg) {
