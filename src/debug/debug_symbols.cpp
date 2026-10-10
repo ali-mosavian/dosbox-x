@@ -156,18 +156,24 @@ struct PendingImage {
 	uint16_t psp = 0;
 	ProgramFiles files;
 	DebugImage image;
+	DebugPlacement registered;	/* what its symbols were last registered with */
 };
 
 static std::vector<PendingImage> pendingImages;
+
+static void RegisterPlaced(const PendingImage &pending,const DebugPlacement &placement)
+{
+	/* Linear addresses throughout: nothing to add to them. No segment layout is
+	 * registered, as that is a real-mode process's memory. */
+	RegisterSymbols(pending.program.c_str(),false,pending.files,0,&placement,pending.psp,0);
+	DEBUG_Symbols().AddExports(pending.image.exports,placement,pending.program);
+}
 
 void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placement)
 {
 	for (size_t i = 0;i < pendingImages.size();i++) {
 		if (pendingImages[i].program != program) continue;
-		/* Linear addresses throughout: nothing to add to them. No segment
-		 * layout is registered, as that is a real-mode process's memory. */
-		RegisterSymbols(program.c_str(),false,pendingImages[i].files,0,&placement,pendingImages[i].psp,0);
-		DEBUG_Symbols().AddExports(pendingImages[i].image.exports,placement,program);
+		RegisterPlaced(pendingImages[i],placement);
 		pendingImages.erase(pendingImages.begin() + i);
 		return;
 	}
@@ -236,10 +242,20 @@ void DEBUG_ImagesLocate(void)
 		DebugPlacement placement;
 		/* A paging host's client is found in the linear space it runs in; any other
 		 * program (DOS/32A runs unpaged) is where RAM says it is. */
-		const bool placed = (paged && DEBUG_LocateObjects(pendingImages[i].image.objects,mapped,placement)) ||
-		                    DEBUG_LocateObjects(pendingImages[i].image.objects,ram,(size_t)MEM_TotalPages() * 4096u,placement);
-		if (placed) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);	/* removes it */
-		else i++;
+		bool complete = paged && DEBUG_LocateObjects(pendingImages[i].image.objects,mapped,placement);
+		if (!complete && placement.empty())
+			complete = DEBUG_LocateObjects(pendingImages[i].image.objects,ram,(size_t)MEM_TotalPages() * 4096u,placement);
+
+		if (complete) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);	/* removes it */
+		else {
+			/* Some objects are there and some not yet, or never: what is placed is worth having,
+			 * and the rest is asked for again. */
+			if (placement.size() > pendingImages[i].registered.size()) {
+				pendingImages[i].registered = placement;
+				RegisterPlaced(pendingImages[i],placement);
+			}
+			i++;
+		}
 	}
 }
 

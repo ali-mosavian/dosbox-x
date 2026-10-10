@@ -5,6 +5,7 @@
 - `le_symbols.py`: `SYMPROBE.BAS` built by llrm-qb -m32 (plain, and `-g` with `debug codeview`), run by the
   emulator's own DOS/32A.
 - `ne_symbols.py`: `ne/prog.c` built by `ne/build.sh`, run by HX's DPMILD16 + HDPMI16.
+- `pe_symbols.py`: `pe/prog.c` + `pe/start.asm` built by `pe/build.sh`, run by HX's DPMILD32 + HDPMI32.
 
 HX is third-party and never committed. Fetch it into an empty directory, outside the tree:
 

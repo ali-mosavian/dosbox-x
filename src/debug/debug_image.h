@@ -43,6 +43,7 @@ struct DebugImage {
 /* Each reader: false unless the bytes are its format. */
 bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out);
 bool DEBUG_NeImage(const DebugBytes &data,DebugImage &out);
+bool DEBUG_PeImage(const DebugBytes &data,DebugImage &out);
 
 /* Tries every format in turn. Adding one is a reader and a line in the table. */
 bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out);
@@ -55,10 +56,11 @@ struct DebugMemoryRegion {
 };
 
 /*
- * Where each object sits in `memory`, by finding its pages. An object with
- * no page that survives, such as one that is all zeros, is left out, as is
- * one whose pages match in more than one place. False unless every object
- * that has content was placed: a half-loaded image answers nothing yet.
+ * Where each object sits in `memory`, by finding its pages. An object with no
+ * page that survives, such as one that is all zeros, is left out, as is one
+ * whose pages match in more than one place. `out` has the objects found; the
+ * result says whether that is all of them: a half-loaded image, or a section
+ * the loader never maps, leaves it false and the answer to be asked again.
  */
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std::vector<DebugMemoryRegion> &memory,
                          DebugPlacement &out);
