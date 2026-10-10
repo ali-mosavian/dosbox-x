@@ -25,4 +25,26 @@ check write_ends_the_job_as_write "$(echo "$events" | grep '"ev":"end","reason":
 events=$(job ':ms 10000' "mount w $HERE" 'w:' 'WRITES.COM')
 check no_write_range_runs_to_exit "$(echo "$events" | grep '"ev":"end","reason":"exit"')"
 
+# A :profile job counts by function and line: prof.c's run() calls outer() once, outer() calls inner(100) three
+# times, and the loop line of inner() runs 300 trips. The functions' counts add up to the program's total.
+SYMBOLS=$(cd "$HERE/../symbols/fixtures" && pwd)
+events=$(job ':ms 10000' ':profile' "mount w $SYMBOLS" 'w:' 'SYMPRX.EXE')
+profile=$(echo "$events" | grep '"ev":"profile"')
+check profile_event_comes_before_the_end "$profile"
+verdict=$(echo "$profile" | python3 -c '
+import json, re, sys
+p = json.loads(sys.stdin.read())
+f = {re.sub(r"^_|_$|@\d+$", "", x["name"]): x for x in p["functions"]}
+loop = [l for l in p["lines"] if l["file"].endswith("prof.c") and l["line"] == 8]
+ok = (f["inner"]["calls"], f["outer"]["calls"], f["run"]["calls"]) == (3, 1, 1)
+ok = ok and f["outer"]["inclusive"] == f["outer"]["self"] + f["inner"]["inclusive"]
+ok = ok and len(loop) == 1 and loop[0]["self"] > 0 and loop[0]["self"] % 300 == 0
+ok = ok and p["attributed_instructions"] == p["instructions"] > 0
+print("ok" if ok else "")' 2>/dev/null)
+check profile_counts_calls_loops_and_adds_up "$verdict"
+
+# Without it, nothing is counted by function.
+events=$(job ':ms 10000' "mount w $SYMBOLS" 'w:' 'SYMPRX.EXE')
+check no_profile_event_without_the_option "$(echo "$events" | grep -v '"ev":"profile"' | grep '"ev":"end"')"
+
 exit $failed

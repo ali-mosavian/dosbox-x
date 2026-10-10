@@ -337,6 +337,18 @@ void DEBUG_ImagesExecuted(uint32_t linear)
 	LocateImages(true,linear);
 }
 
+void DEBUG_ImageSpans(std::vector<std::pair<uint32_t,uint32_t> > &spans)
+{
+	for (size_t i = 0;i < pendingImages.size();i++) {
+		const PendingImage &image = pendingImages[i];
+		for (size_t o = 0;o < image.image.objects.size();o++) {
+			const DebugPlacement::const_iterator at = image.registered.find(image.image.objects[o].index);
+			if (at == image.registered.end() || image.image.objects[o].size == 0) continue;
+			spans.push_back(std::make_pair(at->second,at->second + image.image.objects[o].size));
+		}
+	}
+}
+
 std::vector<DebugImageStatus> DEBUG_ImagesStatus(void)
 {
 	std::vector<DebugImageStatus> out;

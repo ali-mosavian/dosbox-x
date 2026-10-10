@@ -44,6 +44,11 @@
  *   {"cmd":"bp_on_symbol_load","location":"main"} - When an image is placed, set an
  *     execution breakpoint there (a function, file:line, ...). It can be given
  *     before the program starts; bp_on_symbol_load_clear drops all of these.
+ *   {"cmd":"profile_start"} / {"cmd":"profile_stop"} / {"cmd":"profile"} - Count the
+ *     program's executed instructions and memory operands by function and source
+ *     line, self and inclusive, from now. The report holds the totals, what the
+ *     functions add up to, each function (self, inclusive, calls) and each line.
+ *     Programs of every format the symbol store knows are attributed alike.
  *   {"cmd":"images"} - Protected-mode programs the emulator watches for: each with
  *     its object count, the linear address of each object found so far, and
  *     whether all were. A module a program loads at run time (LE, NE, PE, D32X)
@@ -104,6 +109,7 @@ extern bool ticksLocked;
 #include "vtime.h"
 #include "debug_symstore.h"
 #include "debug_symbols.h"
+#include "debug_profile.h"
 #include "debug.h"
 #include "cpu.h"
 #include "regs.h"
@@ -3065,6 +3071,23 @@ static void process_command(const std::string& json) {
         else VTIME_Disable();
         send_ok(json_bool("on", on != 0) + "," + json_num("cycles_per_ms", (long long)CPU_CycleMax) + "," +
                 json_bool("skip_idle", vtime_skip_idle) + "," + json_num("skipped_ms", (long long)VTIME_SkippedMs()));
+        return;
+    }
+
+    if (cmd == "profile_start") {
+        DEBUG_ProfileStart();
+        send_ok(json_str("msg", "Profiling"));
+        return;
+    }
+
+    if (cmd == "profile_stop") {
+        DEBUG_ProfileStop();
+        send_ok(json_str("msg", "Profile stopped"));
+        return;
+    }
+
+    if (cmd == "profile") {
+        send_ok(json_bool("profiling", debug_profiling) + "," + DEBUG_ProfileJson());
         return;
     }
 

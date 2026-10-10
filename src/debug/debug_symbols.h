@@ -29,6 +29,8 @@ void DEBUG_ImagesExecuted(uint32_t linear);
 
 /* Execution reached the entry of the image: nothing more is looked for. */
 void DEBUG_ImageEntered(const std::string &program);
+/* The linear ranges the objects of every placed protected-mode image occupy: where its code may run. */
+void DEBUG_ImageSpans(std::vector<std::pair<uint32_t,uint32_t> > &spans);
 
 /* An image the emulator is waiting to see placed, or has seen. */
 struct DebugImageStatus {

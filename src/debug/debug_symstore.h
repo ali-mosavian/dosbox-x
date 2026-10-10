@@ -76,6 +76,9 @@ public:
 	 * the program's debug info or map already gave is not added twice. */
 	void AddExports(const std::vector<DebugImageExport> &exports,const DebugPlacement &placement,const std::string &program);
 
+	/* Changes whenever anything is added or dropped: a table built from the store is stale when it differs. */
+	uint32_t Generation() const { return generation; }
+
 	size_t Size() const { return symbols.size(); }
 	size_t LineCount() const { return lines.size(); }
 	const std::vector<DebugSymbol> &All() const { return symbols; }
@@ -150,6 +153,9 @@ private:
 	/* The innermost scope covering an address, or -1. */
 	int32_t InnermostScope(uint32_t pcLinear) const;
 
+	uint32_t generation = 0;
+	/* Something was added or dropped: tables built from the store are stale, and a profile re-attributes. */
+	void Touch();
 	std::vector<DebugSymbol> symbols;
 	std::vector<DebugSourceLine> lines;
 	std::vector<DebugScopeEntry> scopes;
