@@ -37,6 +37,10 @@ enum {
 	sstStaticSym = 0x134
 };
 
+/* CV4's numbers for the 32-bit registers a frame is measured from. */
+static const uint16_t CV_REGISTER_ESP = 21;
+static const uint16_t CV_REGISTER_EBP = 22;
+
 /* Symbol record kinds. The 32-bit forms are here because a mixed-model image
  * can carry them; every other kind is stepped over by its own length. */
 enum {
@@ -57,6 +61,7 @@ enum {
 	S_LPROC32 = 0x0204,
 	S_GPROC32 = 0x0205,
 	S_BLOCK32 = 0x0207,
+	S_REGREL32 = 0x020c,
 	S_LABEL32 = 0x0209
 };
 
@@ -566,6 +571,16 @@ std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t mod
 				local.frameOffset = (int32_t)body.u32(data);
 				local.type = body.u16(data + 4);
 				local.name = body.pstr(data + 6);
+				if (depth > 0 && !local.name.empty()) open.locals.push_back(local);
+				break;
+			case S_REGREL32:
+				/* offset u32, register u16, type u16, name (Open Watcom's cs_regrel32). A local
+				 * named off any register but ESP or EBP is not one the frame logic can place. */
+				local.frameOffset = (int32_t)body.u32(data);
+				local.type = body.u16(data + 6);
+				local.name = body.pstr(data + 8);
+				if (body.u16(data + 4) == CV_REGISTER_ESP) local.storage = CV_LOCAL_STACK;
+				else if (body.u16(data + 4) != CV_REGISTER_EBP) break;
 				if (depth > 0 && !local.name.empty()) open.locals.push_back(local);
 				break;
 			case S_REGISTER:

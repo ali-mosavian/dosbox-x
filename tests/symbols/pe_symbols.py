@@ -49,13 +49,8 @@ def run(dosbox: str, hx: Path) -> None:
         s.events.clear()
         s.send({"cmd": "continue"})
         check("pe_bp_fires_on_the_line", s.wait_stopped(30))
-        found = s.send({"cmd": "locals"}).get("locals", [])
-        values = {v["name"]: v.get("value") for v in found}
-        if found:
-            check("pe_locals_read_the_frame", values.get("n") == 5 and values.get("delta") == 10, values)
-        else:
-            # -m32 functions without EBP keep locals ESP-relative; llrm does not emit S_REGREL32 yet (llrm #1343)
-            skip("pe_locals_read_the_frame", "the image has no local records for prog.c yet")
+        values = {v["name"]: v.get("value") for v in s.send({"cmd": "locals"}).get("locals", [])}
+        check("pe_locals_read_the_frame", values.get("n") == 5 and values.get("delta") == 10, values)
         counter = s.send({"cmd": "var", "name": "counter"})
         check("pe_var_reads_the_global", counter.get("value") == 11, counter)
     finally:
