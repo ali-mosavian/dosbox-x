@@ -9,6 +9,7 @@
 #ifndef DOSBOX_DEBUG_SYMSTORE_H
 #define DOSBOX_DEBUG_SYMSTORE_H
 
+#include "debug_image.h"
 #include "debug_symfmt.h"
 
 /* A program's segment, made linear, and the process whose memory it is. */
@@ -62,6 +63,9 @@ public:
 	void Add(const DebugSymbol &symbol);
 	void AddDebugInfo(const DebugInfo &info,const std::string &program);
 	void AddLinkMap(const LinkMapFile &map,uint32_t loadLinear,const std::string &program);
+	/* What the executable exports, where the loader placed its objects. A name
+	 * the program's debug info or map already gave is not added twice. */
+	void AddExports(const std::vector<DebugImageExport> &exports,const DebugPlacement &placement,const std::string &program);
 
 	size_t Size() const { return symbols.size(); }
 	size_t LineCount() const { return lines.size(); }

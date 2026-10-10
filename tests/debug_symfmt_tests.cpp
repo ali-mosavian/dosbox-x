@@ -398,6 +398,82 @@ TEST_F(DebugSymFmtTest, PlaceLinkMapRebasesAddressesByObject)
 	EXPECT_EQ(0x171e0fu,map.publics["DOSUN"].address.mapOffset);
 }
 
+/* An object the loader's placement does not cover has no address: its publics sat at (object << 4) + offset,
+ * a few bytes above zero, and `var` read the guest's real-mode vectors for a global. */
+TEST_F(DebugSymFmtTest, PlaceLinkMapDropsWhatItCouldNotPlace)
+{
+	LinkMapFile map;
+	DEBUG_ParseLinkMap(
+		"Segment                Class          Group          Address         Size\n"
+		"=======                =====          =====          =======         ====\n"
+		"\n"
+		"_TEXT                  CODE           AUTO           0001:00000000   00000593\n"
+		"_DATA                  DATA           AUTO           0002:00000000   00000010\n"
+		"\n"
+		"Address        Symbol\n"
+		"=======        ======\n"
+		"\n"
+		"Module: a.obj(a.c)\n"
+		"0001:00000010* code_name\n"
+		"0002:00000008* data_name\n",
+		"a.map",map);
+
+	DebugPlacement placement;
+	placement[1] = 0x118000;
+	DEBUG_PlaceLinkMap(map,placement);
+	EXPECT_EQ(1u,map.publics.count("code_name"));
+	EXPECT_EQ(0u,map.publics.count("data_name"));
+	ASSERT_EQ(1u,map.segments.size());
+	EXPECT_EQ("_TEXT",map.segments[0].name);
+}
+
+/* An NE image's segments came out of the file whole, with the loader's relocation chains in them, so the
+ * locator saw the patched bytes as content and never matched; its exports were never read at all. */
+TEST_F(DebugSymFmtTest, NeImageGivesSegmentsWithRelocationChainsMaskedAndTheExports)
+{
+	const size_t header = 0x40;
+	std::vector<uint8_t> ne(0x400,0);
+	ne[0] = 'M'; ne[1] = 'Z'; ne[0x3c] = (uint8_t)header;
+	ne[header] = 'N'; ne[header+1] = 'E';
+	ne[header+0x04] = 0x70;					/* entry table, from the header */
+	ne[header+0x1c] = 1;					/* one segment */
+	ne[header+0x22] = 0x40;					/* segment table */
+	ne[header+0x26] = 0x50;					/* resident names */
+	ne[header+0x32] = 0;					/* sector shift defaults to 9 */
+	const size_t segmentTable = header + 0x40;
+	ne[segmentTable] = 1;					/* sector 1 = file offset 0x200 */
+	ne[segmentTable+2] = 0x20;				/* 32 bytes */
+	ne[segmentTable+4] = 0x00; ne[segmentTable+5] = 0x01;	/* code, has relocations */
+	const size_t names = header + 0x50;
+	ne[names] = 3; ne[names+1] = 'm'; ne[names+2] = 'o'; ne[names+3] = 'd';
+	ne[names+6] = 4; ne[names+7] = 'm'; ne[names+8] = 'a'; ne[names+9] = 'i'; ne[names+10] = 'n'; ne[names+11] = 1;
+	const size_t entries = header + 0x70;
+	ne[entries] = 1; ne[entries+1] = 1;			/* one entry in fixed segment 1 */
+	ne[entries+2] = 1; ne[entries+3] = 0x10;		/* flags, offset 0x0010 */
+	for (int i = 0;i < 0x20;i++) ne[0x200+i] = (uint8_t)(0x10 + i);
+	ne[0x204] = 0x0c; ne[0x205] = 0;			/* the chain: 4 -> 0xc -> end */
+	ne[0x20c] = 0xff; ne[0x20d] = 0xff;
+	ne[0x220] = 1; ne[0x221] = 0;				/* one relocation */
+	ne[0x222] = 5;						/* 16-bit offset */
+	ne[0x223] = 0;						/* internal reference, not additive */
+	ne[0x224] = 4; ne[0x225] = 0;				/* chain head at 4 */
+
+	DebugImage image;
+	ASSERT_TRUE(DEBUG_NeImage(DebugBytes(ne.data(),ne.size()),image));
+	ASSERT_EQ(1u,image.objects.size());
+	ASSERT_EQ(1u,image.objects[0].pages.size());
+	const std::vector<uint8_t> fixed = image.objects[0].pages[0].fixed;
+	ASSERT_EQ(0x20u,fixed.size());
+	EXPECT_EQ(0,fixed[4]); EXPECT_EQ(0,fixed[5]);
+	EXPECT_EQ(0,fixed[0xc]); EXPECT_EQ(0,fixed[0xd]);
+	EXPECT_EQ(1,fixed[6]);
+	EXPECT_EQ(1,fixed[0xe]);
+	ASSERT_EQ(1u,image.exports.size());
+	EXPECT_EQ("main",image.exports[0].name);
+	EXPECT_EQ(1u,image.exports[0].object);
+	EXPECT_EQ(0x10u,image.exports[0].offset);
+}
+
 TEST_F(DebugSymFmtTest, TheMzImageEndFindsTheBlockWhenTheTrailerIsUnusable)
 {
 	std::vector<uint8_t> data;

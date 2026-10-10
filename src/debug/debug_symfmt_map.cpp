@@ -206,25 +206,39 @@ std::vector<DebugSegment> DEBUG_LinkMapSegments(const LinkMapFile &map)
 	return out;
 }
 
-static void PlaceAddress(LinkMapAddress &address,const DebugPlacement &bases)
+/* False when the segment has no place: its address would be a paragraph sum with nothing to be relative to. */
+static bool PlaceAddress(LinkMapAddress &address,const DebugPlacement &bases)
 {
 	const DebugPlacement::const_iterator base = bases.find(address.segment);
-	if (base != bases.end()) address.mapOffset = base->second + address.offset;
+	if (base == bases.end()) return false;
+	address.mapOffset = base->second + address.offset;
+	return true;
 }
 
 void DEBUG_PlaceLinkMap(LinkMapFile &map,const DebugPlacement &bases)
 {
+	std::vector<LinkMapSegment> segments;
 	for (size_t i = 0;i < map.segments.size();i++) {
 		LinkMapSegment &segment = map.segments[i];
-		if (!segment.hasAddress) continue;
-		PlaceAddress(segment.address,bases);
-		segment.start = segment.address.mapOffset;
-		segment.stop = segment.start + (segment.length ? segment.length - 1 : 0);
+		if (segment.hasAddress) {
+			if (!PlaceAddress(segment.address,bases)) continue;
+			segment.start = segment.address.mapOffset;
+			segment.stop = segment.start + (segment.length ? segment.length - 1 : 0);
+		}
+		segments.push_back(segment);
 	}
-	for (size_t i = 0;i < map.groups.size();i++) PlaceAddress(map.groups[i].address,bases);
-	for (std::map<std::string,LinkMapPublic>::iterator it = map.publics.begin();it != map.publics.end();++it)
-		PlaceAddress(it->second.address,bases);
-	if (map.hasEntryPoint) PlaceAddress(map.entryPoint,bases);
+	map.segments.swap(segments);
+
+	std::vector<LinkMapGroup> groups;
+	for (size_t i = 0;i < map.groups.size();i++)
+		if (PlaceAddress(map.groups[i].address,bases)) groups.push_back(map.groups[i]);
+	map.groups.swap(groups);
+
+	for (std::map<std::string,LinkMapPublic>::iterator it = map.publics.begin();it != map.publics.end();) {
+		if (PlaceAddress(it->second.address,bases)) ++it;
+		else map.publics.erase(it++);
+	}
+	if (map.hasEntryPoint) map.hasEntryPoint = PlaceAddress(map.entryPoint,bases);
 }
 
 bool DEBUG_ReadLinkMapFile(const char *path,LinkMapFile &out)

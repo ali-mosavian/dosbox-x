@@ -10,20 +10,14 @@ import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+from harness import check, finish, skip  # noqa: E402
 from session import Session  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FAILED = 0
 FUNCTION = "BUMP"
 FUNCTION_LINE = 15  # SUB Bump (line 13) has code from its first statement
 BODY_LINE = 16  # counter = counter + delta
 EXTENDED = 0x100000
-
-
-def check(name: str, ok: bool, detail: object = "") -> None:
-    global FAILED
-    print(("PASS " if ok else "FAIL ") + name + ("" if ok else f"  {detail}"))
-    FAILED |= not ok
 
 
 def run(dosbox: str, program: str, debug_info: bool) -> None:
@@ -60,7 +54,7 @@ def run(dosbox: str, program: str, debug_info: bool) -> None:
         if names or not LOCALS_PENDING:
             check(f"{tag}_locals_name_delta_and_n", "delta" in [n.lower() for n in names] and "n" in [n.lower() for n in names], locals_)
         else:
-            print(f"SKIP {tag}_locals_name_delta_and_n  the image carries no 32-bit proc/local records to read")
+            skip(f"{tag}_locals_name_delta_and_n", "the image carries no 32-bit proc/local records to read")
     finally:
         s.close()
 
@@ -71,4 +65,4 @@ LOCALS_PENDING = True
 
 run(sys.argv[1], "SYMPROBE.EXE", False)
 run(sys.argv[1], "SYMPCV.EXE", True)
-sys.exit(FAILED)
+finish()

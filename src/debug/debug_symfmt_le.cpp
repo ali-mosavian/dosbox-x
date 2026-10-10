@@ -166,15 +166,15 @@ static void MaskFixups(const DebugBytes &data,size_t at,size_t end,size_t pageSi
 	}
 }
 
-void DEBUG_LeImageObjects(const DebugBytes &data,std::vector<DebugImageObject> &out)
+bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out)
 {
 	LeImage le;
-	if (!DEBUG_ParseLe(data,le)) return;
+	if (!DEBUG_ParseLe(data,le)) return false;
 
 	uint32_t header = 0;
 	FindLeHeader(data,header);
 	const size_t pageSize = le.pageSize;
-	if (pageSize == 0) return;
+	if (pageSize == 0) return false;
 
 	const size_t pageMap = (size_t)header + data.u32(header + 0x48);
 	const size_t dataPages = data.u32(header + 0x80);
@@ -213,6 +213,19 @@ void DEBUG_LeImageObjects(const DebugBytes &data,std::vector<DebugImageObject> &
 			page.fixed.assign(fixed[p].begin(),fixed[p].begin() + page.bytes.size());
 			image.pages.push_back(page);
 		}
-		out.push_back(image);
+		out.objects.push_back(image);
 	}
+
+	/* A name's ordinal picks its entry; ordinal 0 names the module. */
+	for (size_t n = 0;n < le.names.size();n++) {
+		for (size_t e = 0;e < le.entries.size();e++) {
+			if (le.entries[e].ordinal != le.names[n].ordinal || le.names[n].ordinal == 0) continue;
+			DebugImageExport exported;
+			exported.name = le.names[n].name;
+			exported.object = le.entries[e].object;
+			exported.offset = le.entries[e].offset;
+			out.exports.push_back(exported);
+		}
+	}
+	return true;
 }

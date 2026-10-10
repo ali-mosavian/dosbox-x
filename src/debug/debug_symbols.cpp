@@ -11,7 +11,11 @@
 #include "dos_inc.h"
 #include "mem.h"
 #include "paging.h"
+#include "cpu.h"
 #include "debug_image.h"
+
+#include <set>
+#include <string.h>
 
 static bool ReadGuestFile(const char *name,std::vector<uint8_t> &out,uint32_t maxBytes)
 {
@@ -151,7 +155,7 @@ struct PendingImage {
 	bool isCom = false;
 	uint16_t psp = 0;
 	ProgramFiles files;
-	std::vector<DebugImageObject> objects;
+	DebugImage image;
 };
 
 static std::vector<PendingImage> pendingImages;
@@ -163,24 +167,103 @@ void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placem
 		/* Linear addresses throughout: nothing to add to them. No segment
 		 * layout is registered, as that is a real-mode process's memory. */
 		RegisterSymbols(program.c_str(),false,pendingImages[i].files,0,&placement,pendingImages[i].psp,0);
+		DEBUG_Symbols().AddExports(pendingImages[i].image.exports,placement,program);
 		pendingImages.erase(pendingImages.begin() + i);
 		return;
 	}
 }
 
+/* The memory as a client of a paging DPMI host sees it: the pages the CPU's last page
+ * directory maps, gathered into runs of consecutive linear pages. The directory
+ * outlives the client's trips through real mode, which is when a query can come. */
+static bool MappedMemory(std::vector<std::vector<uint8_t> > &runs,std::vector<DebugMemoryRegion> &regions)
+{
+	const uint8_t *ram = (const uint8_t *)GetMemBase();
+	const size_t ramBytes = (size_t)MEM_TotalPages() * 4096u;
+	const uint32_t directory = paging.cr3 & ~0xfffu;
+	if (ram == NULL || directory == 0 || (size_t)directory + 4096u > ramBytes) return false;
+
+	const bool largePages = (cpu.cr4 & 0x10u) != 0;
+	std::vector<uint32_t> starts;
+	for (uint32_t d = 0;d < 1024;d++) {
+		const uint32_t entry = host_readd(ram + directory + d * 4u);
+		if (!(entry & 1u)) continue;
+
+		for (uint32_t t = 0;t < 1024;t++) {
+			uint32_t physical;
+			if ((entry & 0x80u) && largePages) {
+				physical = (entry & 0xffc00000u) + t * 4096u;
+			} else {
+				const uint32_t table = entry & ~0xfffu;
+				if ((size_t)table + 4096u > ramBytes) break;
+				const uint32_t page = host_readd(ram + table + t * 4u);
+				if (!(page & 1u)) continue;
+				physical = page & ~0xfffu;
+			}
+			if ((size_t)physical + 4096u > ramBytes) continue;
+
+			const uint32_t linear = (d << 22) | (t << 12);
+			if (runs.empty() || starts.back() + runs.back().size() != linear) {
+				runs.push_back(std::vector<uint8_t>());
+				starts.push_back(linear);
+			}
+			runs.back().insert(runs.back().end(),ram + physical,ram + physical + 4096u);
+		}
+	}
+
+	for (size_t i = 0;i < runs.size();i++) {
+		DebugMemoryRegion region;
+		region.data = runs[i].data();
+		region.size = runs[i].size();
+		region.linear = starts[i];
+		regions.push_back(region);
+	}
+	return !regions.empty();
+}
+
 void DEBUG_ImagesLocate(void)
 {
-	if (pendingImages.empty() || paging.enabled) return;
+	if (pendingImages.empty()) return;
 
-	const uint8_t *memory = (const uint8_t *)GetMemBase();
-	const size_t size = (size_t)MEM_TotalPages() * 4096u;
+	const uint8_t *ram = (const uint8_t *)GetMemBase();
+	if (ram == NULL) return;
+
+	std::vector<std::vector<uint8_t> > runs;
+	std::vector<DebugMemoryRegion> mapped;
+	const bool paged = MappedMemory(runs,mapped);
+
 	for (size_t i = 0;i < pendingImages.size();) {
 		DebugPlacement placement;
-		if (memory != NULL && DEBUG_LocateObjects(pendingImages[i].objects,memory,size,placement))
-			DEBUG_ImageLoadedAt(pendingImages[i].program,placement);	/* removes it */
+		/* A paging host's client is found in the linear space it runs in; any other
+		 * program (DOS/32A runs unpaged) is where RAM says it is. */
+		const bool placed = (paged && DEBUG_LocateObjects(pendingImages[i].image.objects,mapped,placement)) ||
+		                    DEBUG_LocateObjects(pendingImages[i].image.objects,ram,(size_t)MEM_TotalPages() * 4096u,placement);
+		if (placed) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);	/* removes it */
 		else i++;
 	}
 }
+
+/* Reads a protected-mode executable and, when it is one, waits for its loader
+ * to place it. False when the file is anything else. */
+static bool WatchForLoader(const char *program,uint16_t psp)
+{
+	PendingImage pending;
+	pending.program = program;
+	pending.psp = psp;
+	if (!HasAppendedData(program) || !ReadGuestFile(program,pending.files.image,64u*1024u*1024u)) return false;
+	if (!DEBUG_ReadImage(DebugBytes(pending.files.image.data(),pending.files.image.size()),pending.image)) return false;
+
+	pending.files.hasMap = ReadSidecar(program,".MAP",pending.files.map);
+
+	/* A program no loader ever places would be searched for on every query. */
+	static const size_t MAX_PENDING = 8;
+	if (pendingImages.size() >= MAX_PENDING) pendingImages.erase(pendingImages.begin());
+	pendingImages.push_back(pending);
+	DEBUG_Symbols().ClearProgram(program);
+	return true;
+}
+
+static std::set<std::string> watchedPrograms;
 
 void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes)
 {
@@ -191,30 +274,44 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 	const uint16_t saved_errorcode = dos.errorcode;
 	const uint32_t loadLinear = (uint32_t)loadSeg << 4u;
 
-	ProgramFiles files;
-	if (!isCom && HasAppendedData(program)) ReadGuestFile(program,files.image,64u*1024u*1024u);
-	if (!isCom) files.hasMap = ReadSidecar(program,".MAP",files.map);
-
-	/* An earlier run's wait for its loader is over, whatever came of it. */
+	/* A new program starts a new run: what an earlier one made its loader open is open again. */
+	watchedPrograms.clear();
 	for (size_t i = 0;i < pendingImages.size();i++)
 		if (pendingImages[i].program == program) pendingImages.erase(pendingImages.begin() + i--);
 
-	std::vector<DebugImageObject> objects;
-	if (!files.image.empty()) DEBUG_LeImageObjects(DebugBytes(files.image.data(),files.image.size()),objects);
-
-	if (!objects.empty()) {
-		/* The loader is guest code that has not run yet: the stub is all of
-		 * the program that is in memory. */
-		PendingImage pending;
-		pending.program = program;
-		pending.psp = psp;
-		pending.files = files;
-		pending.objects = objects;
-		pendingImages.push_back(pending);
-		DEBUG_Symbols().ClearProgram(program);
-	} else RegisterSymbols(program,isCom,files,loadLinear,NULL,psp,imageBytes);
+	/* The loader is guest code that has not run yet: of a bound extender
+	 * program the stub is all that is in memory. */
+	if (!isCom && WatchForLoader(program,psp)) watchedPrograms.insert(program);
+	else {
+		ProgramFiles files;
+		if (!isCom && HasAppendedData(program)) ReadGuestFile(program,files.image,64u*1024u*1024u);
+		if (!isCom) files.hasMap = ReadSidecar(program,".MAP",files.map);
+		RegisterSymbols(program,isCom,files,loadLinear,NULL,psp,imageBytes);
+	}
 
 	dos.errorcode = saved_errorcode;
+}
+
+/* A loader that is not the program, such as DPMILD16 or DPMILD32, opens the
+ * executable it was asked to run: that open is the first sight of it. */
+void DEBUG_SymbolsOnFileOpen(const char *file)
+{
+	static bool busy = false;
+	if (file == NULL || busy) return;
+
+	const size_t length = strlen(file);
+	if (length < 4 || file[length - 4] != '.') return;
+	static const char *const extensions[] = {"EXE","DLL","DRV","LE","LX"};
+	bool candidate = false;
+	for (size_t i = 0;i < sizeof(extensions) / sizeof(extensions[0]);i++)
+		candidate |= strcasecmp(file + length - 3,extensions[i]) == 0;
+	if (!candidate || !watchedPrograms.insert(file).second) return;
+
+	busy = true;
+	const uint16_t saved_errorcode = dos.errorcode;
+	WatchForLoader(file,dos.psp());
+	dos.errorcode = saved_errorcode;
+	busy = false;
 }
 
 #endif

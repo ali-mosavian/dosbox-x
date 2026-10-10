@@ -29,6 +29,7 @@
 
 #include "control.h"
 #include "dosbox.h"
+#include "debug/debug_symbols.h"
 #include "dos_inc.h"
 #include "bios_disk.h"
 #include "bios.h"
@@ -1983,6 +1984,9 @@ static Bitu DOS_21Handler(void) {
 			uint8_t oldal=reg_al;
 			force_sfn = true;
             if (DOS_OpenFile(name1,reg_al,&reg_ax)) {
+#if C_DEBUG
+                DEBUG_SymbolsOnFileOpen(name1);
+#endif
 #if defined(USE_TTF)
                 if (ttf.inUse&&wpType==1) {
                     int len = (int)strlen(name1);
