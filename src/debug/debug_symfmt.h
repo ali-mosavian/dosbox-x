@@ -537,7 +537,17 @@ enum DwarfLocationKind {
 	DWARF_LOCATION_ADDRESS,		/* DW_OP_addr */
 	DWARF_LOCATION_FRAME,		/* DW_OP_fbreg: from the function's frame base */
 	DWARF_LOCATION_REGISTER,	/* DW_OP_regN */
-	DWARF_LOCATION_REGISTER_OFFSET	/* DW_OP_bregN */
+	DWARF_LOCATION_REGISTER_OFFSET,	/* DW_OP_bregN */
+	DWARF_LOCATION_CONSTANT,	/* DW_OP_consts/constu/litN, DW_OP_stack_value: a value with no home */
+	DWARF_LOCATION_PIECES		/* DW_OP_piece: a value split across places, the low part first */
+};
+
+/* One part of a value: a place (a register, a frame cell, or nothing, for a part that was optimized out) and its size. */
+struct DwarfPiece {
+	DwarfLocationKind kind = DWARF_LOCATION_NONE;
+	uint16_t reg = 0;
+	int32_t offset = 0;
+	uint32_t size = 0;
 };
 
 struct DwarfLocation {
@@ -547,6 +557,8 @@ struct DwarfLocation {
 	int32_t offset = 0;
 	uint16_t reg = 0;		/* DWARF's x86 numbering: 0 EAX, 1 ECX, 2 EDX, 3 EBX, 4 ESP, 5 EBP, 6 ESI, 7 EDI */
 	uint32_t address = 0;
+	int64_t constant = 0;
+	std::vector<DwarfPiece> pieces;
 };
 
 /* What a function's DW_OP_fbreg is measured from. */
@@ -699,7 +711,18 @@ enum DebugStorage {
 	DEBUG_STORAGE_STACK,
 	/* At a displacement from the canonical frame address: the register and offset
 	 * the function's call frame information gives for the instruction being run. */
-	DEBUG_STORAGE_CFA
+	DEBUG_STORAGE_CFA,
+	DEBUG_STORAGE_CONSTANT,		/* no home: the value itself, in `constant` */
+	DEBUG_STORAGE_PIECES,		/* split across places, the low part first */
+	DEBUG_STORAGE_NONE		/* a part of a split value that was optimized out */
+};
+
+/* One part of a value that lives in several places. */
+struct DebugLocalPiece {
+	int storage = DEBUG_STORAGE_NONE;	/* a DebugStorage: FRAME, REGISTER, STACK, CFA or NONE */
+	int32_t frameOffset = 0;
+	uint16_t reg = 0;
+	uint32_t size = 0;
 };
 
 /* Where a value is over a range of the code, when that changes: a parameter that arrives in a
@@ -710,6 +733,8 @@ struct DebugLocalRange {
 	int storage = 0;		/* a DebugStorage */
 	int32_t frameOffset = 0;
 	uint16_t reg = 0;
+	int64_t constant = 0;
+	std::vector<DebugLocalPiece> pieces;
 };
 
 /* The canonical frame address is `reg` (x86's own order: 0 EAX ... 4 ESP, 5 EBP) plus `offset`. */
@@ -729,6 +754,8 @@ struct DebugLocal {
 	 * in DX, r(3) lands in BX, s(6) in SI. Anything above 7 is left
 	 * undecoded rather than guessed at. */
 	uint16_t reg = 0;
+	int64_t constant = 0;
+	std::vector<DebugLocalPiece> pieces;
 	std::string typeName;
 	uint32_t valueSize = 0;
 	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;

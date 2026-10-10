@@ -870,6 +870,37 @@ static long long register_number(uint32_t value, uint32_t width, bool is_unsigne
     return is_unsigned ? (long long)(uint16_t)value : (long long)(int16_t)value;
 }
 
+static std::string hex_string(const std::vector<uint8_t>& bytes) {
+    std::string hex;
+    for (size_t i = 0; i < bytes.size(); i++) {
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%02X", bytes[i]);
+        hex += buf;
+    }
+    return hex;
+}
+
+// The guest address of a stack-resident place: BP or SP plus a displacement, or the canonical frame address at `pc` plus one.
+static bool frame_address(DebugStorage storage, int32_t displacement, uint32_t pc, uint32_t& at, std::string& why, uint32_t* frame_base = NULL) {
+    const uint16_t ss = SegValue(SegNames::ss);
+    // A 32-bit stack is addressed by the whole of EBP or ESP, a 16-bit one by BP or SP.
+    uint32_t base = storage == DEBUG_STORAGE_STACK ? (uint32_t)reg_esp : (uint32_t)reg_ebp;
+    if (storage == DEBUG_STORAGE_CFA) {
+        uint16_t cfa_reg = 0;
+        int32_t cfa_offset = 0;
+        uint32_t cfa_base = 0;
+        if (!DEBUG_Symbols().CfaAt(pc, cfa_reg, cfa_offset) || !register_value(cfa_reg, cfa_base)) {
+            why = "no call frame information at this address";
+            return false;
+        }
+        base = cfa_base;
+        displacement += cfa_offset;
+    }
+    if (frame_base) *frame_base = base;
+    at = (uint32_t)GetAddress(ss, (uint32_t)((int32_t)base + displacement) & (uint32_t)cpu.stack.mask);
+    return true;
+}
+
 // A local or parameter, read where it lives right now. A frame variable is
 // only where BP says it is once the function's prologue has run, so the frame
 // this was read through is reported with it. `pc` picks among the places a
@@ -885,6 +916,8 @@ static std::string local_json(const DebugLocal& declared, const std::string& fun
             local.storage = (DebugStorage)range.storage;
             local.frameOffset = range.frameOffset;
             local.reg = range.reg;
+            local.constant = range.constant;
+            local.pieces = range.pieces;
             live = true;
             break;
         }
@@ -893,10 +926,42 @@ static std::string local_json(const DebugLocal& declared, const std::string& fun
     std::string out = json_str("name", local.name) + "," +
                       json_str("storage", local.storage == DEBUG_STORAGE_REGISTER ? "register"
                                           : local.storage == DEBUG_STORAGE_STACK ? "stack"
-                                          : local.storage == DEBUG_STORAGE_CFA ? "cfa" : "frame");
+                                          : local.storage == DEBUG_STORAGE_CFA ? "cfa"
+                                          : local.storage == DEBUG_STORAGE_CONSTANT ? "constant"
+                                          : local.storage == DEBUG_STORAGE_PIECES ? "pieces" : "frame");
     if (!function.empty()) out += "," + json_str("function", function);
     if (!local.typeName.empty()) out += "," + json_str("type", local.typeName);
     if (!live) return out + "," + json_str("note", "not live at this address");
+
+    if (local.storage == DEBUG_STORAGE_CONSTANT) return out + "," + json_num("value", (long long)local.constant);
+
+    if (local.storage == DEBUG_STORAGE_PIECES) {
+        // Little-endian parts, the low one first; a part with no place, or one that cannot be read, leaves the value unknown.
+        std::vector<uint8_t> bytes;
+        for (size_t p = 0; p < local.pieces.size(); p++) {
+            const DebugLocalPiece& piece = local.pieces[p];
+            uint32_t at = 0;
+            if (piece.storage == DEBUG_STORAGE_REGISTER) {
+                uint32_t value = 0;
+                if (!register_value(piece.reg, value)) return out + "," + json_str("note", "register number not decoded");
+                for (uint32_t b = 0; b < piece.size; b++) bytes.push_back((uint8_t)(b < 4 ? value >> (8 * b) : 0));
+            } else if (piece.storage == DEBUG_STORAGE_NONE) {
+                return out + "," + json_str("note", "part of the value was optimized out");
+            } else {
+                std::string why;
+                if (!frame_address((DebugStorage)piece.storage, piece.frameOffset, pc, at, why)) return out + "," + json_str("note", why);
+                std::vector<uint8_t> part;
+                bool complete = true;
+                read_guest_hex(at, piece.size, part, complete);
+                if (!complete) return out + "," + json_str("note", "part of the value is not readable");
+                bytes.insert(bytes.end(), part.begin(), part.end());
+            }
+        }
+        const uint32_t length = (uint32_t)bytes.size();
+        out += "," + json_num("length", length) + "," + json_str("bytes", hex_string(bytes));
+        out += decoded_value_json(bytes, length, local.valueKind, local.elementSize, local.fields);
+        return out;
+    }
 
     if (local.storage == DEBUG_STORAGE_REGISTER) {
         const bool wide = local.valueSize >= 4;
@@ -916,20 +981,10 @@ static std::string local_json(const DebugLocal& declared, const std::string& fun
         return out;
     }
 
-    // A 32-bit stack is addressed by the whole of EBP or ESP, a 16-bit one by BP or SP.
     const uint16_t ss = SegValue(SegNames::ss);
-    uint32_t base = local.storage == DEBUG_STORAGE_STACK ? (uint32_t)reg_esp : (uint32_t)reg_ebp;
-    int32_t displacement = local.frameOffset;
-    if (local.storage == DEBUG_STORAGE_CFA) {
-        uint16_t cfa_reg = 0;
-        int32_t cfa_offset = 0;
-        uint32_t cfa_base = 0;
-        if (!DEBUG_Symbols().CfaAt(pc, cfa_reg, cfa_offset) || !register_value(cfa_reg, cfa_base))
-            return out + "," + json_str("note", "no call frame information at this address");
-        base = cfa_base;
-        displacement += cfa_offset;
-    }
-    const uint32_t at = (uint32_t)GetAddress(ss, (uint32_t)((int32_t)base + displacement) & (uint32_t)cpu.stack.mask);
+    uint32_t at = 0, base = 0;
+    std::string why;
+    if (!frame_address(local.storage, local.frameOffset, pc, at, why, &base)) return out + "," + json_str("note", why);
     uint32_t length = local.valueSize != 0 ? local.valueSize : 2;
     if (length > 4096) length = 4096;
 

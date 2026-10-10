@@ -300,7 +300,7 @@ enum {
 	DW_AT_location = 0x02,DW_AT_name = 0x03,DW_AT_byte_size = 0x0b,DW_AT_low_pc = 0x11,DW_AT_high_pc = 0x12,
 	DW_AT_upper_bound = 0x2f,DW_AT_count = 0x37,DW_AT_data_member_location = 0x38,DW_AT_encoding = 0x3e,
 	DW_AT_frame_base = 0x40,DW_AT_type = 0x49,DW_AT_segment = 0x46,
-	DW_OP_addr = 0x03,DW_OP_call_frame_cfa = 0x9c,DW_OP_fbreg = 0x91,DW_OP_regx = 0x90
+	DW_OP_addr = 0x03,DW_OP_call_frame_cfa = 0x9c,DW_OP_fbreg = 0x91,DW_OP_regx = 0x90,DW_OP_piece = 0x93,DW_OP_stack_value = 0x9f
 };
 
 struct Abbreviation {
@@ -463,6 +463,58 @@ bool ReadLocation(const DebugBytes &expression,uint8_t addressSize,DwarfLocation
 	if (expression.size() == 0) return false;
 	Reader r(expression,0);
 	const uint8_t op = r.u8();
+
+	/* A constant with no home: a value pushed and declared the value itself. */
+	{
+		Reader c(expression,0);
+		const uint8_t first = c.u8();
+		bool known = true;
+		int64_t value = 0;
+		if (first >= 0x30 && first <= 0x4f) value = first - 0x30;					/* DW_OP_litN */
+		else if (first == 0x10) value = (int64_t)c.uleb();					/* DW_OP_constu */
+		else if (first == 0x11) value = c.sleb();						/* DW_OP_consts */
+		else if (first == 0x08) value = c.u8();							/* DW_OP_const1u */
+		else if (first == 0x09) value = (int8_t)c.u8();						/* DW_OP_const1s */
+		else if (first == 0x0a) value = c.u16();						/* DW_OP_const2u */
+		else if (first == 0x0b) value = (int16_t)c.u16();					/* DW_OP_const2s */
+		else if (first == 0x0c) value = c.u32();						/* DW_OP_const4u */
+		else if (first == 0x0d) value = (int32_t)c.u32();					/* DW_OP_const4s */
+		else known = false;
+		if (known && c.at < expression.size() && c.u8() == DW_OP_stack_value && c.at == expression.size()) {
+			out.kind = DWARF_LOCATION_CONSTANT;
+			out.constant = value;
+			return true;
+		}
+	}
+
+	/* A value in parts: each a register or a frame cell, then its size. */
+	if (expression.u8(0) != DW_OP_addr && expression.size() > 2) {
+		Reader p(expression,0);
+		std::vector<DwarfPiece> pieces;
+		bool whole = true;
+		while (p.at < expression.size() && whole) {
+			DwarfPiece piece;
+			const uint8_t place = p.u8();
+			if (place == DW_OP_piece) {				/* no place: this part is gone */
+				piece.size = (uint32_t)p.uleb();
+				pieces.push_back(piece);
+				continue;
+			}
+			if (place >= 0x50 && place <= 0x6f) { piece.kind = DWARF_LOCATION_REGISTER; piece.reg = (uint16_t)(place - 0x50); }
+			else if (place == DW_OP_regx) { piece.kind = DWARF_LOCATION_REGISTER; piece.reg = (uint16_t)p.uleb(); }
+			else if (place == DW_OP_fbreg) { piece.kind = DWARF_LOCATION_FRAME; piece.offset = (int32_t)p.sleb(); }
+			else { whole = false; break; }
+			if (p.u8() != DW_OP_piece) { whole = false; break; }
+			piece.size = (uint32_t)p.uleb();
+			pieces.push_back(piece);
+		}
+		if (whole && !pieces.empty() && p.at == expression.size()) {
+			out.kind = DWARF_LOCATION_PIECES;
+			out.pieces = pieces;
+			return true;
+		}
+	}
+
 	if (op == DW_OP_addr) {
 		out.kind = DWARF_LOCATION_ADDRESS;
 		out.address = addressSize == 2 ? r.u16() : r.u32();
