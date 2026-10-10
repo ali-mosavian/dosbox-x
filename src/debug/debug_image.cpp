@@ -56,6 +56,32 @@ static void ObjectAnchors(const DebugImageObject &object,std::vector<Anchor> &ou
 	}
 }
 
+/* The byte at a linear address, if some region holds it. */
+static bool ByteAt(const std::vector<DebugMemoryRegion> &memory,uint32_t linear,uint8_t &out)
+{
+	for (size_t r = 0;r < memory.size();r++) {
+		if (linear >= memory[r].linear && linear - memory[r].linear < memory[r].size) {
+			out = memory[r].data[linear - memory[r].linear];
+			return true;
+		}
+	}
+	return false;
+}
+
+/* How many of the bytes the loader rewrites differ in memory at `base` from the file's. */
+static size_t RelocatedBytes(const DebugImageObject &object,const std::vector<DebugMemoryRegion> &memory,uint32_t base)
+{
+	size_t changed = 0;
+	for (size_t p = 0;p < object.pages.size();p++) {
+		const DebugImagePage &page = object.pages[p];
+		for (size_t i = 0;i < page.bytes.size();i++) {
+			uint8_t at = 0;
+			if (!page.fixed[i] && ByteAt(memory,base + page.offset + (uint32_t)i,at) && at != page.bytes[i]) changed++;
+		}
+	}
+	return changed;
+}
+
 /* Found, with `base` set; or not found. An object with nothing to look for
  * (pages of zeros, say) is `unlocatable`, which is no reason to wait. */
 static bool LocateObject(const DebugImageObject &object,const std::vector<DebugMemoryRegion> &memory,uint32_t &base,
@@ -85,18 +111,36 @@ static bool LocateObject(const DebugImageObject &object,const std::vector<DebugM
 	}
 
 	size_t best = 0;
-	size_t leaders = 0;
+	std::vector<uint32_t> leaders;
 	for (std::map<uint32_t,size_t>::const_iterator it = votes.begin();it != votes.end();++it) {
 		if (it->second > best) {
 			best = it->second;
-			leaders = 0;
+			leaders.clear();
 		}
-		if (it->second == best) {
-			leaders++;
-			base = it->first;
+		if (it->second == best) leaders.push_back(it->first);
+	}
+	if (best == 0) return false;
+	if (leaders.size() == 1) {
+		base = leaders[0];
+		return true;
+	}
+
+	/* A loader reads through a buffer, which keeps a copy of the file's bytes. The object it
+	 * placed is the one where the bytes it rewrites differ from the file's. */
+	size_t bestRelocated = 0;
+	size_t winners = 0;
+	for (size_t l = 0;l < leaders.size();l++) {
+		const size_t relocated = RelocatedBytes(object,memory,leaders[l]);
+		if (relocated > bestRelocated) {
+			bestRelocated = relocated;
+			winners = 0;
+		}
+		if (relocated == bestRelocated) {
+			winners++;
+			base = leaders[l];
 		}
 	}
-	return best > 0 && leaders == 1;
+	return bestRelocated > 0 && winners == 1;
 }
 
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std::vector<DebugMemoryRegion> &memory,

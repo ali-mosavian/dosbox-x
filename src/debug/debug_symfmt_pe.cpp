@@ -83,6 +83,7 @@ bool DEBUG_PeImage(const DebugBytes &data,DebugImage &out)
 	const uint16_t magic = data.u16(optional);
 	if (magic != PE32_MAGIC && magic != PE32_PLUS_MAGIC) return false;
 	const size_t directories = optional + (magic == PE32_MAGIC ? 96 : 112);
+	const uint32_t imageBase = magic == PE32_MAGIC ? data.u32(optional + 28) : data.u32(optional + 24);
 	const size_t table = optional + data.u16(header + 20);
 
 	PeDirectory directory[16];
@@ -136,6 +137,7 @@ bool DEBUG_PeImage(const DebugBytes &data,DebugImage &out)
 		object.index = (uint16_t)(s + 1);
 		object.size = sections[s].virtualSize ? sections[s].virtualSize : sections[s].rawSize;
 		object.code = (sections[s].characteristics & (PE_SECTION_CODE | PE_SECTION_EXECUTE)) != 0;
+		object.linkBase = (uint32_t)(imageBase + sections[s].rva);
 		if (!fixed[s].empty()) {
 			const DebugBytes bytes = data.sub(sections[s].rawOffset,fixed[s].size());
 			DebugImagePage page;

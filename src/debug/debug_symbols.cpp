@@ -88,7 +88,7 @@ struct ProgramFiles {
  * it was loaded to. A real-mode image has one load address and no placement;
  * a protected-mode one has loadLinear 0 and says where each object went. */
 static void RegisterSymbols(const char *program,bool isCom,const ProgramFiles &files,uint32_t loadLinear,
-                            const DebugPlacement *placement,uint16_t psp,uint32_t imageBytes)
+                            const DebugPlacement *placement,const DebugPlacement *layout,uint16_t psp,uint32_t imageBytes)
 {
 	DebugInfo info;
 	bool found = false;
@@ -97,12 +97,12 @@ static void RegisterSymbols(const char *program,bool isCom,const ProgramFiles &f
 	 * appended format can be found in one. */
 	if (!isCom) {
 		if (!files.image.empty())
-			found = DEBUG_ParseDebugInfoBytes(DebugBytes(files.image.data(),files.image.size()),program,loadLinear,info,placement);
+			found = DEBUG_ParseDebugInfoBytes(DebugBytes(files.image.data(),files.image.size()),program,loadLinear,info,placement,layout);
 
 		if (!found) {
 			std::vector<uint8_t> sidecar;
 			if (ReadSidecar(program,".TDS",sidecar))
-				found = DEBUG_ParseDebugInfoBytes(DebugBytes(sidecar.data(),sidecar.size()),program,loadLinear,info,placement);
+				found = DEBUG_ParseDebugInfoBytes(DebugBytes(sidecar.data(),sidecar.size()),program,loadLinear,info,placement,layout);
 		}
 	}
 
@@ -166,7 +166,11 @@ static void RegisterPlaced(const PendingImage &pending,const DebugPlacement &pla
 {
 	/* Linear addresses throughout: nothing to add to them. No segment layout is
 	 * registered, as that is a real-mode process's memory. */
-	RegisterSymbols(pending.program.c_str(),false,pending.files,0,&placement,pending.psp,0);
+	/* Where the linker put each object, measured from the first. */
+	DebugPlacement layout;
+	for (size_t i = 0;i < pending.image.objects.size();i++)
+		layout[pending.image.objects[i].index] = pending.image.objects[i].linkBase - pending.image.objects[0].linkBase;
+	RegisterSymbols(pending.program.c_str(),false,pending.files,0,&placement,&layout,pending.psp,0);
 	DEBUG_Symbols().AddExports(pending.image.exports,placement,pending.program);
 }
 
@@ -324,6 +328,21 @@ static bool WatchForLoader(const char *program,uint16_t psp)
 
 static std::set<std::string> watchedPrograms;
 
+/* A file's name without its directory, upper-case: the stub of a bound program opens itself by a full path. */
+static std::string FileNameOf(const std::string &path)
+{
+	std::string name = path.substr(path.find_last_of("/\\:") == std::string::npos ? 0 : path.find_last_of("/\\:") + 1);
+	for (size_t i = 0;i < name.size();i++) name[i] = (char)toupper((unsigned char)name[i]);
+	return name;
+}
+
+static bool IsWatched(const char *file)
+{
+	for (size_t i = 0;i < pendingImages.size();i++)
+		if (FileNameOf(pendingImages[i].program) == FileNameOf(file)) return true;
+	return false;
+}
+
 void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes)
 {
 	if (program == NULL) return;
@@ -345,7 +364,7 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 		ProgramFiles files;
 		if (!isCom && HasAppendedData(program)) ReadGuestFile(program,files.image,64u*1024u*1024u);
 		if (!isCom) files.hasMap = ReadSidecar(program,".MAP",files.map);
-		RegisterSymbols(program,isCom,files,loadLinear,NULL,psp,imageBytes);
+		RegisterSymbols(program,isCom,files,loadLinear,NULL,NULL,psp,imageBytes);
 	}
 
 	dos.errorcode = saved_errorcode;
@@ -364,7 +383,7 @@ void DEBUG_SymbolsOnFileOpen(const char *file)
 	bool candidate = false;
 	for (size_t i = 0;i < sizeof(extensions) / sizeof(extensions[0]);i++)
 		candidate |= strcasecmp(file + length - 3,extensions[i]) == 0;
-	if (!candidate || !watchedPrograms.insert(file).second) return;
+	if (!candidate || IsWatched(file) || !watchedPrograms.insert(file).second) return;
 
 	busy = true;
 	const uint16_t saved_errorcode = dos.errorcode;
