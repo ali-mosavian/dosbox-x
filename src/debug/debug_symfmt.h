@@ -396,19 +396,22 @@ bool DEBUG_ParseWatcom(const DebugBytes &data,WatInfo &out);
 
 /* ---- Microsoft LINK .MAP ---- */
 
+struct LinkMapAddress {
+	uint16_t segment = 0;
+	uint32_t offset = 0;
+	/* (segment << 4) + offset: load-relative, the space the whole map uses. */
+	uint32_t mapOffset = 0;
+};
+
 struct LinkMapSegment {
 	uint32_t start = 0;
 	uint32_t stop = 0;
 	uint32_t length = 0;
 	std::string name;
 	std::string className;
-};
-
-struct LinkMapAddress {
-	uint16_t segment = 0;
-	uint32_t offset = 0;
-	/* (segment << 4) + offset: load-relative, the space the whole map uses. */
-	uint32_t mapOffset = 0;
+	/* As written, where the format says it (WLINK's "0001:00000594"). */
+	LinkMapAddress address;
+	bool hasAddress = false;
 };
 
 struct LinkMapGroup {
@@ -424,6 +427,13 @@ struct LinkMapPublic {
 /* The linkers' convention, MS LINK's, TLINK's and WLINK's alike: a segment
  * whose class name ends in CODE holds code. */
 bool DEBUG_IsCodeClass(const std::string &className);
+
+/* Where each linker segment (or LE object, by its number) really is, as the
+ * byte base its addresses are registered against. A real-mode image needs
+ * none: its segments are paragraphs and move with the load segment. A
+ * protected-mode loader places each object separately, so its readers are
+ * given where. */
+typedef std::map<uint16_t,uint32_t> DebugPlacement;
 
 struct LinkMapFile {
 	std::string sourceName;
@@ -445,6 +455,10 @@ struct LinkMapResolution {
 };
 
 void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFile &out);
+
+/* Re-bases every address in a map that names a segment with an address. A
+ * segment without one in `bases` keeps the paragraph arithmetic. */
+void DEBUG_PlaceLinkMap(LinkMapFile &map,const DebugPlacement &bases);
 bool DEBUG_ReadLinkMapFile(const char *path,LinkMapFile &out);
 
 /* Accepts a public, a segment name, "SEG+off"/"SEG:off", a raw "seg:off" pair,
@@ -454,6 +468,40 @@ bool DEBUG_ResolveLinkMapSymbol(const LinkMapFile &map,const std::string &reques
 
 /* The public at exactly this address, else "SEGMENT+0x...", else false. */
 bool DEBUG_DescribeMapAddress(const LinkMapFile &map,uint32_t loadLinear,uint32_t linear,std::string &out);
+
+/* ---- LE ---- */
+
+struct LeObject {
+	uint32_t size = 0;
+	uint32_t base = 0;		/* the address the linker preferred */
+	uint32_t flags = 0;
+	uint32_t firstPage = 0;		/* 1-based, into the object page table */
+	uint32_t pageCount = 0;
+};
+
+struct LeName {
+	std::string name;
+	uint16_t ordinal = 0;		/* 0 in the resident table names the module */
+	bool resident = true;
+};
+
+struct LeEntry {
+	uint16_t ordinal = 0;
+	uint16_t object = 0;		/* 1-based */
+	uint32_t offset = 0;		/* within that object */
+};
+
+struct LeImage {
+	std::vector<LeObject> objects;
+	std::vector<LeName> names;
+	std::vector<LeEntry> entries;
+	uint32_t eipObject = 0;
+	uint32_t eip = 0;
+	uint32_t pageSize = 0;
+};
+
+/* Reads an LE image, bound to a DOS stub or bare. False when it is not one. */
+bool DEBUG_ParseLe(const DebugBytes &data,LeImage &out);
 
 /* ---- format-independent layer ---- */
 
@@ -595,7 +643,8 @@ std::map<uint16_t,uint32_t> DEBUG_CvSegmentBases(const CvInfo &info);
  * used to guess. A stripped Borland EXE is read through its .TDS sidecar, so
  * the path matters and not only the bytes. */
 bool DEBUG_ParseDebugInfo(const char *file,uint32_t loadLinear,DebugInfo &out);
-bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out);
+bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out,
+                               const DebugPlacement *placement = NULL);
 
 /* A map's segments, load-relative, code by DEBUG_IsCodeClass. */
 std::vector<DebugSegment> DEBUG_LinkMapSegments(const LinkMapFile &map);

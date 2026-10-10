@@ -9,6 +9,9 @@
 
 #include "logging.h"
 #include "dos_inc.h"
+#include "mem.h"
+#include "paging.h"
+#include "debug_image.h"
 
 static bool ReadGuestFile(const char *name,std::vector<uint8_t> &out,uint32_t maxBytes)
 {
@@ -70,27 +73,33 @@ static bool HasAppendedData(const char *program)
 	return size > DEBUG_MzAppendedOffset(mz);
 }
 
-void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes)
+/* What a program brought: its own bytes and the .MAP its linker wrote. */
+struct ProgramFiles {
+	std::vector<uint8_t> image;
+	std::vector<uint8_t> map;
+	bool hasMap = false;
+};
+
+/* Registers a program's debug info, or failing that its .MAP, at the address
+ * it was loaded to. A real-mode image has one load address and no placement;
+ * a protected-mode one has loadLinear 0 and says where each object went. */
+static void RegisterSymbols(const char *program,bool isCom,const ProgramFiles &files,uint32_t loadLinear,
+                            const DebugPlacement *placement,uint16_t psp,uint32_t imageBytes)
 {
-	if (program == NULL) return;
-
-	/* Opening files here must leave no trace: the guest reads the DOS error
-	 * code after EXEC returns, and a missing sidecar would overwrite it. */
-	const uint16_t saved_errorcode = dos.errorcode;
-	const uint32_t loadLinear = (uint32_t)loadSeg << 4u;
-
-	std::vector<uint8_t> data;
 	DebugInfo info;
 	bool found = false;
 
 	/* A COM image has no header saying where its load image stops, so no
 	 * appended format can be found in one. */
 	if (!isCom) {
-		if (HasAppendedData(program) && ReadGuestFile(program,data,64u*1024u*1024u))
-			found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,loadLinear,info);
+		if (!files.image.empty())
+			found = DEBUG_ParseDebugInfoBytes(DebugBytes(files.image.data(),files.image.size()),program,loadLinear,info,placement);
 
-		if (!found && ReadSidecar(program,".TDS",data))
-			found = DEBUG_ParseDebugInfoBytes(DebugBytes(data.data(),data.size()),program,loadLinear,info);
+		if (!found) {
+			std::vector<uint8_t> sidecar;
+			if (ReadSidecar(program,".TDS",sidecar))
+				found = DEBUG_ParseDebugInfoBytes(DebugBytes(sidecar.data(),sidecar.size()),program,loadLinear,info,placement);
+		}
 	}
 
 	/* Debug info that names nothing does not shadow a .MAP that names
@@ -101,21 +110,22 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 		found = false;
 	}
 
+	LinkMapFile map;
+	if (files.hasMap && !isCom) {
+		DEBUG_ParseLinkMap(std::string((const char*)files.map.data(),files.map.size()),program,map);
+		if (placement != NULL) DEBUG_PlaceLinkMap(map,*placement);
+	}
+
 	if (found) {
 		DEBUG_Symbols().ClearProgram(program);
 		DEBUG_Symbols().AddDebugInfo(info,program);
 		/* The layout is the linker's: its .MAP lists every segment with its
 		 * class, where debug info may list some -- CV3 one per module. */
-		LinkMapFile map;
 		std::vector<DebugSegment> layout = info.segments;
-		if (ReadSidecar(program,".MAP",data)) {
-			DEBUG_ParseLinkMap(std::string((const char*)data.data(),data.size()),program,map);
-			if (!map.segments.empty()) layout = DEBUG_LinkMapSegments(map);
-		}
+		if (!map.segments.empty()) layout = DEBUG_LinkMapSegments(map);
 		DEBUG_Symbols().AddSegments(layout,loadLinear,imageBytes,program,psp);
-		LOG_MSG("DEBUG: %s carries %u %s symbols, loaded at segment %04X",
-		        program,(unsigned int)info.symbols.size(),info.version.c_str(),loadSeg);
-		dos.errorcode = saved_errorcode;
+		LOG_MSG("DEBUG: %s carries %u %s symbols, loaded at %05X",
+		        program,(unsigned int)info.symbols.size(),info.version.c_str(),(unsigned int)loadLinear);
 		return;
 	}
 
@@ -125,18 +135,84 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 	 * Only for an EXE: a COM .MAP's addresses are written relative to
 	 * whatever origin its toolchain chose, and no COM fixture was available
 	 * to find out which. Guessing would put every symbol 0x100 out. */
-	if (!isCom && ReadSidecar(program,".MAP",data)) {
-		LinkMapFile map;
-		DEBUG_ParseLinkMap(std::string((const char*)data.data(),data.size()),program,map);
-		if (!map.publics.empty() || !map.segments.empty()) {
-			DEBUG_Symbols().ClearProgram(program);
-			const size_t before = DEBUG_Symbols().Size();
-			DEBUG_Symbols().AddLinkMap(map,loadLinear,program);
-			DEBUG_Symbols().AddSegments(DEBUG_LinkMapSegments(map),loadLinear,imageBytes,program,psp);
-			LOG_MSG("DEBUG: %s has no appended debug info; its .MAP gives %u symbols at segment %04X",
-			        program,(unsigned int)(DEBUG_Symbols().Size() - before),loadSeg);
-		}
+	if (!isCom && (!map.publics.empty() || !map.segments.empty())) {
+		DEBUG_Symbols().ClearProgram(program);
+		const size_t before = DEBUG_Symbols().Size();
+		DEBUG_Symbols().AddLinkMap(map,loadLinear,program);
+		DEBUG_Symbols().AddSegments(DEBUG_LinkMapSegments(map),loadLinear,imageBytes,program,psp);
+		LOG_MSG("DEBUG: %s has no appended debug info; its .MAP gives %u symbols at %05X",
+		        program,(unsigned int)(DEBUG_Symbols().Size() - before),(unsigned int)loadLinear);
 	}
+}
+
+/* A protected-mode program the loader has not placed yet. */
+struct PendingImage {
+	std::string program;
+	bool isCom = false;
+	uint16_t psp = 0;
+	ProgramFiles files;
+	std::vector<DebugImageObject> objects;
+};
+
+static std::vector<PendingImage> pendingImages;
+
+void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placement)
+{
+	for (size_t i = 0;i < pendingImages.size();i++) {
+		if (pendingImages[i].program != program) continue;
+		/* Linear addresses throughout: nothing to add to them. No segment
+		 * layout is registered, as that is a real-mode process's memory. */
+		RegisterSymbols(program.c_str(),false,pendingImages[i].files,0,&placement,pendingImages[i].psp,0);
+		pendingImages.erase(pendingImages.begin() + i);
+		return;
+	}
+}
+
+void DEBUG_ImagesLocate(void)
+{
+	if (pendingImages.empty() || paging.enabled) return;
+
+	const uint8_t *memory = (const uint8_t *)GetMemBase();
+	const size_t size = (size_t)MEM_TotalPages() * 4096u;
+	for (size_t i = 0;i < pendingImages.size();) {
+		DebugPlacement placement;
+		if (memory != NULL && DEBUG_LocateObjects(pendingImages[i].objects,memory,size,placement))
+			DEBUG_ImageLoadedAt(pendingImages[i].program,placement);	/* removes it */
+		else i++;
+	}
+}
+
+void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes)
+{
+	if (program == NULL) return;
+
+	/* Opening files here must leave no trace: the guest reads the DOS error
+	 * code after EXEC returns, and a missing sidecar would overwrite it. */
+	const uint16_t saved_errorcode = dos.errorcode;
+	const uint32_t loadLinear = (uint32_t)loadSeg << 4u;
+
+	ProgramFiles files;
+	if (!isCom && HasAppendedData(program)) ReadGuestFile(program,files.image,64u*1024u*1024u);
+	if (!isCom) files.hasMap = ReadSidecar(program,".MAP",files.map);
+
+	/* An earlier run's wait for its loader is over, whatever came of it. */
+	for (size_t i = 0;i < pendingImages.size();i++)
+		if (pendingImages[i].program == program) pendingImages.erase(pendingImages.begin() + i--);
+
+	std::vector<DebugImageObject> objects;
+	if (!files.image.empty()) DEBUG_LeImageObjects(DebugBytes(files.image.data(),files.image.size()),objects);
+
+	if (!objects.empty()) {
+		/* The loader is guest code that has not run yet: the stub is all of
+		 * the program that is in memory. */
+		PendingImage pending;
+		pending.program = program;
+		pending.psp = psp;
+		pending.files = files;
+		pending.objects = objects;
+		pendingImages.push_back(pending);
+		DEBUG_Symbols().ClearProgram(program);
+	} else RegisterSymbols(program,isCom,files,loadLinear,NULL,psp,imageBytes);
 
 	dos.errorcode = saved_errorcode;
 }

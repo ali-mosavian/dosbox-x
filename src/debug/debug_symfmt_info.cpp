@@ -704,7 +704,20 @@ std::string DEBUG_SymbolExplanation(const DebugInfo &info,const DebugSymbol &sym
 	       " + " + DEBUG_Hex(symbol.offset) + " (" + info.file + ")";
 }
 
-bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out)
+/* A protected-mode loader says where each segment went; the reader then
+ * works in those addresses instead of the SegMap's frame:offset. */
+static void PlaceCodeView(CvInfo &info,const DebugPlacement &bases)
+{
+	for (size_t i = 0;i < info.segments.size();i++) {
+		const DebugPlacement::const_iterator base = bases.find(info.segments[i].index);
+		if (base == bases.end()) continue;
+		info.segments[i].frame = 0;
+		info.segments[i].offset = base->second;
+	}
+}
+
+bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out,
+                               const DebugPlacement *placement)
 {
 	out.file = file != NULL ? file : "";
 	out.loadLinear = loadLinear;
@@ -746,6 +759,7 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 	CvInfo cv;
 	if (!DEBUG_ParseCodeView(data,cv)) return false;
 
+	if (placement != NULL) PlaceCodeView(cv,*placement);
 	out.format = DEBUG_FORMAT_CODEVIEW;
 	out.version = cv.signature;
 	out.warnings = cv.warnings;

@@ -134,6 +134,8 @@ void DEBUG_ParseLinkMap(const std::string &text,const char *sourceName,LinkMapFi
 			if (ParseColonAddress(tokens[3],start) && ParseMapHex(tokens[4],segment.length)) {
 				segment.name = tokens[0];
 				segment.className = tokens[1];
+				segment.address = start;
+				segment.hasAddress = true;
 				segment.start = start.mapOffset;
 				segment.stop = segment.start + (segment.length ? segment.length - 1 : 0);
 				out.segments.push_back(segment);
@@ -202,6 +204,27 @@ std::vector<DebugSegment> DEBUG_LinkMapSegments(const LinkMapFile &map)
 		out.push_back(range);
 	}
 	return out;
+}
+
+static void PlaceAddress(LinkMapAddress &address,const DebugPlacement &bases)
+{
+	const DebugPlacement::const_iterator base = bases.find(address.segment);
+	if (base != bases.end()) address.mapOffset = base->second + address.offset;
+}
+
+void DEBUG_PlaceLinkMap(LinkMapFile &map,const DebugPlacement &bases)
+{
+	for (size_t i = 0;i < map.segments.size();i++) {
+		LinkMapSegment &segment = map.segments[i];
+		if (!segment.hasAddress) continue;
+		PlaceAddress(segment.address,bases);
+		segment.start = segment.address.mapOffset;
+		segment.stop = segment.start + (segment.length ? segment.length - 1 : 0);
+	}
+	for (size_t i = 0;i < map.groups.size();i++) PlaceAddress(map.groups[i].address,bases);
+	for (std::map<std::string,LinkMapPublic>::iterator it = map.publics.begin();it != map.publics.end();++it)
+		PlaceAddress(it->second.address,bases);
+	if (map.hasEntryPoint) PlaceAddress(map.entryPoint,bases);
 }
 
 bool DEBUG_ReadLinkMapFile(const char *path,LinkMapFile &out)
