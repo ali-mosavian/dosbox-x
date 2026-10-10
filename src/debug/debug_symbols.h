@@ -21,6 +21,15 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
  * executable is waited for like a program EXEC loaded, whichever loader asked. */
 void DEBUG_SymbolsOnFileOpen(const char *file);
 
+/* True while an image has been seen start and its entry has not been reached. */
+extern bool debug_images_waiting;
+
+/* Execution reached `linear`, in a page it had not run in before. */
+void DEBUG_ImagesExecuted(uint32_t linear);
+
+/* Execution reached the entry of the image: nothing more is looked for. */
+void DEBUG_ImageEntered(const std::string &program);
+
 /* An image the emulator is waiting to see placed, or has seen. */
 struct DebugImageStatus {
 	std::string program;

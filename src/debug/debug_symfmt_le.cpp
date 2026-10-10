@@ -219,6 +219,10 @@ bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out)
 		out.objects.push_back(image);
 	}
 
+	out.hasEntry = le.eipObject != 0;
+	out.entryObject = (uint16_t)le.eipObject;
+	out.entryOffset = le.eip;
+
 	/* A name's ordinal picks its entry; ordinal 0 names the module. */
 	for (size_t n = 0;n < le.names.size();n++) {
 		for (size_t e = 0;e < le.entries.size();e++) {

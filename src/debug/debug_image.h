@@ -39,6 +39,10 @@ struct DebugImageExport {
 struct DebugImage {
 	std::vector<DebugImageObject> objects;
 	std::vector<DebugImageExport> exports;
+	/* Where it starts running, when the format says: an object and an offset in it. */
+	bool hasEntry = false;
+	uint16_t entryObject = 0;
+	uint32_t entryOffset = 0;
 };
 
 /* Each reader: false unless the bytes are its format. */
@@ -57,6 +61,13 @@ struct DebugMemoryRegion {
 	uint32_t linear = 0;
 };
 
+/* Where the CPU is executing, as an object's base: execution at an image's entry settles which copy of its
+ * code is the one running, where copies the loader left behind match as well. */
+struct DebugEntryHint {
+	uint16_t object = 0;
+	uint32_t base = 0;
+};
+
 /*
  * Where each object sits in `memory`, by finding its pages. An object with no
  * page that survives, such as one that is all zeros, is left out, as is one
@@ -65,10 +76,10 @@ struct DebugMemoryRegion {
  * the loader never maps, leaves it false and the answer to be asked again.
  */
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std::vector<DebugMemoryRegion> &memory,
-                         DebugPlacement &out);
+                         DebugPlacement &out,const DebugEntryHint *hint = NULL);
 
 /* The same for memory with no paging in the way: one run from address 0. */
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint8_t *memory,size_t memorySize,
-                         DebugPlacement &out);
+                         DebugPlacement &out,const DebugEntryHint *hint = NULL);
 
 #endif

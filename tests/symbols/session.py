@@ -62,6 +62,20 @@ class Session:
                 self.events.append(message)
         return True
 
+    def wait_event(self, name: str, seconds: float) -> dict | None:
+        """The first event of that name not yet taken, or None after `seconds`."""
+        deadline = time.monotonic() + seconds
+        while True:
+            for i, event in enumerate(self.events):
+                if event.get("event") == name:
+                    return self.events.pop(i)
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([self.sock], [], [], left)[0]:
+                return None
+            message = json.loads(self.lines.readline())
+            if "status" not in message:
+                self.events.append(message)
+
     def screen(self) -> str:
         return self.send({"cmd": "text_screen"}).get("text") or ""
 
