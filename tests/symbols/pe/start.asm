@@ -5,7 +5,7 @@ extrn run_:near
 .data
 ready db 'ready',13,10,'$'
 .code
-_start:
+start:
     mov edx,offset ready
     mov ah,9
     int 21h
@@ -14,4 +14,4 @@ _start:
     call run_
     mov ax,4c00h
     int 21h
-end _start
+end start
