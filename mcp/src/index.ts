@@ -52,6 +52,7 @@ import {
   scannerMagicPattern,
   type ModuleProbeResult,
 } from "./formats.js";
+import { d32ModulesFromImages, watchedImages } from "./images.js";
 import {
   describeMapAddress,
   effectiveLoadLinear,
@@ -1711,7 +1712,7 @@ server.tool(
       base: z.number().int().min(0),
     })).optional().describe("ELF symbol files and runtime bases to register."),
     d32SearchPaths: z.array(z.string()).optional().describe("Directories/files for D32 module scan registration."),
-    scanD32Modules: z.boolean().optional().describe("Scan memory and auto-register D32 modules when search paths are supplied."),
+    scanD32Modules: z.boolean().optional().describe("Discover D32 modules (the emulator's images, or a memory scan on an older build) and auto-register them when search paths are supplied."),
     moduleRangeStart: z.number().int().min(0).optional().describe("D32 scan start (default 0x100000)."),
     moduleRangeEnd: z.number().int().min(0).optional().describe("D32 scan end (default 0x2000000)."),
     verifySymbol: z.string().optional().describe("Optional symbol to resolve as a readiness check."),
@@ -3292,7 +3293,7 @@ server.tool(
 
 server.tool(
   "dosbox_modules",
-  "Format-pluggable module discovery and registration. scan uses mem_search + header probes; " +
+  "Format-pluggable module discovery and registration. scan asks the emulator for the images it placed (an older build: mem_search + header probes); " +
   "register manually binds a host module file to a runtime base (same as dosbox_symbols load-d32).",
   {
     op: z.enum(["scan", "list", "register"]).describe("Operation."),
@@ -4077,8 +4078,30 @@ async function scanDiscoveredModules(
   searchPaths: string[],
 ): Promise<Array<Record<string, unknown>>> {
   const results: Array<Record<string, unknown>> = [];
-  const seenBases = new Set<number>();
 
+  /* The emulator places every protected-mode image it sees, a D32 module a program loads included: ask it.
+   * A build that predates the command is searched the old way, below. */
+  const images = watchedImages(await db.sendCommand({ cmd: "images" }));
+  if (images !== undefined) {
+    for (const { probe, file } of d32ModulesFromImages(images, searchPaths)) {
+      const key = `${probe.formatId}@${hex(probe.base)}`;
+      const registered = d32Modules.has(file);
+      discoveredModules.set(key, { probe, file, registered });
+      results.push({
+        key,
+        format: probe.formatId,
+        base: hex(probe.base),
+        size: hex(probe.size),
+        name: probe.name,
+        file,
+        fingerprint: probe.fingerprint,
+        registered,
+      });
+    }
+    return results;
+  }
+
+  const seenBases = new Set<number>();
   for (const scanner of moduleScanners) {
     const pattern = scannerMagicPattern(scanner);
     const resp = await db.sendCommand(clean({
