@@ -1316,8 +1316,17 @@ extern bool INT28_AllowOnce;
 bool int16_unmask_irq1_on_read = true;
 bool int16_ah_01_cf_undoc = true;
 
+#if C_DEBUG
+extern bool debug_key_wait_armed;
+void DEBUG_Socket_KeyWait(uint8_t function);
+#endif
+
 Bitu INT16_Handler(void) {
     uint16_t temp=0;
+#if C_DEBUG
+    if (debug_key_wait_armed && (reg_ah == 0x00 || reg_ah == 0x10 || reg_ah == 0x01 || reg_ah == 0x11) && !check_key(temp))
+        DEBUG_Socket_KeyWait(reg_ah);
+#endif
     switch (reg_ah) {
     case 0x00: /* GET KEYSTROKE */
         if (int16_unmask_irq1_on_read)
