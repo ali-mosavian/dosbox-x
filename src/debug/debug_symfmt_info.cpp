@@ -779,6 +779,201 @@ static void DwarfToRealMode(const DwarfInfo &dwarf,DebugInfo &out)
 	}
 }
 
+/* A DWARF type as the store describes one: a printable name, how many bytes to read, how to read them. */
+struct DwarfTypeText {
+	std::string name;
+	uint32_t size = 0;
+	DebugValueKind kind = DEBUG_VALUE_UNKNOWN;
+	uint32_t elementSize = 0;
+	std::vector<DebugField> fields;
+};
+
+static DwarfTypeText DescribeDwarfType(const DwarfInfo &dwarf,size_t offset,unsigned depth = 0)
+{
+	DwarfTypeText text;
+	if (offset == 0) {
+		text.name = "void";
+		return text;
+	}
+	const std::map<size_t,size_t>::const_iterator found = dwarf.typeIndex.find(offset);
+	if (found == dwarf.typeIndex.end() || depth > 8) return text;
+	const DwarfType &type = dwarf.types[found->second];
+
+	switch (type.tag) {
+	case 0x24: {						/* base type */
+		text.name = type.name;
+		text.size = type.size;
+		const uint8_t encoding = type.encoding;
+		if (encoding == 4) text.kind = DEBUG_VALUE_FLOAT;
+		else if (encoding == 5 || encoding == 6 || encoding == 0x0d) text.kind = DEBUG_VALUE_SIGNED;
+		else text.kind = DEBUG_VALUE_UNSIGNED;		/* unsigned, unsigned char, boolean, address */
+		break;
+	}
+	case 0x0f:						/* pointer */
+		text.name = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1).name + "*";
+		text.size = type.size ? type.size : 4;
+		text.kind = DEBUG_VALUE_UNSIGNED;
+		break;
+	case 0x16:						/* typedef */
+	{
+		const DwarfTypeText target = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1);
+		text = target;
+		text.name = type.name;
+		break;
+	}
+	case 0x26: case 0x35:					/* const, volatile */
+		text = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1);
+		break;
+	case 0x13: case 0x17:					/* structure, union */
+		text.name = std::string(type.tag == 0x13 ? "struct " : "union ") + type.name;
+		text.size = type.size;
+		for (size_t m = 0;m < type.members.size();m++) {
+			const DwarfTypeText member = DescribeDwarfType(dwarf,type.members[m].type,depth + 1);
+			DebugField field;
+			field.name = type.members[m].name;
+			field.offset = type.members[m].offset;
+			field.size = member.size;
+			field.typeName = member.name;
+			field.kind = member.kind;
+			field.elementSize = member.elementSize;
+			text.fields.push_back(field);
+		}
+		break;
+	case 0x01: {						/* array */
+		const DwarfTypeText element = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1);
+		char count[16];
+		snprintf(count,sizeof(count),"[%u]",(unsigned int)type.count);
+		text.name = element.name + count;
+		text.size = element.size * type.count;
+		text.kind = element.kind;
+		text.elementSize = element.size;
+		text.fields = element.fields;
+		break;
+	}
+	case 0x04:						/* enumeration */
+		text.name = "enum " + type.name;
+		text.size = type.size ? type.size : 4;
+		text.kind = DEBUG_VALUE_SIGNED;
+		break;
+	case 0x15:						/* a function's type */
+		text.name = "function";
+		break;
+	}
+	return text;
+}
+
+static void ApplyDwarfType(const DwarfInfo &dwarf,size_t offset,DebugSymbol &symbol)
+{
+	const DwarfTypeText text = DescribeDwarfType(dwarf,offset);
+	symbol.typeName = text.name;
+	symbol.valueSize = text.size;
+	symbol.valueKind = text.kind;
+	symbol.elementSize = text.elementSize;
+	symbol.fields = text.fields;
+}
+
+/* A DWARF address, placed: the load-relative offset it comes to once its object is where the loader put it. */
+static bool DwarfPlaced(const DebugPlacement &placement,const DebugPlacement &layout,uint32_t address,uint32_t &placed)
+{
+	uint16_t object = 0;
+	uint32_t offset = 0;
+	if (!DwarfObjectOf(layout,address,object,offset)) return false;
+	const DebugPlacement::const_iterator base = placement.find(object);
+	if (base == placement.end()) return false;
+	placed = base->second + offset;
+	return true;
+}
+
+static void DwarfScopes(const DwarfInfo &dwarf,const DebugPlacement &placement,const DebugPlacement &layout,DebugInfo &out)
+{
+	for (size_t i = 0;i < dwarf.cfa.size();i++) {
+		DebugCfaRow row;
+		uint32_t end = 0;
+		if (!DwarfPlaced(placement,layout,dwarf.cfa[i].begin,row.begin) ||
+		    !DwarfPlaced(placement,layout,dwarf.cfa[i].end - 1,end)) continue;
+		row.end = end + 1;
+		row.reg = dwarf.cfa[i].reg;
+		row.offset = dwarf.cfa[i].offset;
+		out.cfa.push_back(row);
+	}
+
+	std::vector<int32_t> mapped(dwarf.scopes.size(),-1);
+	for (size_t i = 0;i < dwarf.scopes.size();i++) {
+		const DwarfScope &source = dwarf.scopes[i];
+		DebugScope scope;
+		uint32_t last = 0;
+		if (!DwarfPlaced(placement,layout,source.begin,scope.imageOffset) ||
+		    !DwarfPlaced(placement,layout,source.end - 1,last)) continue;
+		scope.endOffset = last + 1;
+		scope.function = source.function;
+		scope.parent = source.parent >= 0 ? mapped[(size_t)source.parent] : -1;
+
+		for (size_t v = 0;v < source.variables.size();v++) {
+			const DwarfVariable &variable = source.variables[v];
+			DebugLocal local;
+			local.name = variable.name;
+
+			bool readable = true;
+			for (size_t w = 0;w < variable.where.size() && readable;w++) {
+				const DwarfLocation &where = variable.where[w];
+				DebugLocalRange range;
+				switch (where.kind) {
+				case DWARF_LOCATION_REGISTER:
+					if (where.reg > 7) { readable = false; break; }
+					range.storage = DEBUG_STORAGE_REGISTER;
+					range.reg = where.reg;
+					break;
+				case DWARF_LOCATION_FRAME:
+					if (source.frame == DWARF_FRAME_CFA) range.storage = DEBUG_STORAGE_CFA;
+					else if (source.frameReg == 5) range.storage = DEBUG_STORAGE_FRAME;
+					else if (source.frameReg == 4) range.storage = DEBUG_STORAGE_STACK;
+					else { readable = false; break; }
+					range.frameOffset = where.offset;
+					break;
+				case DWARF_LOCATION_REGISTER_OFFSET:
+					if (where.reg == 5) range.storage = DEBUG_STORAGE_FRAME;
+					else if (where.reg == 4) range.storage = DEBUG_STORAGE_STACK;
+					else { readable = false; break; }
+					range.frameOffset = where.offset;
+					break;
+				default:
+					readable = false;
+					break;
+				}
+				if (!readable) break;
+
+				const bool whole = where.begin == 0 && where.end == 0xffffffffu;
+				uint32_t last = 0;
+				if (!whole && (!DwarfPlaced(placement,layout,where.begin,range.begin) ||
+				               !DwarfPlaced(placement,layout,where.end - 1,last))) { readable = false; break; }
+				range.end = whole ? 0xffffffffu : last + 1;
+				if (whole) range.begin = 0;
+				local.ranges.push_back(range);
+			}
+			if (!readable || local.ranges.empty()) continue;
+
+			/* One place for the whole function is just that place. */
+			if (local.ranges.size() == 1 && local.ranges[0].begin == 0 && local.ranges[0].end == 0xffffffffu) {
+				local.storage = (DebugStorage)local.ranges[0].storage;
+				local.frameOffset = local.ranges[0].frameOffset;
+				local.reg = local.ranges[0].reg;
+				local.ranges.clear();
+			}
+
+			DebugSymbol typed;
+			ApplyDwarfType(dwarf,variable.type,typed);
+			local.typeName = typed.typeName;
+			local.valueSize = typed.valueSize;
+			local.valueKind = typed.valueKind;
+			local.elementSize = typed.elementSize;
+			local.fields = typed.fields;
+			scope.locals.push_back(local);
+		}
+		mapped[i] = (int32_t)out.scopes.size();
+		out.scopes.push_back(scope);
+	}
+}
+
 static void DwarfToDebugInfo(const DwarfInfo &dwarf,const DebugPlacement &placement,const DebugPlacement &layout,
                              DebugInfo &out)
 {
@@ -801,8 +996,10 @@ static void DwarfToDebugInfo(const DwarfInfo &dwarf,const DebugPlacement &placem
 		symbol.module = source.unit;
 		symbol.isFunction = source.function;
 		symbol.source = DEBUG_FORMAT_DWARF;
+		if (source.type != 0) ApplyDwarfType(dwarf,source.type,symbol);
 		out.symbols.push_back(symbol);
 	}
+	DwarfScopes(dwarf,placement,layout,out);
 
 	/* A row covers the code up to the next row; one sharing its address with the next has no code. */
 	for (size_t i = 0;i + 1 < dwarf.lines.size();i++) {

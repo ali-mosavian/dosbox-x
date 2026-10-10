@@ -68,18 +68,26 @@ static bool ByteAt(const std::vector<DebugMemoryRegion> &memory,uint32_t linear,
 	return false;
 }
 
-/* How many of the bytes the loader rewrites differ in memory at `base` from the file's. */
-static size_t RelocatedBytes(const DebugImageObject &object,const std::vector<DebugMemoryRegion> &memory,uint32_t base)
+/* How a copy of the object in memory differs from the file's pages. */
+struct CopyDifference {
+	size_t stray = 0;	/* bytes the loader leaves alone that are not the file's: not this object's copy, or changed since */
+	size_t relocated = 0;	/* bytes the loader rewrites that are not the file's: it did its work here */
+};
+
+static CopyDifference DifferenceFromFile(const DebugImageObject &object,const std::vector<DebugMemoryRegion> &memory,
+                                         uint32_t base)
 {
-	size_t changed = 0;
+	CopyDifference difference;
 	for (size_t p = 0;p < object.pages.size();p++) {
 		const DebugImagePage &page = object.pages[p];
 		for (size_t i = 0;i < page.bytes.size();i++) {
 			uint8_t at = 0;
-			if (!page.fixed[i] && ByteAt(memory,base + page.offset + (uint32_t)i,at) && at != page.bytes[i]) changed++;
+			if (!ByteAt(memory,base + page.offset + (uint32_t)i,at) || at == page.bytes[i]) continue;
+			if (page.fixed[i]) difference.stray++;
+			else difference.relocated++;
 		}
 	}
-	return changed;
+	return difference;
 }
 
 /* Found, with `base` set; or not found. An object with nothing to look for
@@ -125,17 +133,19 @@ static bool LocateObject(const DebugImageObject &object,const std::vector<DebugM
 		return true;
 	}
 
-	/* A loader reads through a buffer, which keeps a copy of the file's bytes. The object it
-	 * placed is the one where the bytes it rewrites differ from the file's. */
+	/* A loader reads through a buffer, which keeps copies of the file's pages, whole or overwritten
+	 * in part. The object it placed is the one that is the file's but for the bytes it rewrites. */
+	size_t bestStray = (size_t)-1;
 	size_t bestRelocated = 0;
 	size_t winners = 0;
 	for (size_t l = 0;l < leaders.size();l++) {
-		const size_t relocated = RelocatedBytes(object,memory,leaders[l]);
-		if (relocated > bestRelocated) {
-			bestRelocated = relocated;
+		const CopyDifference difference = DifferenceFromFile(object,memory,leaders[l]);
+		if (difference.stray < bestStray || (difference.stray == bestStray && difference.relocated > bestRelocated)) {
+			bestStray = difference.stray;
+			bestRelocated = difference.relocated;
 			winners = 0;
 		}
-		if (relocated == bestRelocated) {
+		if (difference.stray == bestStray && difference.relocated == bestRelocated) {
 			winners++;
 			base = leaders[l];
 		}

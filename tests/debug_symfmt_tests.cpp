@@ -416,6 +416,29 @@ TEST_F(DebugSymFmtTest, LocateObjectsPrefersTheCopyTheLoaderRelocated)
 	EXPECT_EQ(0x2000u,placement[1]);
 }
 
+/* The loader's buffer is rewritten page after page: a copy of the code with the data page's bytes laid over its
+ * start differed from the file in every masked byte too, and scored as the most relocated. The object is the
+ * copy that is the file's but for the bytes the loader rewrites. */
+TEST_F(DebugSymFmtTest, LocateObjectsDoesNotTakeABufferWithAnotherPageOverItsStart)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	for (int i = 8;i < 12;i++) objects[0].pages[0].fixed[i] = 0;		/* a fixup near the start */
+	objects[0].pages[0].fixed[300] = 0;
+
+	std::vector<uint8_t> memory(0x4000,0);
+	memcpy(&memory[0x1000],&objects[0].pages[0].bytes[0],512);	/* the buffer, its start overwritten */
+	for (int i = 0;i < 16;i++) memory[0x1000+i] = (uint8_t)(0xa0 + i);
+	memcpy(&memory[0x2000],&objects[0].pages[0].bytes[0],512);	/* the object, relocated */
+	memory[0x2000+8] ^= 0x55;				/* one byte of each value differs: the rest were equal */
+	memory[0x2000+300] ^= 0x55;
+	memcpy(&memory[0x3000],&objects[0].pages[0].bytes[0],512);	/* the file as read */
+
+	DebugPlacement placement;
+	ASSERT_TRUE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+	EXPECT_EQ(0x2000u,placement[1]);
+}
+
 TEST_F(DebugSymFmtTest, LocateObjectsWaitsWhileTheImageIsNotLoadedYet)
 {
 	std::vector<DebugImageObject> objects;
@@ -645,6 +668,56 @@ TEST_F(DebugSymFmtTest, DwarfReadsTheLinesAndPublicsJwlinkAppendsToAnLeImage)
 	ASSERT_TRUE(symbol != NULL);
 	EXPECT_EQ(0x28u,symbol->address);
 	EXPECT_TRUE(symbol->function);
+}
+
+/* llrm's DWARF 5 (from an OMF object, relocated by jwlink): locals by frame base and location list, call frame
+ * information, and the types they name. */
+TEST_F(DebugSymFmtTest, DwarfReadsLocalsLocationListsFrameRowsAndTypes)
+{
+	std::vector<uint8_t> data;
+	ASSERT_TRUE(LoadSymbolsFixture("SYMLOC.EXE",data));
+
+	DwarfInfo info;
+	ASSERT_TRUE(DEBUG_ParseDwarf(DebugBytes(data.data(),data.size()),info));
+	EXPECT_EQ(5u,info.version);
+
+	const DwarfScope *add = NULL,*run = NULL;
+	for (size_t i = 0;i < info.scopes.size();i++) {
+		if (info.scopes[i].function == "add") add = &info.scopes[i];
+		if (info.scopes[i].function == "run") run = &info.scopes[i];
+	}
+	ASSERT_TRUE(add != NULL && run != NULL);
+	EXPECT_EQ(DWARF_FRAME_CFA,add->frame);
+
+	/* a parameter arrives in a register, then is kept at a place off the frame */
+	ASSERT_EQ(3u,add->variables.size());
+	const DwarfVariable &first = add->variables[0];
+	EXPECT_EQ("first",first.name);
+	EXPECT_TRUE(first.parameter);
+	ASSERT_EQ(2u,first.where.size());
+	EXPECT_EQ(DWARF_LOCATION_REGISTER,first.where[0].kind);
+	EXPECT_EQ(0u,first.where[0].reg);
+	EXPECT_EQ(DWARF_LOCATION_FRAME,first.where[1].kind);
+	EXPECT_EQ(-12,first.where[1].offset);
+	EXPECT_EQ(first.where[0].end,first.where[1].begin);
+
+	/* the frame address is ESP plus a depth that follows the prologue */
+	ASSERT_FALSE(info.cfa.empty());
+	EXPECT_EQ(4u,info.cfa[0].reg);
+	EXPECT_EQ(4,info.cfa[0].offset);
+	bool deeper = false;
+	for (size_t i = 0;i < info.cfa.size();i++) deeper |= info.cfa[i].offset > 4;
+	EXPECT_TRUE(deeper);
+
+	const DwarfVariable *p = NULL;
+	for (size_t i = 0;i < run->variables.size();i++)
+		if (run->variables[i].name == "p") p = &run->variables[i];
+	ASSERT_TRUE(p != NULL);
+	const std::map<size_t,size_t>::const_iterator type = info.typeIndex.find(p->type);
+	ASSERT_TRUE(type != info.typeIndex.end());
+	EXPECT_EQ("pt",info.types[type->second].name);
+	EXPECT_EQ(2u,info.types[type->second].members.size());
+	EXPECT_EQ(8u,info.types[type->second].size);
 }
 
 TEST_F(DebugSymFmtTest, TheMzImageEndFindsTheBlockWhenTheTrailerIsUnusable)

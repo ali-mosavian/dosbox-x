@@ -528,12 +528,83 @@ struct DwarfSymbol {
 	bool hasSize = false;
 	bool function = false;
 	std::string unit;
+	size_t type = 0;		/* the DIE offset of its type, 0 for none */
+};
+
+/* Where a value is. A range of the code of its own, or the whole function's when begin is 0 and end is all ones. */
+enum DwarfLocationKind {
+	DWARF_LOCATION_NONE,
+	DWARF_LOCATION_ADDRESS,		/* DW_OP_addr */
+	DWARF_LOCATION_FRAME,		/* DW_OP_fbreg: from the function's frame base */
+	DWARF_LOCATION_REGISTER,	/* DW_OP_regN */
+	DWARF_LOCATION_REGISTER_OFFSET	/* DW_OP_bregN */
+};
+
+struct DwarfLocation {
+	DwarfLocationKind kind = DWARF_LOCATION_NONE;
+	uint32_t begin = 0;
+	uint32_t end = 0xffffffffu;
+	int32_t offset = 0;
+	uint16_t reg = 0;		/* DWARF's x86 numbering: 0 EAX, 1 ECX, 2 EDX, 3 EBX, 4 ESP, 5 EBP, 6 ESI, 7 EDI */
+	uint32_t address = 0;
+};
+
+/* What a function's DW_OP_fbreg is measured from. */
+enum DwarfFrame {
+	DWARF_FRAME_CFA,		/* the canonical frame address call frame information gives at each address */
+	DWARF_FRAME_REGISTER
+};
+
+struct DwarfVariable {
+	std::string name;
+	size_t type = 0;
+	bool parameter = false;
+	std::vector<DwarfLocation> where;
+};
+
+/* A function, or a block inside one. */
+struct DwarfScope {
+	std::string function;
+	uint32_t begin = 0;
+	uint32_t end = 0;
+	int parent = -1;
+	DwarfFrame frame = DWARF_FRAME_CFA;
+	uint16_t frameReg = 0;
+	std::vector<DwarfVariable> variables;
+};
+
+/* The canonical frame address is `reg` plus `offset` over [begin, end). */
+struct DwarfCfaRow {
+	uint32_t begin = 0;
+	uint32_t end = 0;
+	uint16_t reg = 4;
+	int32_t offset = 4;
+};
+
+struct DwarfField {
+	std::string name;
+	uint32_t offset = 0;
+	size_t type = 0;
+};
+
+struct DwarfType {
+	uint16_t tag = 0;		/* DW_TAG_* */
+	std::string name;
+	uint32_t size = 0;
+	uint8_t encoding = 0;		/* DW_ATE_* of a base type */
+	size_t target = 0;		/* what a pointer, typedef, array or qualifier refers to */
+	uint32_t count = 0;		/* elements of an array */
+	std::vector<DwarfField> members;
 };
 
 struct DwarfInfo {
 	uint16_t version = 0;		/* the newest info unit's */
 	std::vector<DwarfLine> lines;
 	std::vector<DwarfSymbol> symbols;
+	std::vector<DwarfScope> scopes;
+	std::vector<DwarfCfaRow> cfa;
+	std::vector<DwarfType> types;
+	std::map<size_t,size_t> typeIndex;	/* a type's DIE offset -> its place in `types` */
 	std::vector<std::string> warnings;
 };
 
@@ -622,7 +693,28 @@ enum DebugStorage {
 	 * it pushes and pops, so the displacement holds only where the stack stands at
 	 * the depth the compiler measured it from: the function's body, between its
 	 * prologue and its epilogue. */
-	DEBUG_STORAGE_STACK
+	DEBUG_STORAGE_STACK,
+	/* At a displacement from the canonical frame address: the register and offset
+	 * the function's call frame information gives for the instruction being run. */
+	DEBUG_STORAGE_CFA
+};
+
+/* Where a value is over a range of the code, when that changes: a parameter that arrives in a
+ * register and is kept on the stack once the function has stored it. */
+struct DebugLocalRange {
+	uint32_t begin = 0;		/* load-relative like DebugLine; the store makes it linear */
+	uint32_t end = 0;
+	int storage = 0;		/* a DebugStorage */
+	int32_t frameOffset = 0;
+	uint16_t reg = 0;
+};
+
+/* The canonical frame address is `reg` (x86's own order: 0 EAX ... 4 ESP, 5 EBP) plus `offset`. */
+struct DebugCfaRow {
+	uint32_t begin = 0;		/* load-relative */
+	uint32_t end = 0;
+	uint16_t reg = 4;
+	int32_t offset = 4;
 };
 
 struct DebugLocal {
@@ -640,6 +732,9 @@ struct DebugLocal {
 	uint32_t elementSize = 0;
 	std::vector<DebugField> fields;
 	bool isBasicArray = false;
+	/* When non-empty, where the value is at an address: the range covering it, in place of
+	 * storage, frameOffset and reg above. */
+	std::vector<DebugLocalRange> ranges;
 };
 
 /* A function body or a block inside one, and the variables it holds. */
@@ -670,6 +765,7 @@ struct DebugInfo {
 	std::vector<DebugLine> lines;
 	std::vector<DebugScope> scopes;
 	std::vector<DebugSegment> segments;
+	std::vector<DebugCfaRow> cfa;
 	std::vector<std::string> warnings;
 };
 
