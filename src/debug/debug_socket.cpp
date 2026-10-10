@@ -180,6 +180,7 @@ static int socket_bump_fd(int fd) {
     return fd;
 }
 #include <string.h>
+#include <chrono>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -253,6 +254,10 @@ static std::vector<LinearExecBreakpoint> linear_exec_breakpoints;
 // bp_on_image_load: stop at the entry of the next image placed; bp_on_symbol_load: breakpoints for when one is.
 static bool image_stop_armed = false;
 static std::vector<std::string> symbol_load_specs;
+// A screenshot command waiting for its file: later commands wait too, so replies stay in order.
+static bool screenshot_pending = false;
+static std::string screenshot_path;
+static std::chrono::steady_clock::time_point screenshot_deadline;
 static std::string last_stop_event_json;
 static std::string last_fault_stop_event_json;
 static std::string current_response_id_json;
@@ -3355,7 +3360,8 @@ static void process_command(const std::string& json) {
     }
 
     if (cmd == "screenshot") {
-        // Trigger screenshot capture
+        // Trigger screenshot capture. The reply waits for the file: the frame is drawn on the next
+        // render, so a client that read the file at once found nothing.
         extern void CAPTURE_ScreenShotEvent(bool pressed);
         extern std::string capture_screenshot_override_path;
         extern std::string GetCaptureFilePath(const char * type,const char * ext);
@@ -3365,9 +3371,12 @@ static void process_command(const std::string& json) {
         } else {
             path = GetCaptureFilePath("Screenshot", ".png");
         }
+        long long wait_ms = 5000;
+        json_get_int(json, "timeout_ms", wait_ms);
+        screenshot_path = path;
+        screenshot_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+        screenshot_pending = true;
         CAPTURE_ScreenShotEvent(true);
-        send_ok(json_str("msg", "Screenshot triggered") + "," +
-                json_str("path", path));
         return;
     }
 
@@ -4922,8 +4931,32 @@ void DEBUG_Socket_Shutdown(void) {
     gdb_mode = false;
 }
 
+void DEBUG_Socket_ScreenshotWritten(bool written) {
+    if (!screenshot_pending) return;
+    screenshot_pending = false;
+    if (!written) {
+        send_error("Screenshot could not be written");
+        return;
+    }
+    long long size = -1;
+    FILE* f = fopen(screenshot_path.c_str(), "rb");
+    if (f != NULL) {
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        fclose(f);
+    }
+    send_ok(json_str("msg", "Screenshot written") + "," + json_str("path", screenshot_path) + "," + json_num("size", size));
+}
+
 bool DEBUG_Socket_CheckCommands(void) {
     if (server_socket < 0) return false;
+
+    if (screenshot_pending) {
+        // Nothing else is read until the file is there, or no frame is going to be drawn.
+        if (std::chrono::steady_clock::now() < screenshot_deadline) return false;
+        screenshot_pending = false;
+        send_error("No frame was drawn in time: is the guest stopped?");
+    }
 
     // Accept new connections
     if (client_socket < 0) {
