@@ -53,7 +53,11 @@ enum {
 	S_BLOCK16 = 0x0107,
 	S_LDATA32 = 0x0201,
 	S_GDATA32 = 0x0202,
-	S_PUB32   = 0x0203
+	S_PUB32   = 0x0203,
+	S_LPROC32 = 0x0204,
+	S_GPROC32 = 0x0205,
+	S_BLOCK32 = 0x0207,
+	S_LABEL32 = 0x0209
 };
 
 static std::string SymFormat(const char *fmt,...)
@@ -365,6 +369,27 @@ static bool ParseSymbol(const DebugBytes &body,size_t at,uint16_t kindCode,uint1
 		out.name = body.pstr(at + 25);
 		out.kind = CV_SYM_PROC;
 		return true;
+	case S_LPROC32:
+	case S_GPROC32:
+		/* The same, with 32-bit lengths and offsets: pParent/pEnd/pNext,
+		 * procLength, debugStart, debugEnd, offset u32, segment, procType,
+		 * flags u8, name. */
+		if (at + 33 > body.size()) return false;
+		out.size = body.u32(at + 12);
+		out.hasSize = true;
+		out.offset = body.u32(at + 24);
+		out.segment = body.u16(at + 28);
+		out.type = body.u16(at + 30);
+		out.name = body.pstr(at + 33);
+		out.kind = CV_SYM_PROC;
+		return true;
+	case S_LABEL32:
+		if (at + 7 > body.size()) return false;
+		out.offset = body.u32(at);
+		out.segment = body.u16(at + 4);
+		out.name = body.pstr(at + 7);
+		out.kind = CV_SYM_LABEL;
+		return true;
 	case S_LABEL16:
 		if (at + 5 > body.size()) return false;
 		out.offset = body.u16(at);
@@ -512,6 +537,8 @@ std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t mod
 			switch (kindCode) {
 			case S_LPROC16:
 			case S_GPROC16:
+			case S_LPROC32:
+			case S_GPROC32:
 				if (depth == 0 && symbol.kind == CV_SYM_PROC) {
 					open = CvScope();
 					open.moduleIndex = moduleIndex;
@@ -523,6 +550,7 @@ std::vector<CvSymbol> DEBUG_ParseCvSymbolRun(const DebugBytes &body,uint16_t mod
 				depth++;
 				break;
 			case S_BLOCK16:
+			case S_BLOCK32:
 				if (depth > 0) depth++;
 				break;
 			case S_ENDBLK:

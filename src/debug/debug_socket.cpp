@@ -8,7 +8,8 @@
  *   {"cmd":"continue"}        - Continue execution  
  *   {"cmd":"step"}            - Single step
  *   {"cmd":"step_over"}       - Step over (step past call)
- *   {"cmd":"bp_set","seg":X,"off":Y}  - Set breakpoint
+ *   {"cmd":"bp_set","seg":X,"off":Y}  - Set breakpoint; or "addr":X (linear), or
+ *     "location":"func" / "file.c:29" / "*0x9C7E", resolved like "resolve"
  *   {"cmd":"bp_clear","seg":X,"off":Y} - Clear breakpoint
  *   {"cmd":"bp_list"}         - List breakpoints
  *   {"cmd":"get_load_info"}   - Get latest DOS EXEC COM/EXE load metadata
@@ -82,6 +83,7 @@
 
 #include "debug_socket.h"
 #include "debug_symstore.h"
+#include "debug_symbols.h"
 #include "debug.h"
 #include "cpu.h"
 #include "regs.h"
@@ -2265,6 +2267,17 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    /* A protected-mode loader runs as guest code, so where it put the program
+     * is only known by looking: do that before a command that needs it. */
+    static const char* const symbol_commands[] = {"sym", "sym_list", "resolve", "where", "var", "locals",
+                                                  "line_list", "bp_set", "bp_set_linear_exec"};
+    for (size_t i = 0; i < sizeof(symbol_commands) / sizeof(symbol_commands[0]); i++) {
+        if (cmd == symbol_commands[i]) {
+            DEBUG_ImagesLocate();
+            break;
+        }
+    }
+
     if (cmd == "status") {
         std::string extra = socket_state_fields() + "," +
                 json_num("port", socket_port) + "," +
@@ -2473,7 +2486,20 @@ static void process_command(const std::string& json) {
 
     if (cmd == "bp_set") {
         long long seg = -1, off = -1, addr_linear = -1;
-        
+        std::string spec;
+
+        if (json_get_string(json, "location", spec)) {
+            DebugLocation at;
+            std::string error;
+            if (!DEBUG_Symbols().ResolveLocation(spec, at, error)) {
+                send_error(error.c_str());
+                return;
+            }
+            CBreakpoint::AddBreakpointByAddr((PhysPt)at.linear, false);
+            send_ok(json_str("msg", "Breakpoint set") + "," + location_json(at));
+            return;
+        }
+
         // Check for linear address first, then seg:off
         if (json_get_int(json, "addr", addr_linear)) {
             // Linear/physical address breakpoint - use internal API directly

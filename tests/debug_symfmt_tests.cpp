@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include "../src/debug/debug_image.h"
 #include "../src/debug/debug_symfmt.h"
 
 namespace {
@@ -209,6 +210,192 @@ TEST_F(DebugSymFmtTest, ParseSymbolRunReadsThe32BitPublicForm)
 	EXPECT_EQ(9u,parsed[0].segment);
 	EXPECT_EQ(0x12345678u,parsed[0].offset);
 	EXPECT_EQ(CV_SYM_PUBLIC,parsed[0].kind);
+}
+
+/* A CV4 record: length, kind, then the body. */
+static void AddCvRecord(std::vector<uint8_t> &out,uint16_t kind,const std::vector<uint8_t> &body)
+{
+	const uint16_t length = (uint16_t)(2 + body.size());
+	out.push_back((uint8_t)length); out.push_back((uint8_t)(length >> 8));
+	out.push_back((uint8_t)kind); out.push_back((uint8_t)(kind >> 8));
+	out.insert(out.end(),body.begin(),body.end());
+}
+
+static void AddU32(std::vector<uint8_t> &out,uint32_t value)
+{
+	for (int i = 0;i < 4;i++) out.push_back((uint8_t)(value >> (8 * i)));
+}
+
+static void AddU16(std::vector<uint8_t> &out,uint16_t value)
+{
+	out.push_back((uint8_t)value); out.push_back((uint8_t)(value >> 8));
+}
+
+/* A 32-bit program's functions were skipped whole: GORILLA's LE image has none today, but any
+ * 32-bit CV4 image names its procs S_GPROC32, and `locals` answered nothing for all of them. */
+TEST_F(DebugSymFmtTest, ParseSymbolRunReadsA32BitProcAndItsLocals)
+{
+	std::vector<uint8_t> proc;
+	AddU32(proc,0); AddU32(proc,0); AddU32(proc,0);	/* parent, end, next */
+	AddU32(proc,0x40); AddU32(proc,4); AddU32(proc,0x3c);	/* length, debug start, debug end */
+	AddU32(proc,0x1000);				/* offset */
+	AddU16(proc,2); AddU16(proc,0x100);		/* segment, type */
+	proc.push_back(0);				/* flags */
+	proc.push_back(4); proc.push_back('d'); proc.push_back('r'); proc.push_back('a'); proc.push_back('w');
+
+	std::vector<uint8_t> local;
+	AddU32(local,(uint32_t)-8);			/* BP-relative */
+	AddU16(local,0x74);				/* type */
+	local.push_back(1); local.push_back('x');
+
+	std::vector<uint8_t> body;
+	AddCvRecord(body,0x0205,proc);			/* S_GPROC32 */
+	AddCvRecord(body,0x0200,local);			/* S_BPREL32 */
+	AddCvRecord(body,0x0006,std::vector<uint8_t>());	/* S_ENDBLK */
+
+	std::vector<CvScope> scopes;
+	const std::vector<CvSymbol> parsed = DEBUG_ParseCvSymbolRun(DebugBytes(body.data(),body.size()),1,0,body.size(),&scopes);
+	ASSERT_EQ(1u,parsed.size());
+	EXPECT_EQ("draw",parsed[0].name);
+	EXPECT_EQ(CV_SYM_PROC,parsed[0].kind);
+	EXPECT_EQ(0x1000u,parsed[0].offset);
+	EXPECT_EQ(0x40u,parsed[0].size);
+	ASSERT_EQ(1u,scopes.size());
+	ASSERT_EQ(1u,scopes[0].locals.size());
+	EXPECT_EQ("x",scopes[0].locals[0].name);
+	EXPECT_EQ(-8,scopes[0].locals[0].frameOffset);
+}
+
+/* An LE image whose name tables and entry table were never read: `sym` for an exported function found nothing. */
+TEST_F(DebugSymFmtTest, ParseLeReadsObjectsExportNamesAndEntries)
+{
+	std::vector<uint8_t> le(0x98,0);
+	std::vector<uint8_t> objects,names,entries;
+	AddU32(objects,0x300); AddU32(objects,0x10000); AddU32(objects,5); AddU32(objects,1); AddU32(objects,1); AddU32(objects,0);
+	names.push_back(3); names.push_back('m'); names.push_back('o'); names.push_back('d'); AddU16(names,0);
+	names.push_back(4); names.push_back('m'); names.push_back('a'); names.push_back('i'); names.push_back('n'); AddU16(names,1);
+	names.push_back(0);
+	entries.push_back(1); entries.push_back(3);		/* one 32-bit entry */
+	AddU16(entries,1);					/* in object 1 */
+	entries.push_back(1);					/* flags */
+	AddU32(entries,0x44);
+	entries.push_back(0);
+
+	le[0] = 'L'; le[1] = 'E';
+	le[0x29] = 0x10;					/* page size 4096 */
+	le[0x40] = 0x98;					/* object table, then names, then entries */
+	le[0x44] = 1;
+	le[0x58] = (uint8_t)(0x98 + objects.size());
+	le[0x5c] = (uint8_t)(0x98 + objects.size() + names.size());
+	le.insert(le.end(),objects.begin(),objects.end());
+	le.insert(le.end(),names.begin(),names.end());
+	le.insert(le.end(),entries.begin(),entries.end());
+
+	LeImage image;
+	ASSERT_TRUE(DEBUG_ParseLe(DebugBytes(le.data(),le.size()),image));
+	ASSERT_EQ(1u,image.objects.size());
+	EXPECT_EQ(0x10000u,image.objects[0].base);
+	ASSERT_EQ(2u,image.names.size());
+	EXPECT_EQ("main",image.names[1].name);
+	EXPECT_EQ(1u,image.names[1].ordinal);
+	ASSERT_EQ(1u,image.entries.size());
+	EXPECT_EQ(1u,image.entries[0].object);
+	EXPECT_EQ(0x44u,image.entries[0].offset);
+}
+
+static DebugImageObject PatternObject(uint16_t index,size_t bytes,uint8_t seed)
+{
+	DebugImageObject object;
+	object.index = index;
+	object.size = (uint32_t)bytes;
+	DebugImagePage page;
+	uint32_t state = seed;
+	for (size_t i = 0;i < bytes;i++) {
+		state = state * 1103515245u + 12345u;
+		page.bytes.push_back((uint8_t)(state >> 16));
+	}
+	page.fixed.assign(bytes,1);
+	object.pages.push_back(page);
+	return object;
+}
+
+/* DOS/32A puts objects at addresses nothing records (0x170010, 0x180500 in GORILLA); a map read as if
+ * loaded at the stub's segment named every function 0x8250 + offset. */
+TEST_F(DebugSymFmtTest, LocateObjectsFindsEachObjectWhereItsBytesAre)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	objects.push_back(PatternObject(2,512,91));
+
+	std::vector<uint8_t> memory(0x10000,0);
+	memcpy(&memory[0x3010],&objects[0].pages[0].bytes[0],512);
+	memcpy(&memory[0x8500],&objects[1].pages[0].bytes[0],512);
+
+	DebugPlacement placement;
+	ASSERT_TRUE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+	EXPECT_EQ(0x3010u,placement[1]);
+	EXPECT_EQ(0x8500u,placement[2]);
+}
+
+TEST_F(DebugSymFmtTest, LocateObjectsIgnoresTheBytesALoaderRelocates)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	objects[0].pages[0].fixed[8] = 0;			/* a fixup sits inside the first window */
+	std::vector<uint8_t> memory(0x4000,0);
+	memcpy(&memory[0x1000],&objects[0].pages[0].bytes[0],512);
+	memory[0x1008] ^= 0xff;
+
+	DebugPlacement placement;
+	ASSERT_TRUE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+	EXPECT_EQ(0x1000u,placement[1]);
+}
+
+/* A loader reads through a low buffer, so a copy of a page can outlive the load: two matches are no answer. */
+TEST_F(DebugSymFmtTest, LocateObjectsDeclinesWhenTwoPlacesMatchEqually)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	std::vector<uint8_t> memory(0x4000,0);
+	memcpy(&memory[0x1000],&objects[0].pages[0].bytes[0],512);
+	memcpy(&memory[0x2000],&objects[0].pages[0].bytes[0],512);
+
+	DebugPlacement placement;
+	EXPECT_FALSE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+}
+
+TEST_F(DebugSymFmtTest, LocateObjectsWaitsWhileTheImageIsNotLoadedYet)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	std::vector<uint8_t> memory(0x4000,0);
+
+	DebugPlacement placement;
+	EXPECT_FALSE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+}
+
+/* WLINK's map writes object:offset; read as paragraphs it put 0001:00001dff at 0x1dff + 0x10. */
+TEST_F(DebugSymFmtTest, PlaceLinkMapRebasesAddressesByObject)
+{
+	LinkMapFile map;
+	DEBUG_ParseLinkMap(
+		"Segment                Class          Group          Address         Size\n"
+		"=======                =====          =====          =======         ====\n"
+		"\n"
+		"_TEXT                  CODE           AUTO           0001:00000000   00000593\n"
+		"\n"
+		"Address        Symbol\n"
+		"=======        ======\n"
+		"\n"
+		"Module: a.obj(a.bas)\n"
+		"0001:00001dff* DOSUN\n",
+		"a.map",map);
+	ASSERT_EQ(1u,map.publics.count("DOSUN"));
+
+	DebugPlacement placement;
+	placement[1] = 0x170010;
+	DEBUG_PlaceLinkMap(map,placement);
+	EXPECT_EQ(0x171e0fu,map.publics["DOSUN"].address.mapOffset);
 }
 
 TEST_F(DebugSymFmtTest, TheMzImageEndFindsTheBlockWhenTheTrailerIsUnusable)
