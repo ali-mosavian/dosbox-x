@@ -722,6 +722,16 @@ static void PlaceCodeView(CvInfo &info,const DebugPlacement &bases)
 /* Which object an address of jwlink's DWARF falls in, and how far into it. */
 static bool DwarfObjectOf(const DebugPlacement &layout,uint32_t address,uint16_t &object,uint32_t &offset)
 {
+	/* A segmented image (NE) has no one address space to measure from: every object is "at 0", and the
+	 * line program, which names no segment, is the code's: the first object's. */
+	bool flat = false;
+	for (DebugPlacement::const_iterator it = layout.begin();it != layout.end();++it) flat |= it->second != 0;
+	if (!flat && !layout.empty()) {
+		object = layout.begin()->first;
+		offset = address;
+		return true;
+	}
+
 	bool found = false;
 	uint32_t best = 0;
 	for (DebugPlacement::const_iterator it = layout.begin();it != layout.end();++it) {
@@ -732,6 +742,41 @@ static bool DwarfObjectOf(const DebugPlacement &layout,uint32_t address,uint16_t
 	}
 	offset = address - best;
 	return found;
+}
+
+/* A real-mode image: an address is an offset in the segment its symbol names, a frame paragraph relative to
+ * the load segment (0 for code), the way a LINK .MAP writes it. */
+static void DwarfToRealMode(const DwarfInfo &dwarf,DebugInfo &out)
+{
+	for (size_t i = 0;i < dwarf.symbols.size();i++) {
+		const DwarfSymbol &source = dwarf.symbols[i];
+		DebugSymbol symbol;
+		symbol.name = source.name;
+		symbol.segment = source.segment;
+		symbol.offset = source.address;
+		symbol.segmentBase = (uint32_t)source.segment << 4u;
+		symbol.linear = out.loadLinear + symbol.segmentBase + source.address;
+		symbol.size = source.size;
+		symbol.hasSize = source.hasSize;
+		symbol.module = source.unit;
+		symbol.isFunction = source.function;
+		symbol.source = DEBUG_FORMAT_DWARF;
+		out.symbols.push_back(symbol);
+	}
+
+	for (size_t i = 0;i + 1 < dwarf.lines.size();i++) {
+		const DwarfLine &row = dwarf.lines[i];
+		const uint32_t next = dwarf.lines[i+1].address;
+		if (row.endSequence || !row.statement || row.line == 0 || next <= row.address) continue;
+
+		DebugLine line;
+		line.module = row.unit;
+		line.file = row.file;
+		line.line = (uint16_t)row.line;
+		line.imageOffset = row.address;
+		line.endOffset = next;
+		out.lines.push_back(line);
+	}
 }
 
 static void DwarfToDebugInfo(const DwarfInfo &dwarf,const DebugPlacement &placement,const DebugPlacement &layout,
@@ -823,13 +868,14 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 
 	CvInfo cv;
 	if (!DEBUG_ParseCodeView(data,cv)) {
-		/* DWARF is only read for a protected-mode image, whose objects were placed. */
+		/* A placed protected-mode image maps DWARF through where its objects went; a real-mode one through the load segment. */
 		DwarfInfo dwarf;
-		if (placement == NULL || layout == NULL || !DEBUG_ParseDwarf(data,dwarf)) return false;
+		if (!DEBUG_ParseDwarf(data,dwarf)) return false;
 		out.format = DEBUG_FORMAT_DWARF;
 		out.version = "DWARF " + std::to_string(dwarf.version);
 		out.warnings = dwarf.warnings;
-		DwarfToDebugInfo(dwarf,*placement,*layout,out);
+		if (placement != NULL && layout != NULL) DwarfToDebugInfo(dwarf,*placement,*layout,out);
+		else DwarfToRealMode(dwarf,out);
 		return true;
 	}
 
