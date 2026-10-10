@@ -44,6 +44,9 @@ extern bool ignore_opcode_63;
 
 #if C_DEBUG
 #include "debug.h"
+#if C_DEBUG
+#include "debug/debug_profile.h"
+#endif
 #endif
 
 #if C_DEBUG
@@ -208,6 +211,7 @@ Bits CPU_Core_Normal_Run(void) {
 			static uint32_t prev_cs_val = 0;
 			static bool     prev_valid  = false;
 			static uint32_t prev_esp    = 0;
+			static uint32_t prev_csbase = 0;
 			uint32_t cur_cseip  = (uint32_t)core.cseip;
 			uint32_t cur_cs_val = SegValue(cs);
 			if (prev_valid) {
@@ -226,7 +230,13 @@ Bits CPU_Core_Normal_Run(void) {
 				if (debug_images_waiting && (transfer || ((cur_cseip ^ prev_cseip) >> 12)))
 					DEBUG_ImagesExecuted(cur_cseip);
 			}
+			if (debug_profiling) {
+				if (prev_valid && cur_cseip != debug_sequential_next)
+					DEBUG_ProfileTransfer(prev_cseip, prev_esp, prev_csbase, cur_cseip, (uint32_t)SegPhys(cs));
+				if (cur_cseip - debug_profile_begin >= debug_profile_length) DEBUG_ProfileEnter(cur_cseip);
+			}
 			dosrun_instructions += dosrun_counting;
+			prev_csbase = (uint32_t)SegPhys(cs);
 			prev_cseip  = cur_cseip;
 			prev_cs_val = cur_cs_val;
 			prev_esp    = reg_esp;

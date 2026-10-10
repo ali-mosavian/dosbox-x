@@ -3,6 +3,7 @@
  */
 
 #include "debug_symstore.h"
+#include "debug_profile.h"
 #include "dos_inc.h"
 
 #include <algorithm>
@@ -46,8 +47,15 @@ static bool ModuleNameMatches(const std::string &candidate,const std::string &re
 	return base == bare;
 }
 
+void DebugSymbolStore::Touch()
+{
+	generation++;
+	DEBUG_ProfileInvalidate();
+}
+
 void DebugSymbolStore::Clear()
 {
+	Touch();
 	symbols.clear();
 	lines.clear();
 	scopes.clear();
@@ -57,6 +65,7 @@ void DebugSymbolStore::Clear()
 
 void DebugSymbolStore::ClearProgram(const std::string &program)
 {
+	Touch();
 	std::vector<DebugSymbol> keptSymbols;
 	for (size_t i = 0;i < symbols.size();i++)
 		if (symbols[i].program != program) keptSymbols.push_back(symbols[i]);
@@ -116,6 +125,7 @@ void DebugSymbolStore::AddSegments(const std::vector<DebugSegment> &from,uint32_
 
 void DebugSymbolStore::Flatten()
 {
+	Touch();
 	std::vector<uint32_t> bounds;
 	for (size_t i = 0;i < segments.size();i++) {
 		bounds.push_back(segments[i].begin);
@@ -163,11 +173,13 @@ const DebugProgramSegment *DebugSymbolStore::ProgramDataAt(uint32_t linear) cons
 
 void DebugSymbolStore::Add(const DebugSymbol &symbol)
 {
+	Touch();
 	symbols.push_back(symbol);
 }
 
 void DebugSymbolStore::AddDebugInfo(const DebugInfo &info,const std::string &program)
 {
+	Touch();
 	for (size_t i = 0;i < info.symbols.size();i++) {
 		DebugSymbol symbol = info.symbols[i];
 		symbol.program = program;
@@ -223,6 +235,7 @@ void DebugSymbolStore::AddDebugInfo(const DebugInfo &info,const std::string &pro
 
 void DebugSymbolStore::AddLinkMap(const LinkMapFile &map,uint32_t loadLinear,const std::string &program)
 {
+	Touch();
 	/* The map keys each public twice, as written and upper-cased, so adding
 	 * every entry would double every symbol. */
 	for (std::map<std::string,LinkMapPublic>::const_iterator it = map.publics.begin();it != map.publics.end();++it) {
@@ -243,6 +256,7 @@ void DebugSymbolStore::AddLinkMap(const LinkMapFile &map,uint32_t loadLinear,con
 void DebugSymbolStore::AddExports(const std::vector<DebugImageExport> &exports,const DebugPlacement &placement,
                                   const std::string &program)
 {
+	Touch();
 	for (size_t i = 0;i < exports.size();i++) {
 		const DebugPlacement::const_iterator base = placement.find(exports[i].object);
 		if (base == placement.end()) continue;

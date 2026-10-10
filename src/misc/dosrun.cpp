@@ -12,6 +12,8 @@
  *   :write A[-B]
  *              stop when anything writes linear A, or A..B inclusive (hex),
  *              and report where, the value, and the state as a crash does
+ *   :profile   count the job's executed instructions and memory operands by function
+ *              and source line, self and inclusive, and report them before the end
  *   :cwd, :env, :drives, :ls [PATTERN]
  *              queries, answered in order with the command lines
  *   anything else is a shell command line, run in order
@@ -29,6 +31,8 @@
  *                                        a write a :write range caught
  *   {"ev":"state",...}                   registers, source line and last branches,
  *                                        unless the job simply exited
+ *   {"ev":"profile","instructions":N,"functions":[...],"lines":[...]}
+ *                                        a :profile job's counts, see the socket's "profile"
  *   {"ev":"end","reason":...,...}        exit | crash | write | limit | wall, with emulated ms,
  *                                        host CPU ms and CS:EIP
  *   {"ev":"query","q":...,"result":...}  a query's answer, from DOS's own state
@@ -68,6 +72,7 @@
 #include "cpu.h"
 #include "debug/debug_socket.h"
 #include "debug/debug_symstore.h"
+#include "debug/debug_profile.h"
 
 #include <algorithm>
 #include <deque>
@@ -99,6 +104,7 @@ bool watch = true;
 /* The :write ranges, [lo, hi] linear. */
 std::vector<std::pair<uint32_t, uint32_t>> write_breaks;
 bool keep = false;
+bool profile = false; /* the job counts by function and line, and reports it */
 bool forked = false; /* this process shares an older one's host state */
 unsigned depth = 0;  /* kept machines below this one */
 double fork_cpu_ms = 0; /* a child's rusage starts at zero on Linux, not everywhere */
@@ -339,6 +345,10 @@ void report(const char *reason) {
         emit(state());
         emit(trace());
     }
+    if (profile) {
+        DEBUG_ProfileStop();
+        emit("{\"ev\":\"profile\"," + DEBUG_ProfileJson() + "}");
+    }
     /* host CPU time, not wall time: other load on the host does not count */
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
@@ -373,6 +383,7 @@ bool read_job(unsigned &wall, bool &pop) {
     wall = 0;
     watch = true;
     keep = false;
+    profile = false;
     pop = false;
     write_breaks.clear();
     std::string buf;
@@ -382,6 +393,7 @@ bool read_job(unsigned &wall, bool &pop) {
         else if (!buf.compare(0, 6, ":wall ")) wall = (unsigned)strtoul(buf.c_str() + 6, NULL, 10);
         else if (buf == ":nowatch") watch = false;
         else if (buf == ":keep") keep = true;
+        else if (buf == ":profile") profile = true;
         else if (buf == ":pop") pop = true;
         else if (!buf.compare(0, 7, ":write ")) {
             char *end = NULL;
@@ -486,6 +498,7 @@ void serve() {
             transfers = 0;
             dosrun_counting = false;
             dosrun_instructions = dosrun_memory = 0;
+            if (profile) DEBUG_ProfileStart();
             dosrun_watch = watch;
             dosrun_writes = !write_breaks.empty();
             signal(SIGALRM, on_alarm);
