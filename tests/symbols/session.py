@@ -36,12 +36,27 @@ class Session:
                 break
             except OSError:
                 time.sleep(0.2)
-        self.lines = self.sock.makefile("r")
+        self.pending = b""
         self.events: list[dict] = []
+
+    def readline(self, timeout: float | None = None) -> str | None:
+        """One line from the socket, waiting up to `timeout` seconds (forever when None); None on timeout. A line
+        that came in with the previous one is already here, which select on the socket would not say."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while b"\n" not in self.pending:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and (left <= 0 or not select.select([self.sock], [], [], left)[0]):
+                return None
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("the emulator closed the socket")
+            self.pending += chunk
+        line, _, self.pending = self.pending.partition(b"\n")
+        return line.decode()
 
     def read(self) -> dict:
         while True:
-            message = json.loads(self.lines.readline())
+            message = json.loads(self.readline())
             if "status" in message:
                 return message
             self.events.append(message)
@@ -52,27 +67,19 @@ class Session:
 
     def wait_stopped(self, seconds: float) -> bool:
         """Until the program hits a breakpoint: the emulator reports it as a "stopped" event."""
-        deadline = time.monotonic() + seconds
-        while not any(e.get("event") == "stopped" for e in self.events):
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.sock], [], [], left)[0]:
-                return False
-            message = json.loads(self.lines.readline())
-            if "status" not in message:
-                self.events.append(message)
-        return True
+        return self.wait_event("stopped", seconds, keep=True) is not None
 
-    def wait_event(self, name: str, seconds: float) -> dict | None:
-        """The first event of that name not yet taken, or None after `seconds`."""
+    def wait_event(self, name: str, seconds: float, keep: bool = False) -> dict | None:
+        """The first event of that name not yet taken (left in place when `keep`), or None after `seconds`."""
         deadline = time.monotonic() + seconds
         while True:
             for i, event in enumerate(self.events):
                 if event.get("event") == name:
-                    return self.events.pop(i)
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.sock], [], [], left)[0]:
+                    return event if keep else self.events.pop(i)
+            line = self.readline(max(0.0, deadline - time.monotonic()))
+            if line is None:
                 return None
-            message = json.loads(self.lines.readline())
+            message = json.loads(line)
             if "status" not in message:
                 self.events.append(message)
 

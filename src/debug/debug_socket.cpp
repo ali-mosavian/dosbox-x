@@ -258,6 +258,8 @@ static std::vector<std::string> symbol_load_specs;
 static bool screenshot_pending = false;
 static std::string screenshot_path;
 static std::chrono::steady_clock::time_point screenshot_deadline;
+// Set when a key is injected: BIOS INT 16h (which DOS's keyboard functions call) reports the first read that finds nothing.
+bool debug_key_wait_armed = false;
 static std::string last_stop_event_json;
 static std::string last_fault_stop_event_json;
 static std::string current_response_id_json;
@@ -3864,7 +3866,16 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    if (cmd == "key_wait_arm") {
+        // The next time the guest reads the keyboard and finds nothing there: one key_wait event.
+        debug_key_wait_armed = true;
+        send_ok(json_bool("armed", true));
+        return;
+    }
+
     if (cmd == "key" || cmd == "keypress") {
+        // The key goes in; the next read that finds the buffer empty again is when the program is done with it.
+        debug_key_wait_armed = true;
         // Inject a single key or special key
         std::string key;
         long long scancode = -1, ascii = -1;
@@ -4946,6 +4957,15 @@ void DEBUG_Socket_ScreenshotWritten(bool written) {
         fclose(f);
     }
     send_ok(json_str("msg", "Screenshot written") + "," + json_str("path", screenshot_path) + "," + json_num("size", size));
+}
+
+void DEBUG_Socket_KeyWait(uint8_t function) {
+    debug_key_wait_armed = false;
+    if (client_socket < 0 || gdb_mode) return;
+    char at[32];
+    snprintf(at, sizeof(at), "%04X:%08X", SegValue(cs), (unsigned)reg_eip);
+    send_response("{" + json_str("event", "key_wait") + "," + json_hex("function", function) + "," +
+                  json_str("at", at) + "," + json_hex("linear", (uint32_t)GetAddress(SegValue(cs), reg_eip)) + "}");
 }
 
 bool DEBUG_Socket_CheckCommands(void) {
