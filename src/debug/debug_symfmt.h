@@ -435,6 +435,8 @@ bool DEBUG_IsCodeClass(const std::string &className);
  * protected-mode loader places each object separately, so its readers are
  * given where. */
 typedef std::map<uint16_t,uint32_t> DebugPlacement;
+/* DWARF from jwlink gives each address as its distance from the start of the image's first
+ * object, as the linker laid them out: where each object began, by that measure. */
 
 struct LinkMapFile {
 	std::string sourceName;
@@ -504,6 +506,40 @@ struct LeImage {
 /* Reads an LE image, bound to a DOS stub or bare. False when it is not one. */
 bool DEBUG_ParseLe(const DebugBytes &data,LeImage &out);
 
+/* ---- DWARF 2 to 5 ---- */
+
+/* One row of a line program, with the file and unit it names. */
+struct DwarfLine {
+	uint32_t address = 0;
+	uint32_t line = 0;
+	bool endSequence = false;
+	bool statement = true;
+	std::string file;
+	std::string unit;
+};
+
+/* A named piece of code or data. The address is as the producer wrote it: an offset
+ * within `segment` for jwlink, where 0 means the image's first code object. */
+struct DwarfSymbol {
+	std::string name;
+	uint32_t address = 0;
+	uint16_t segment = 0;
+	uint32_t size = 0;
+	bool hasSize = false;
+	bool function = false;
+	std::string unit;
+};
+
+struct DwarfInfo {
+	uint16_t version = 0;		/* the newest info unit's */
+	std::vector<DwarfLine> lines;
+	std::vector<DwarfSymbol> symbols;
+	std::vector<std::string> warnings;
+};
+
+/* Reads the ELF block of DWARF a linker appends to an executable (or an ELF file itself). */
+bool DEBUG_ParseDwarf(const DebugBytes &data,DwarfInfo &out);
+
 /* ---- format-independent layer ---- */
 
 enum DebugFormatId {
@@ -511,7 +547,8 @@ enum DebugFormatId {
 	DEBUG_FORMAT_TDINFO,
 	DEBUG_FORMAT_WATCOM,
 	DEBUG_FORMAT_MAP,
-	DEBUG_FORMAT_EXPORT		/* a name the executable itself exports */
+	DEBUG_FORMAT_EXPORT,		/* a name the executable itself exports */
+	DEBUG_FORMAT_DWARF
 };
 
 struct DebugModule {
@@ -651,7 +688,7 @@ std::map<uint16_t,uint32_t> DEBUG_CvSegmentBases(const CvInfo &info);
  * the path matters and not only the bytes. */
 bool DEBUG_ParseDebugInfo(const char *file,uint32_t loadLinear,DebugInfo &out);
 bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out,
-                               const DebugPlacement *placement = NULL);
+                               const DebugPlacement *placement = NULL,const DebugPlacement *layout = NULL);
 
 /* A map's segments, load-relative, code by DEBUG_IsCodeClass. */
 std::vector<DebugSegment> DEBUG_LinkMapSegments(const LinkMapFile &map);

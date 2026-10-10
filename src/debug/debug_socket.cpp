@@ -609,6 +609,7 @@ static const char* symbol_source_name(DebugFormatId source) {
     case DEBUG_FORMAT_WATCOM:   return "watcom";
     case DEBUG_FORMAT_MAP:      return "map";
     case DEBUG_FORMAT_EXPORT:   return "export";
+    case DEBUG_FORMAT_DWARF:    return "dwarf";
     }
     return "unknown";
 }

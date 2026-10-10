@@ -24,6 +24,7 @@ struct DebugImageObject {
 	uint16_t index = 0;		/* 1-based, the number linkers and debug info use */
 	uint32_t size = 0;
 	bool code = false;
+	uint32_t linkBase = 0;		/* the address the linker gave it, where the format has one */
 	std::vector<DebugImagePage> pages;
 };
 

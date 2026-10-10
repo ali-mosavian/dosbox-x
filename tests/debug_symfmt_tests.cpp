@@ -396,6 +396,26 @@ TEST_F(DebugSymFmtTest, LocateObjectsDeclinesWhenTwoPlacesMatchEqually)
 	EXPECT_FALSE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
 }
 
+/* DOS/32A reads through an 8 KB buffer that keeps the last pages it read, with the file's bytes in them. A tiny
+ * image has nothing but that copy and the loaded one, and two equal matches declined the code object: its
+ * symbols never appeared. The loaded copy is the one whose relocated bytes differ from the file's. */
+TEST_F(DebugSymFmtTest, LocateObjectsPrefersTheCopyTheLoaderRelocated)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	objects[0].pages[0].fixed[300] = 0;			/* a fixup the first windows do not cover */
+	objects[0].pages[0].fixed[301] = 0;
+
+	std::vector<uint8_t> memory(0x4000,0);
+	memcpy(&memory[0x1000],&objects[0].pages[0].bytes[0],512);	/* the loader's buffer: the file as read */
+	memcpy(&memory[0x2000],&objects[0].pages[0].bytes[0],512);	/* the object, relocated */
+	memory[0x2000+300] ^= 0x55;
+
+	DebugPlacement placement;
+	ASSERT_TRUE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+	EXPECT_EQ(0x2000u,placement[1]);
+}
+
 TEST_F(DebugSymFmtTest, LocateObjectsWaitsWhileTheImageIsNotLoadedYet)
 {
 	std::vector<DebugImageObject> objects;
@@ -589,6 +609,42 @@ TEST_F(DebugSymFmtTest, D32ImageGivesCodeAndDataWithRelocationsMaskedAndTheExpor
 	EXPECT_EQ("add",image.exports[0].name);
 	EXPECT_EQ(1u,image.exports[0].object);
 	EXPECT_EQ(4u,image.exports[0].offset);
+}
+
+/* The same, read from the symbols tests' images: found by walking up to tests/symbols/fixtures. */
+static bool LoadSymbolsFixture(const char *name,std::vector<uint8_t> &out)
+{
+	std::string prefix = ".";
+	for (int up = 0;up < 6;up++) {
+		if (DEBUG_ReadHostFile((prefix + "/tests/symbols/fixtures/" + name).c_str(),out)) return true;
+		prefix += "/..";
+	}
+	return false;
+}
+
+/* A `debug dwarf` image carried its lines and publics in an ELF block no reader opened: `where` named no source line. */
+TEST_F(DebugSymFmtTest, DwarfReadsTheLinesAndPublicsJwlinkAppendsToAnLeImage)
+{
+	std::vector<uint8_t> data;
+	ASSERT_TRUE(LoadSymbolsFixture("SYMLED.EXE",data));
+
+	DwarfInfo info;
+	ASSERT_TRUE(DEBUG_ParseDwarf(DebugBytes(data.data(),data.size()),info));
+	EXPECT_EQ(2u,info.version);
+	EXPECT_TRUE(info.warnings.empty());
+
+	const DwarfLine *bump = NULL;
+	for (size_t i = 0;i < info.lines.size();i++)
+		if (info.lines[i].file == "prog.c" && info.lines[i].line == 11) bump = &info.lines[i];
+	ASSERT_TRUE(bump != NULL);
+	EXPECT_EQ(0x28u,bump->address);
+
+	const DwarfSymbol *symbol = NULL;
+	for (size_t i = 0;i < info.symbols.size();i++)
+		if (info.symbols[i].name == "bump_") symbol = &info.symbols[i];
+	ASSERT_TRUE(symbol != NULL);
+	EXPECT_EQ(0x28u,symbol->address);
+	EXPECT_TRUE(symbol->function);
 }
 
 TEST_F(DebugSymFmtTest, TheMzImageEndFindsTheBlockWhenTheTrailerIsUnusable)

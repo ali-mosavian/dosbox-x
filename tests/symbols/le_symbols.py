@@ -34,6 +34,7 @@ def run(dosbox: str, program: str, debug_info: bool) -> None:
         images = s.send({"cmd": "images"}).get("images", [])
         mine = [i for i in images if i["program"].upper().endswith(program)]
         placed = mine[0]["placed"] if mine else []
+        check(f"{tag}_images_lists_the_program_once", len(mine) == 1, images)
         check(f"{tag}_images_lists_the_program_placed_in_extended_memory",
               bool(mine) and mine[0]["complete"] and placed and int(placed[0]["linear"], 16) > EXTENDED, images)
 

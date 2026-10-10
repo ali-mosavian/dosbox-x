@@ -187,6 +187,7 @@ bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out)
 		image.index = (uint16_t)(o + 1);
 		image.size = object.size;
 		image.code = (object.flags & 0x4) != 0;
+		image.linkBase = object.base;
 
 		const size_t pageCount = object.pageCount;
 		std::vector<std::vector<uint8_t> > fixed(pageCount,std::vector<uint8_t>(pageSize,1));
@@ -207,7 +208,9 @@ bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out)
 			DebugImagePage page;
 			page.offset = (uint32_t)(p * pageSize);
 			if (page.offset >= object.size) break;
-			const size_t length = std::min(pageSize,(size_t)object.size - page.offset);
+			/* The image's last page holds only what its header says; the bytes after it are not the object's. */
+			const size_t held = number == data.u32(header + 0x14) ? (data.u32(header + 0x2c) ? data.u32(header + 0x2c) : pageSize) : pageSize;
+			const size_t length = std::min(std::min(pageSize,held),(size_t)object.size - page.offset);
 			const DebugBytes bytes = data.sub(dataPages + (size_t)(file - 1) * pageSize,length);
 			page.bytes.assign(bytes.data(),bytes.data() + bytes.size());
 			page.fixed.assign(fixed[p].begin(),fixed[p].begin() + page.bytes.size());

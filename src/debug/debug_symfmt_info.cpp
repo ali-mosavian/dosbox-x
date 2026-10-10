@@ -719,8 +719,70 @@ static void PlaceCodeView(CvInfo &info,const DebugPlacement &bases)
 	info.segments.swap(placed);
 }
 
+/* Which object an address of jwlink's DWARF falls in, and how far into it. */
+static bool DwarfObjectOf(const DebugPlacement &layout,uint32_t address,uint16_t &object,uint32_t &offset)
+{
+	bool found = false;
+	uint32_t best = 0;
+	for (DebugPlacement::const_iterator it = layout.begin();it != layout.end();++it) {
+		if (it->second > address || (found && it->second < best)) continue;
+		best = it->second;
+		object = it->first;
+		found = true;
+	}
+	offset = address - best;
+	return found;
+}
+
+static void DwarfToDebugInfo(const DwarfInfo &dwarf,const DebugPlacement &placement,const DebugPlacement &layout,
+                             DebugInfo &out)
+{
+	for (size_t i = 0;i < dwarf.symbols.size();i++) {
+		const DwarfSymbol &source = dwarf.symbols[i];
+		uint16_t object = source.segment;
+		uint32_t offset = source.address;
+		if (object == 0 && !DwarfObjectOf(layout,source.address,object,offset)) continue;
+		const DebugPlacement::const_iterator base = placement.find(object);
+		if (base == placement.end()) continue;
+
+		DebugSymbol symbol;
+		symbol.name = source.name;
+		symbol.segment = object;
+		symbol.offset = offset;
+		symbol.segmentBase = base->second;
+		symbol.linear = base->second + offset;
+		symbol.size = source.size;
+		symbol.hasSize = source.hasSize;
+		symbol.module = source.unit;
+		symbol.isFunction = source.function;
+		symbol.source = DEBUG_FORMAT_DWARF;
+		out.symbols.push_back(symbol);
+	}
+
+	/* A row covers the code up to the next row; one sharing its address with the next has no code. */
+	for (size_t i = 0;i + 1 < dwarf.lines.size();i++) {
+		const DwarfLine &row = dwarf.lines[i];
+		if (row.endSequence || !row.statement || row.line == 0) continue;
+
+		uint16_t object = 0;
+		uint32_t offset = 0;
+		if (!DwarfObjectOf(layout,row.address,object,offset)) continue;
+		const DebugPlacement::const_iterator base = placement.find(object);
+		const uint32_t next = dwarf.lines[i+1].address;
+		if (base == placement.end() || next <= row.address) continue;
+
+		DebugLine line;
+		line.module = row.unit;
+		line.file = row.file;
+		line.line = (uint16_t)row.line;
+		line.imageOffset = base->second + offset;
+		line.endOffset = line.imageOffset + (next - row.address);
+		out.lines.push_back(line);
+	}
+}
+
 bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out,
-                               const DebugPlacement *placement)
+                               const DebugPlacement *placement,const DebugPlacement *layout)
 {
 	out.file = file != NULL ? file : "";
 	out.loadLinear = loadLinear;
@@ -760,7 +822,16 @@ bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t 
 	}
 
 	CvInfo cv;
-	if (!DEBUG_ParseCodeView(data,cv)) return false;
+	if (!DEBUG_ParseCodeView(data,cv)) {
+		/* DWARF is only read for a protected-mode image, whose objects were placed. */
+		DwarfInfo dwarf;
+		if (placement == NULL || layout == NULL || !DEBUG_ParseDwarf(data,dwarf)) return false;
+		out.format = DEBUG_FORMAT_DWARF;
+		out.version = "DWARF " + std::to_string(dwarf.version);
+		out.warnings = dwarf.warnings;
+		DwarfToDebugInfo(dwarf,*placement,*layout,out);
+		return true;
+	}
 
 	if (placement != NULL) PlaceCodeView(cv,*placement);
 	out.format = DEBUG_FORMAT_CODEVIEW;
