@@ -99,6 +99,9 @@
 
 #include "debug_socket.h"
 #include "vga.h"
+#include "pic.h"
+extern bool ticksLocked;
+#include "vtime.h"
 #include "debug_symstore.h"
 #include "debug_symbols.h"
 #include "debug.h"
@@ -3036,6 +3039,35 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    if (cmd == "virtual_time_status") {
+        send_ok(json_bool("on", ticksLocked && CPU_CycleAutoAdjust == false) + "," + json_num("cycles_per_ms", (long long)CPU_CycleMax) + "," +
+                json_bool("skip_idle", vtime_skip_idle) + "," + json_num("skipped_ms", (long long)VTIME_SkippedMs()) + "," +
+                json_num("clock_reads", (long long)VTIME_ClockReads()) + "," + json_num("emulated_us", (long long)(PIC_FullIndex() * 1000.0)));
+        return;
+    }
+
+    if (cmd == "virtual_time") {
+        // Guest time that follows what the guest runs: a fixed cycle count per emulated millisecond, no host
+        // throttle, no host clock behind the CMOS, and (skip_idle) the idle part of a clock-polling wait skipped.
+        long long on = 1, cycles = 25000, epoch = 0;
+        json_get_int(json, "on", on);
+        json_get_int(json, "cycles_per_ms", cycles);
+        json_get_int(json, "epoch", epoch);
+        // skip_idle defaults to on; only false or 0 turns it off.
+        bool skip = true;
+        const size_t at = json.find("\"skip_idle\":");
+        if (at != std::string::npos) {
+            size_t v = at + 12;
+            while (v < json.length() && json[v] == ' ') v++;
+            skip = json.compare(v, 5, "false") != 0 && json.compare(v, 1, "0") != 0;
+        }
+        if (on) VTIME_Enable((uint32_t)cycles, skip, epoch);
+        else VTIME_Disable();
+        send_ok(json_bool("on", on != 0) + "," + json_num("cycles_per_ms", (long long)CPU_CycleMax) + "," +
+                json_bool("skip_idle", vtime_skip_idle) + "," + json_num("skipped_ms", (long long)VTIME_SkippedMs()));
+        return;
+    }
+
     if (cmd == "images") {
         DEBUG_ImagesLocate();
         std::string arr;
@@ -5328,6 +5360,15 @@ void DEBUG_Socket_FreezeWait(void) {
         usleep(1000);  // 1ms; keeps host responsive without busy-spinning
     }
     socket_freeze_loop_active = false;
+}
+
+// With virtual time the guest's timeline must not depend on how soon a client connects: the machine waits
+// at its first instruction until one has, and has said continue.
+void DEBUG_Socket_HoldAtStart(void) {
+    static bool held = false;
+    if (held || server_socket < 0 || !VTIME_Configured()) return;
+    held = true;
+    DEBUG_Socket_FreezeWait();
 }
 
 bool DEBUG_Socket_IsActive(void) {

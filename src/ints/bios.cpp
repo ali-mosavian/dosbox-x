@@ -22,6 +22,7 @@
 #include "mem.h"
 #include "cpu.h"
 #include "bios.h"
+#include "vtime.h"
 #include "regs.h"
 #include "timer.h"
 #include "cpu.h"
@@ -3079,6 +3080,7 @@ static void InitRtc () {
 
 static Bitu INT1A_Handler(void) {
     CALLBACK_SIF(true);
+    if (reg_ah <= 0x04) VTIME_ClockRead();
     switch (reg_ah) {
     case 0x00:  /* Get System time */
         {
@@ -11121,7 +11123,7 @@ private:
         const Section_prop* section = static_cast<Section_prop *>(control->GetSection("dosbox"));
         const char *logo_text = section->Get_string("logo text");
         const char *logo = section->Get_string("logo");
-        bool fastbioslogo=section->Get_bool("fastbioslogo")||control->opt_fastbioslogo||control->opt_fastlaunch;
+        bool fastbioslogo=section->Get_bool("fastbioslogo")||control->opt_fastbioslogo||control->opt_fastlaunch||VTIME_Configured();
         if (fastbioslogo && machine != MCH_PC98) {
 #if defined(USE_TTF)
             if (TTF_using()) {

@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <math.h>
 #include "dosbox.h"
+#include "vtime.h"
 #include "inout.h"
 #include "logging.h"
 #include "pic.h"
@@ -739,6 +740,7 @@ static bool pit_any_status(void) {
 
 static Bitu read_latch(Bitu port,Bitu /*iolen*/) {
 //LOG(LOG_PIT,LOG_ERROR)("port read %X",port);
+    VTIME_ClockRead();
 
     // HACK: Port translation for this code PC-98 mode.
     //       0x71,0x73,0x75,0x77 => 0x40-0x43

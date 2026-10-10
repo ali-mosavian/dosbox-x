@@ -29,6 +29,7 @@
 
 #include "control.h"
 #include "dosbox.h"
+#include "vtime.h"
 #include "debug/debug_symbols.h"
 #include "dos_inc.h"
 #include "bios_disk.h"
@@ -1618,6 +1619,7 @@ static Bitu DOS_21Handler(void) {
 #endif
             break;
         case 0x2c: {    /* Get System Time */
+            VTIME_ClockRead();
             // use BIOS to get RTC time
             if (IS_PC98_ARCH) {
                 CPU_Push16(reg_ax);

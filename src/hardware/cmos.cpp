@@ -21,6 +21,7 @@
 #include <math.h>
 
 #include "dosbox.h"
+#include "vtime.h"
 #include "timer.h"
 #include "cpu.h"
 #include "pic.h"
@@ -387,6 +388,7 @@ unsigned char CMOS_GetShutdownByte() {
  */
 
 static Bitu cmos_readreg(Bitu port,Bitu iolen) {
+    VTIME_ClockRead();
     (void)port;//UNUSED
     (void)iolen;//UNUSED
     if (cmos.reg>0x3f) {
@@ -602,7 +604,7 @@ void CMOS_Reset(Section* sec) {
 void CMOS_Init() {
     LOG(LOG_MISC,LOG_DEBUG)("Initializing CMOS/RTC");
 
-    cmos_sync_time(time(NULL));
+    cmos_sync_time(VTIME_StartTime(time(NULL)));
 
     AddExitFunction(AddExitFunctionFuncPair(CMOS_Destroy),true);
     AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(CMOS_Reset));
