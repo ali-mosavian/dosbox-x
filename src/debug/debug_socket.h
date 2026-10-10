@@ -18,6 +18,8 @@
 
 #if C_DEBUG
 
+#include <map>
+#include <string>
 #include <vector>
 
 // A control transfer the normal core observed, as linear addresses.
@@ -32,6 +34,15 @@ struct BranchEntry {
 void DEBUG_Socket_TraceEnable(void);
 // The newest n entries of the branch ring, oldest first.
 std::vector<BranchEntry> DEBUG_Socket_TraceRecent(size_t n);
+
+// An image the emulator watched a loader place is placed far enough to run, and its symbols are registered:
+// where each object went (by number) and, when the format says, its entry. Raises the image_loaded event, and
+// arms what bp_on_image_load and bp_on_symbol_load asked for.
+void DEBUG_Socket_ImageLoaded(const std::string& program, const std::map<uint16_t, uint32_t>& placement,
+                              bool has_entry, uint32_t entry);
+
+// The placement DEBUG_Socket_ImageLoaded was given was found wrong: take back what it set.
+void DEBUG_Socket_ImageMoved(const std::string& program);
 
 // True while the server listens. Breakpoints, watchpoints, steps and reverse
 // checkpoints only stop or record for a client, so the CPU core checks this

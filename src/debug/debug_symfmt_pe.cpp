@@ -148,6 +148,15 @@ bool DEBUG_PeImage(const DebugBytes &data,DebugImage &out)
 		out.objects.push_back(object);
 	}
 
+	/* AddressOfEntryPoint is 16 bytes into the optional header: an RVA, in some section. */
+	const uint32_t entryRva = data.u32(optional + 16);
+	size_t entrySection = 0;
+	if (entryRva != 0 && SectionOf(sections,entryRva,&entrySection)) {
+		out.hasEntry = true;
+		out.entryObject = (uint16_t)(entrySection + 1);
+		out.entryOffset = entryRva - sections[entrySection].rva;
+	}
+
 	size_t exportAt = 0;
 	if (directory[PE_DIR_EXPORT].size != 0 && FileOffset(sections,directory[PE_DIR_EXPORT].rva,exportAt)) {
 		const uint32_t names = data.u32(exportAt + 24);

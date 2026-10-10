@@ -37,6 +37,13 @@
  *     a host file, either a LINK .MAP or a program with debug info in it. Each
  *     program's symbols load by themselves as DOS EXEC runs it, so this is for
  *     files the guest cannot see.
+ *   {"cmd":"bp_on_image_load"} - Stop the guest at the entry of the next protected-mode
+ *     image a loader places (LE, NE, PE), with an "image_loaded" event carrying
+ *     its program, where each object went and its entry. Without it the event
+ *     comes when the image is placed, and the guest runs on. "on":false disarms.
+ *   {"cmd":"bp_on_symbol_load","location":"main"} - When an image is placed, set an
+ *     execution breakpoint there (a function, file:line, ...). It can be given
+ *     before the program starts; bp_on_symbol_load_clear drops all of these.
  *   {"cmd":"images"} - Protected-mode programs the emulator watches for: each with
  *     its object count, the linear address of each object found so far, and
  *     whether all were. A module a program loads at run time (LE, NE, PE, D32X)
@@ -183,6 +190,10 @@ struct LinearExecBreakpoint {
     uint16_t match_seg = 0;
     bool has_match_off = false;
     uint32_t match_off = 0;
+    // Set on the one that watches a loaded image's entry: the event fields to send when it is reached.
+    std::string image_event;
+    // Set on every one an image's placement made, so a placement found wrong can take them back.
+    std::string image_program;
 };
 
 // External declarations from debug.cpp
@@ -234,6 +245,9 @@ static bool gdb_mode = false;  // true = GDB RSP, false = JSON
 static uint8_t last_exception_num = 0xFF;
 static uint32_t last_exception_error = 0;
 static std::vector<LinearExecBreakpoint> linear_exec_breakpoints;
+// bp_on_image_load: stop at the entry of the next image placed; bp_on_symbol_load: breakpoints for when one is.
+static bool image_stop_armed = false;
+static std::vector<std::string> symbol_load_specs;
 static std::string last_stop_event_json;
 static std::string last_fault_stop_event_json;
 static std::string current_response_id_json;
@@ -2973,6 +2987,32 @@ static void process_command(const std::string& json) {
         return;
     }
 
+    if (cmd == "bp_on_image_load") {
+        long long on = 1;
+        json_get_int(json, "on", on);
+        image_stop_armed = on != 0;
+        send_ok(json_bool("armed", image_stop_armed));
+        return;
+    }
+
+    if (cmd == "bp_on_symbol_load") {
+        std::string spec;
+        if (!json_get_string(json, "location", spec)) {
+            send_error("Missing 'location'");
+            return;
+        }
+        symbol_load_specs.push_back(spec);
+        send_ok(json_str("msg", "Breakpoint armed for when its image is loaded") + "," + json_str("location", spec));
+        return;
+    }
+
+    if (cmd == "bp_on_symbol_load_clear") {
+        symbol_load_specs.clear();
+        image_stop_armed = false;
+        send_ok(json_str("msg", "Cleared"));
+        return;
+    }
+
     if (cmd == "images") {
         DEBUG_ImagesLocate();
         std::string arr;
@@ -5049,6 +5089,58 @@ bool DEBUG_Socket_DecrStepArm(void) {
     return (--socket_step_arm == 0);
 }
 
+void DEBUG_Socket_ImageMoved(const std::string& program) {
+    for (size_t i = 0; i < linear_exec_breakpoints.size();) {
+        if (linear_exec_breakpoints[i].image_program == program) linear_exec_breakpoints.erase(linear_exec_breakpoints.begin() + i);
+        else i++;
+    }
+}
+
+void DEBUG_Socket_ImageLoaded(const std::string& program, const std::map<uint16_t, uint32_t>& placement,
+                              bool has_entry, uint32_t entry) {
+    // A placement found wrong, then corrected, leaves nothing of the first one behind.
+    DEBUG_Socket_ImageMoved(program);
+
+    // Breakpoints asked for at symbol-load time exist before anything runs on.
+    std::string armed;
+    for (size_t i = 0; i < symbol_load_specs.size(); i++) {
+        DebugLocation at;
+        std::string error;
+        if (!DEBUG_Symbols().ResolveLocation(symbol_load_specs[i], at, error)) continue;
+        add_linear_exec_breakpoint(at.linear, false);
+        for (size_t b = 0; b < linear_exec_breakpoints.size(); b++)
+            if (linear_exec_breakpoints[b].linear == at.linear && linear_exec_breakpoints[b].image_event.empty())
+                linear_exec_breakpoints[b].image_program = program;
+        if (!armed.empty()) armed += ",";
+        armed += "{" + json_str("location", symbol_load_specs[i]) + "," + json_hex("linear", at.linear) + "}";
+    }
+
+    std::string objects;
+    for (std::map<uint16_t, uint32_t>::const_iterator it = placement.begin(); it != placement.end(); ++it) {
+        if (!objects.empty()) objects += ",";
+        objects += "{" + json_num("object", it->first) + "," + json_hex("linear", it->second) + "}";
+    }
+    std::string fields = json_str("program", program) + ",\"objects\":[" + objects + "]";
+    if (has_entry) fields += "," + json_hex("entry", entry);
+    fields += ",\"breakpoints\":[" + armed + "]";
+
+    if (has_entry) {
+        // Watched at the entry itself: it is where the image starts, and nothing else says so.
+        add_linear_exec_breakpoint(entry, true);
+        for (size_t i = 0; i < linear_exec_breakpoints.size(); i++) {
+            if (linear_exec_breakpoints[i].linear == entry && linear_exec_breakpoints[i].once &&
+                linear_exec_breakpoints[i].image_event.empty()) {
+                linear_exec_breakpoints[i].image_event = fields;
+                linear_exec_breakpoints[i].image_program = program;
+            }
+        }
+        return;
+    }
+    DEBUG_ImageEntered(program);
+    if (client_socket >= 0 && !gdb_mode)
+        send_response("{" + json_str("event", "image_loaded") + "," + fields + "," + json_bool("stopped", false) + "}");
+}
+
 bool DEBUG_Socket_CheckLinearExecBreakpoint(uint16_t seg, uint32_t off) {
     if (linear_exec_breakpoints.empty()) return false;
 
@@ -5063,7 +5155,23 @@ bool DEBUG_Socket_CheckLinearExecBreakpoint(uint16_t seg, uint32_t off) {
         if (it->has_match_off && it->match_off != off) continue;
         if (it->suppress_current) continue;
 
-        if (client_socket >= 0 && !gdb_mode) {
+        if (!it->image_event.empty()) {
+            // The image starts running here. The event always comes; the guest stops only if asked to.
+            const std::string program = it->image_program;
+            const std::string fields = it->image_event;
+            linear_exec_breakpoints.erase(it);
+            DEBUG_ImageEntered(program);
+            if (client_socket >= 0 && !gdb_mode) {
+                if (image_stop_armed) {
+                    send_and_latch_stop("{" + json_str("event", "image_loaded") + "," +
+                                        stop_context_json("image_loaded", seg, off) + "," + fields + "," +
+                                        json_bool("stopped", true) + "," + get_registers_json() + "}");
+                    return true;
+                }
+                send_response("{" + json_str("event", "image_loaded") + "," + fields + "," + json_bool("stopped", false) + "}");
+            }
+            return false;
+        } else if (client_socket >= 0 && !gdb_mode) {
             char addr[32];
             snprintf(addr, sizeof(addr), "%04X:%08X", seg, off);
             send_and_latch_stop("{" + json_str("event", "stopped") + "," +

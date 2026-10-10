@@ -439,6 +439,26 @@ TEST_F(DebugSymFmtTest, LocateObjectsDoesNotTakeABufferWithAnotherPageOverItsSta
 	EXPECT_EQ(0x2000u,placement[1]);
 }
 
+/* An NE segment's relocations leave its bytes as the file has them, so the loader's buffer copy and the loaded
+ * one matched equally and neither was placed. The CPU is running at the image's entry in the loaded one. */
+TEST_F(DebugSymFmtTest, LocateObjectsTakesTheCopyTheCpuRunsTheEntryIn)
+{
+	std::vector<DebugImageObject> objects;
+	objects.push_back(PatternObject(1,512,3));
+	std::vector<uint8_t> memory(0x4000,0);
+	memcpy(&memory[0x1000],&objects[0].pages[0].bytes[0],512);
+	memcpy(&memory[0x2000],&objects[0].pages[0].bytes[0],512);
+
+	DebugPlacement placement;
+	EXPECT_FALSE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement));
+
+	DebugEntryHint hint;
+	hint.object = 1;
+	hint.base = 0x2000;
+	ASSERT_TRUE(DEBUG_LocateObjects(objects,memory.data(),memory.size(),placement,&hint));
+	EXPECT_EQ(0x2000u,placement[1]);
+}
+
 TEST_F(DebugSymFmtTest, LocateObjectsWaitsWhileTheImageIsNotLoadedYet)
 {
 	std::vector<DebugImageObject> objects;

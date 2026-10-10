@@ -197,6 +197,8 @@ Bits CPU_Core_Normal_Run(void) {
 		extern void DEBUG_Socket_TraceRecordBranch(uint32_t, uint32_t, uint32_t, uint32_t);
 		extern void DEBUG_Socket_ReverseInstructionCheckpoint(void);
 		extern uint32_t debug_socket_normal_core_hooks_active;
+		extern bool debug_images_waiting;
+		extern void DEBUG_ImagesExecuted(uint32_t linear);
 		debug_socket_normal_core_hooks_active = 1;
 		// A transfer is execution that does not start where the previous
 		// instruction ended: a sequential one records its end at SAVEIP
@@ -219,6 +221,10 @@ Bits CPU_Core_Normal_Run(void) {
 					DOSRUN_Executes(cur_cs_val, cur_cseip);
 					if (transfer) DOSRUN_Transferred(prev_cs_val, prev_cseip, prev_esp, cur_cs_val, cur_cseip);
 				}
+				// An image the loader is still placing shows itself when execution first
+				// reaches a page: the entry is on one nobody has run before.
+				if (debug_images_waiting && (transfer || ((cur_cseip ^ prev_cseip) >> 12)))
+					DEBUG_ImagesExecuted(cur_cseip);
 			}
 			dosrun_instructions += dosrun_counting;
 			prev_cseip  = cur_cseip;

@@ -13,7 +13,9 @@
 #include "paging.h"
 #include "cpu.h"
 #include "debug_image.h"
+#include "debug_socket.h"
 
+#include <algorithm>
 #include <set>
 #include <string.h>
 
@@ -158,9 +160,42 @@ struct PendingImage {
 	DebugImage image;
 	DebugPlacement registered;	/* what its symbols were last registered with */
 	bool complete = false;		/* every object with content is placed: nothing left to look for */
+	bool announced = false;		/* the socket was told where it is, and watches its entry */
+	bool entered = false;		/* execution reached the entry: the image is running */
 };
 
 static std::vector<PendingImage> pendingImages;
+
+bool debug_images_waiting = false;
+
+static void UpdateWaiting(void)
+{
+	debug_images_waiting = false;
+	for (size_t i = 0;i < pendingImages.size();i++) debug_images_waiting |= !pendingImages[i].entered;
+}
+
+/* Tells the socket where an image is, once it is placed far enough to run, and so where it starts. Again
+ * if a later look found the objects elsewhere: the first match can be the loader's own buffer. */
+static void Announce(PendingImage &pending)
+{
+	const bool ready = pending.image.hasEntry ? pending.registered.count(pending.image.entryObject) != 0 : pending.complete;
+	if (!ready) return;
+	if (pending.announced) DEBUG_Socket_ImageMoved(pending.program);
+	pending.announced = true;
+	pending.entered = false;
+
+	uint32_t entry = 0;
+	if (pending.image.hasEntry) entry = pending.registered[pending.image.entryObject] + pending.image.entryOffset;
+	DEBUG_Socket_ImageLoaded(pending.program,pending.registered,pending.image.hasEntry,entry);
+	UpdateWaiting();
+}
+
+void DEBUG_ImageEntered(const std::string &program)
+{
+	for (size_t i = 0;i < pendingImages.size();i++)
+		if (pendingImages[i].program == program) pendingImages[i].entered = true;
+	UpdateWaiting();
+}
 
 static void RegisterPlaced(const PendingImage &pending,const DebugPlacement &placement)
 {
@@ -181,6 +216,7 @@ void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placem
 		RegisterPlaced(pendingImages[i],placement);
 		pendingImages[i].registered = placement;
 		pendingImages[i].complete = true;
+		Announce(pendingImages[i]);
 		return;
 	}
 }
@@ -233,10 +269,17 @@ static bool MappedMemory(std::vector<std::vector<uint8_t> > &runs,std::vector<De
 	return !regions.empty();
 }
 
+static void LocateImages(bool hasExecuting,uint32_t executing);
+
 void DEBUG_ImagesLocate(void)
 {
+	LocateImages(false,0);
+}
+
+static void LocateImages(bool hasExecuting,uint32_t executing)
+{
 	bool waiting = false;
-	for (size_t i = 0;i < pendingImages.size();i++) waiting |= !pendingImages[i].complete;
+	for (size_t i = 0;i < pendingImages.size();i++) waiting |= !pendingImages[i].entered;
 	if (!waiting) return;
 
 	const uint8_t *ram = (const uint8_t *)GetMemBase();
@@ -247,22 +290,51 @@ void DEBUG_ImagesLocate(void)
 	const bool paged = MappedMemory(runs,mapped);
 
 	for (size_t i = 0;i < pendingImages.size();i++) {
-		if (pendingImages[i].complete) continue;
+		if (pendingImages[i].complete && pendingImages[i].entered) continue;
 		DebugPlacement placement;
 		/* A paging host's client is found in the linear space it runs in; any other
 		 * program (DOS/32A runs unpaged) is where RAM says it is. */
-		bool complete = paged && DEBUG_LocateObjects(pendingImages[i].image.objects,mapped,placement);
+		DebugEntryHint hint;
+		const DebugEntryHint *hinted = NULL;
+		if (hasExecuting && pendingImages[i].image.hasEntry && executing >= pendingImages[i].image.entryOffset) {
+			hint.object = pendingImages[i].image.entryObject;
+			hint.base = executing - pendingImages[i].image.entryOffset;
+			hinted = &hint;
+		}
+		bool complete = paged && DEBUG_LocateObjects(pendingImages[i].image.objects,mapped,placement,hinted);
 		if (!complete && placement.empty())
-			complete = DEBUG_LocateObjects(pendingImages[i].image.objects,ram,(size_t)MEM_TotalPages() * 4096u,placement);
+			complete = DEBUG_LocateObjects(pendingImages[i].image.objects,ram,(size_t)MEM_TotalPages() * 4096u,placement,hinted);
 
-		if (complete) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);
+		if (complete) {
+			if (placement != pendingImages[i].registered) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);
+		}
 		/* Some objects are there and some not yet, or never: what is placed is worth having,
 		 * and the rest is asked for again. */
-		else if (placement.size() > pendingImages[i].registered.size()) {
+		else if (!pendingImages[i].entered && placement.size() >= pendingImages[i].registered.size() &&
+		         placement != pendingImages[i].registered) {
 			pendingImages[i].registered = placement;
 			RegisterPlaced(pendingImages[i],placement);
+			Announce(pendingImages[i]);
 		}
 	}
+}
+
+/* Pages the CPU has run code in since the program started: one that is new is where a loader's work may
+ * have just come to an end. */
+static std::vector<uint32_t> executedPages(1u << 15,0);
+
+void DEBUG_ImagesExecuted(uint32_t linear)
+{
+	/* A page a paging host has not yet mapped faults on the fetch and is retried, loaded: look then. */
+	uint32_t probe = 0;
+	if (mem_readd_checked(linear,&probe)) return;
+
+	const uint32_t page = linear >> 12;
+	uint32_t &word = executedPages[page >> 5];
+	const uint32_t bit = 1u << (page & 31);
+	if (word & bit) return;
+	word |= bit;
+	LocateImages(true,linear);
 }
 
 std::vector<DebugImageStatus> DEBUG_ImagesStatus(void)
@@ -322,6 +394,7 @@ static bool WatchForLoader(const char *program,uint16_t psp)
 	static const size_t MAX_PENDING = 8;
 	if (pendingImages.size() >= MAX_PENDING) pendingImages.erase(pendingImages.begin());
 	pendingImages.push_back(pending);
+	UpdateWaiting();
 	DEBUG_Symbols().ClearProgram(program);
 	return true;
 }
@@ -354,8 +427,10 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
 
 	/* A new program starts a new run: what an earlier one made its loader open is open again. */
 	watchedPrograms.clear();
+	std::fill(executedPages.begin(),executedPages.end(),0u);
 	for (size_t i = 0;i < pendingImages.size();i++)
 		if (pendingImages[i].program == program) pendingImages.erase(pendingImages.begin() + i--);
+	UpdateWaiting();
 
 	/* The loader is guest code that has not run yet: of a bound extender
 	 * program the stub is all that is in memory. */

@@ -93,7 +93,7 @@ static CopyDifference DifferenceFromFile(const DebugImageObject &object,const st
 /* Found, with `base` set; or not found. An object with nothing to look for
  * (pages of zeros, say) is `unlocatable`, which is no reason to wait. */
 static bool LocateObject(const DebugImageObject &object,const std::vector<DebugMemoryRegion> &memory,uint32_t &base,
-                         bool &unlocatable)
+                         bool &unlocatable,const DebugEntryHint *hint)
 {
 	std::vector<Anchor> anchors;
 	ObjectAnchors(object,anchors);
@@ -133,6 +133,15 @@ static bool LocateObject(const DebugImageObject &object,const std::vector<DebugM
 		return true;
 	}
 
+	/* The CPU is running at the image's entry in one of them: that one. */
+	if (hint != NULL && hint->object == object.index) {
+		for (size_t l = 0;l < leaders.size();l++) {
+			if (leaders[l] != hint->base) continue;
+			base = leaders[l];
+			return true;
+		}
+	}
+
 	/* A loader reads through a buffer, which keeps copies of the file's pages, whole or overwritten
 	 * in part. The object it placed is the one that is the file's but for the bytes it rewrites. */
 	size_t bestStray = (size_t)-1;
@@ -154,26 +163,26 @@ static bool LocateObject(const DebugImageObject &object,const std::vector<DebugM
 }
 
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std::vector<DebugMemoryRegion> &memory,
-                         DebugPlacement &out)
+                         DebugPlacement &out,const DebugEntryHint *hint)
 {
 	out.clear();
 	bool complete = true;
 	for (size_t o = 0;o < objects.size();o++) {
 		uint32_t base = 0;
 		bool unlocatable = false;
-		if (LocateObject(objects[o],memory,base,unlocatable)) out[objects[o].index] = base;
+		if (LocateObject(objects[o],memory,base,unlocatable,hint)) out[objects[o].index] = base;
 		else if (!unlocatable) complete = false;
 	}
 	return complete && !out.empty();
 }
 
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint8_t *memory,size_t memorySize,
-                         DebugPlacement &out)
+                         DebugPlacement &out,const DebugEntryHint *hint)
 {
 	DebugMemoryRegion whole;
 	whole.data = memory;
 	whole.size = memorySize;
-	return DEBUG_LocateObjects(objects,std::vector<DebugMemoryRegion>(1,whole),out);
+	return DEBUG_LocateObjects(objects,std::vector<DebugMemoryRegion>(1,whole),out,hint);
 }
 
 bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out)

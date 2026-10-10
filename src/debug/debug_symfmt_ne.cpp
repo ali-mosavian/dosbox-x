@@ -131,6 +131,11 @@ bool DEBUG_NeImage(const DebugBytes &data,DebugImage &out)
 		out.objects.push_back(object);
 	}
 
+	/* CS:IP at 14h: the segment number and the offset in it. */
+	out.hasEntry = data.u16(header + 0x16) != 0;
+	out.entryObject = data.u16(header + 0x16);
+	out.entryOffset = data.u16(header + 0x14);
+
 	std::vector<std::pair<std::string,uint16_t> > names;
 	ReadNames(data,(size_t)header + data.u16(header + 0x26),names);
 	/* Unlike the other tables, this one is an offset from the start of the file. */
