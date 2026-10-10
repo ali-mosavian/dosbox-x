@@ -6,6 +6,7 @@
   emulator's own DOS/32A.
 - `ne_symbols.py`: `ne/prog.c` built by `ne/build.sh`, run by HX's DPMILD16 + HDPMI16.
 - `pe_symbols.py`: `pe/prog.c` + `pe/start.asm` built by `pe/build.sh`, run by HX's DPMILD32 + HDPMI32.
+- `dwarf_symbols.py`, `dwarf16_symbols.py`: our prog.c linked with jwlink `debug dwarf` as LE, PE, 16-bit MZ and 16-bit NE (`dwarf/build.sh`, `dwarf16/build.sh`); no .MAP beside the images.
 
 HX is third-party and never committed. Fetch it into an empty directory, outside the tree:
 
