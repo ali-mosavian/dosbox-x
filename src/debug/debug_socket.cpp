@@ -51,6 +51,10 @@
  *   {"cmd":"mem_dump","seg":X,"off":Y,"len":Z,"file":"/host/path"} - Read memory
  *     straight to a host file (binary). No hex, no response-size limit: for
  *     dumps far larger than mem_read's practical reply size.
+ *   {"cmd":"mem_hash","addr":X,"len":N} - A 64-bit FNV-1a of a range as the CPU reads it, in hex:
+ *     compare screens or regions without moving the bytes. "vram":true takes "addr" as an
+ *     offset into the video adapter's own memory, every plane (a planar mode 12h screen is
+ *     0x28000 bytes from 0).
  *   {"cmd":"mem_write","seg":X,"off":Y,"data":"hex"} - Write memory
  *   {"cmd":"disasm","seg":X,"off":Y,"count":Z} - Disassemble
  *   {"cmd":"status"}          - Get debugger status
@@ -87,6 +91,7 @@
 #if C_DEBUG
 
 #include "debug_socket.h"
+#include "vga.h"
 #include "debug_symstore.h"
 #include "debug_symbols.h"
 #include "debug.h"
@@ -495,6 +500,17 @@ static bool json_get_int(const std::string& json, const char* key, long long& ou
     // Handle number
     out = strtoll(json.c_str() + pos, nullptr, 0);
     return true;
+}
+
+// A flag: true, or a number that is not zero.
+static bool json_get_flag(const std::string& json, const char* key) {
+    const std::string search = "\"" + std::string(key) + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos += search.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (json.compare(pos, 4, "true") == 0) return true;
+    return strtoll(json.c_str() + pos, nullptr, 0) != 0;
 }
 
 // Parse a JSON array of strings: "key": ["str1","str2",...]
@@ -3355,6 +3371,46 @@ static void process_command(const std::string& json) {
         char msg[256];
         snprintf(msg, sizeof(msg), "Dumped %lld bytes from 0x%08X to %s", len, (unsigned)addr, filename.c_str());
         send_ok(json_str("msg", msg) + "," + json_str("file", filename) + "," + json_num("size", len) + "," + json_hex("addr", addr));
+        return;
+    }
+
+    if (cmd == "mem_hash") {
+        // A 64-bit FNV-1a of a range, so a host can tell whether a region changed without moving its bytes.
+        // vram:true hashes the adapter's own memory, every plane, from the offset in "addr"; without it the
+        // range is what the CPU reads, which in a planar mode is one plane at a time.
+        long long addr_val, len, seg, off;
+        if (!json_get_int(json, "len", len) || len <= 0) {
+            send_error("Missing or bad 'len'");
+            return;
+        }
+        uint32_t start;
+        if (json_get_int(json, "addr", addr_val)) start = (uint32_t)addr_val;
+        else if (json_get_int(json, "seg", seg) && json_get_int(json, "off", off)) start = ((uint32_t)seg << 4) + (uint32_t)off;
+        else {
+            send_error("Need 'addr' (linear) or 'seg'+'off'");
+            return;
+        }
+        const bool raw = json_get_flag(json, "vram");
+        if (raw && (vga.mem.linear == NULL || (uint64_t)start + (uint64_t)len > vga.mem.memsize)) {
+            send_error("Range is outside the video memory");
+            return;
+        }
+
+        uint64_t hash = 14695981039346656037ull;
+        uint32_t unreadable = 0;
+        for (long long i = 0; i < len; i++) {
+            uint8_t val = 0;
+            if (raw) val = vga.mem.linear[start + i];
+            else if (mem_readb_checked(start + (uint32_t)i, &val)) {
+                val = 0;
+                unreadable++;
+            }
+            hash = (hash ^ val) * 1099511628211ull;
+        }
+        char text[24];
+        snprintf(text, sizeof(text), "%016llx", (unsigned long long)hash);
+        send_ok(json_str("hash", text) + "," + json_str("algorithm", "fnv1a64") + "," + json_num("len", len) + "," +
+                json_num("unreadable", unreadable) + "," + json_bool("vram", raw));
         return;
     }
 
