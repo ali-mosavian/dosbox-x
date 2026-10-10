@@ -796,38 +796,65 @@ static bool basic_array_data(uint32_t descriptor, uint32_t expectedElementSize,
     return data != 0;
 }
 
-// Borland numbers registers the way x86 encodes them.
-static const char* register_name(uint16_t reg) {
-    static const char* const names[8] = {"AX","CX","DX","BX","SP","BP","SI","DI"};
-    return reg < 8 ? names[reg] : NULL;
+// Borland and DWARF number the word registers the way x86 encodes them.
+static const char* register_name(uint16_t reg, bool wide) {
+    static const char* const words[8] = {"AX","CX","DX","BX","SP","BP","SI","DI"};
+    static const char* const longs[8] = {"EAX","ECX","EDX","EBX","ESP","EBP","ESI","EDI"};
+    return reg < 8 ? (wide ? longs[reg] : words[reg]) : NULL;
 }
 
 static bool register_value(uint16_t reg, uint32_t& out) {
     switch (reg) {
-    case 0: out = reg_ax; return true;
-    case 1: out = reg_cx; return true;
-    case 2: out = reg_dx; return true;
-    case 3: out = reg_bx; return true;
-    case 4: out = reg_sp; return true;
-    case 5: out = reg_bp; return true;
-    case 6: out = reg_si; return true;
-    case 7: out = reg_di; return true;
+    case 0: out = (uint32_t)reg_eax; return true;
+    case 1: out = (uint32_t)reg_ecx; return true;
+    case 2: out = (uint32_t)reg_edx; return true;
+    case 3: out = (uint32_t)reg_ebx; return true;
+    case 4: out = (uint32_t)reg_esp; return true;
+    case 5: out = (uint32_t)reg_ebp; return true;
+    case 6: out = (uint32_t)reg_esi; return true;
+    case 7: out = (uint32_t)reg_edi; return true;
     }
     return false;
 }
 
+// A value of `width` bytes taken from a register, signed unless it is known not to be.
+static long long register_number(uint32_t value, uint32_t width, bool is_unsigned) {
+    if (width >= 4) return is_unsigned ? (long long)value : (long long)(int32_t)value;
+    if (width == 1) return is_unsigned ? (long long)(uint8_t)value : (long long)(int8_t)value;
+    return is_unsigned ? (long long)(uint16_t)value : (long long)(int16_t)value;
+}
+
 // A local or parameter, read where it lives right now. A frame variable is
 // only where BP says it is once the function's prologue has run, so the frame
-// this was read through is reported with it.
-static std::string local_json(const DebugLocal& local, const std::string& function) {
+// this was read through is reported with it. `pc` picks among the places a
+// value is over the code, and the frame a stack-pointer-relative one is read from.
+static std::string local_json(const DebugLocal& declared, const std::string& function, uint32_t pc) {
+    DebugLocal local = declared;
+    bool live = true;
+    if (!declared.ranges.empty()) {
+        live = false;
+        for (size_t r = 0; r < declared.ranges.size(); r++) {
+            const DebugLocalRange& range = declared.ranges[r];
+            if (pc < range.begin || pc >= range.end) continue;
+            local.storage = (DebugStorage)range.storage;
+            local.frameOffset = range.frameOffset;
+            local.reg = range.reg;
+            live = true;
+            break;
+        }
+    }
+
     std::string out = json_str("name", local.name) + "," +
                       json_str("storage", local.storage == DEBUG_STORAGE_REGISTER ? "register"
-                                          : local.storage == DEBUG_STORAGE_STACK ? "stack" : "frame");
+                                          : local.storage == DEBUG_STORAGE_STACK ? "stack"
+                                          : local.storage == DEBUG_STORAGE_CFA ? "cfa" : "frame");
     if (!function.empty()) out += "," + json_str("function", function);
     if (!local.typeName.empty()) out += "," + json_str("type", local.typeName);
+    if (!live) return out + "," + json_str("note", "not live at this address");
 
     if (local.storage == DEBUG_STORAGE_REGISTER) {
-        const char* name = register_name(local.reg);
+        const bool wide = local.valueSize >= 4;
+        const char* name = register_name(local.reg, wide);
         out += "," + json_num("register_index", local.reg);
         if (name == NULL) {
             // Borland's numbering past the eight word registers is not
@@ -837,14 +864,26 @@ static std::string local_json(const DebugLocal& local, const std::string& functi
         }
         uint32_t value = 0;
         register_value(local.reg, value);
-        out += "," + json_str("register", name) + "," + json_num("value", (long long)(int16_t)value);
+        out += "," + json_str("register", name) +
+               "," + json_num("value", register_number(value, local.valueSize ? local.valueSize : 2,
+                                                        local.valueKind == DEBUG_VALUE_UNSIGNED));
         return out;
     }
 
-    /* A 32-bit stack is addressed by the whole of EBP or ESP, a 16-bit one by BP or SP. */
+    // A 32-bit stack is addressed by the whole of EBP or ESP, a 16-bit one by BP or SP.
     const uint16_t ss = SegValue(SegNames::ss);
-    const uint32_t base = local.storage == DEBUG_STORAGE_STACK ? (uint32_t)reg_esp : (uint32_t)reg_ebp;
-    const uint32_t at = (uint32_t)GetAddress(ss, (uint32_t)((int32_t)base + local.frameOffset) & (uint32_t)cpu.stack.mask);
+    uint32_t base = local.storage == DEBUG_STORAGE_STACK ? (uint32_t)reg_esp : (uint32_t)reg_ebp;
+    int32_t displacement = local.frameOffset;
+    if (local.storage == DEBUG_STORAGE_CFA) {
+        uint16_t cfa_reg = 0;
+        int32_t cfa_offset = 0;
+        uint32_t cfa_base = 0;
+        if (!DEBUG_Symbols().CfaAt(pc, cfa_reg, cfa_offset) || !register_value(cfa_reg, cfa_base))
+            return out + "," + json_str("note", "no call frame information at this address");
+        base = cfa_base;
+        displacement += cfa_offset;
+    }
+    const uint32_t at = (uint32_t)GetAddress(ss, (uint32_t)((int32_t)base + displacement) & (uint32_t)cpu.stack.mask);
     uint32_t length = local.valueSize != 0 ? local.valueSize : 2;
     if (length > 4096) length = 4096;
 
@@ -2767,7 +2806,7 @@ static void process_command(const std::string& json) {
             DebugLocal local;
             std::string function;
             if (DEBUG_Symbols().ResolveLocal(pc, name, local, function)) {
-                send_ok(local_json(local, function));
+                send_ok(local_json(local, function, pc));
                 return;
             }
             send_error("Unknown symbol");
@@ -2842,7 +2881,7 @@ static void process_command(const std::string& json) {
         std::string arr;
         for (size_t i = 0; i < locals.size(); i++) {
             if (!arr.empty()) arr += ",";
-            arr += "{" + local_json(locals[i], functions[i]) + "}";
+            arr += "{" + local_json(locals[i], functions[i], pc) + "}";
         }
         send_ok(json_hex("linear", pc) + "," +
                 json_num("count", (long long)locals.size()) + "," +

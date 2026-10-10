@@ -82,6 +82,11 @@ void DebugSymbolStore::ClearProgram(const std::string &program)
 	}
 	scopes.swap(keptScopes);
 
+	std::vector<DebugCfaEntry> keptCfa;
+	for (size_t i = 0;i < cfaRows.size();i++)
+		if (cfaRows[i].program != program) keptCfa.push_back(cfaRows[i]);
+	cfaRows.swap(keptCfa);
+
 	std::vector<DebugProgramSegment> keptSegments;
 	for (size_t i = 0;i < segments.size();i++)
 		if (segments[i].program != program) keptSegments.push_back(segments[i]);
@@ -169,6 +174,16 @@ void DebugSymbolStore::AddDebugInfo(const DebugInfo &info,const std::string &pro
 		symbols.push_back(symbol);
 	}
 
+	for (size_t i = 0;i < info.cfa.size();i++) {
+		DebugCfaEntry row;
+		row.begin = info.loadLinear + info.cfa[i].begin;
+		row.end = info.loadLinear + info.cfa[i].end;
+		row.reg = info.cfa[i].reg;
+		row.offset = info.cfa[i].offset;
+		row.program = program;
+		cfaRows.push_back(row);
+	}
+
 	const size_t scopeBase = scopes.size();
 	for (size_t i = 0;i < info.scopes.size();i++) {
 		DebugScopeEntry scope;
@@ -179,6 +194,14 @@ void DebugSymbolStore::AddDebugInfo(const DebugInfo &info,const std::string &pro
 			: (int32_t)(scopeBase + (size_t)info.scopes[i].parent);
 		scope.function = info.scopes[i].function;
 		scope.locals = info.scopes[i].locals;
+		/* A range arrives load-relative like the scope; the one that says "everywhere" stays that. */
+		for (size_t l = 0;l < scope.locals.size();l++) {
+			for (size_t r = 0;r < scope.locals[l].ranges.size();r++) {
+				DebugLocalRange &range = scope.locals[l].ranges[r];
+				if (range.end != 0xffffffffu) range.end += info.loadLinear;
+				if (range.begin != 0) range.begin += info.loadLinear;
+			}
+		}
 		scope.program = program;
 		scopes.push_back(scope);
 	}
@@ -239,6 +262,17 @@ void DebugSymbolStore::AddExports(const std::vector<DebugImageExport> &exports,c
 		symbol.program = program;
 		symbols.push_back(symbol);
 	}
+}
+
+bool DebugSymbolStore::CfaAt(uint32_t pcLinear,uint16_t &reg,int32_t &offset) const
+{
+	for (size_t i = 0;i < cfaRows.size();i++) {
+		if (pcLinear < cfaRows[i].begin || pcLinear >= cfaRows[i].end) continue;
+		reg = cfaRows[i].reg;
+		offset = cfaRows[i].offset;
+		return true;
+	}
+	return false;
 }
 
 const DebugSymbol *DebugSymbolStore::Resolve(const std::string &name) const

@@ -54,7 +54,43 @@ def run(dosbox: str, tag: str, files: list, command: str) -> None:
         s.close()
 
 
+def locals_run(dosbox: str) -> None:
+    """locals.c, built with llrm's own DWARF (OMF sections, version 5): types, location lists, frame bases."""
+    tag = "loc"
+    s = Session(dosbox, FIXTURES, ["SYMLOC.EXE"], "SYMLOC.EXE")
+    try:
+        s.send({"cmd": "continue"})
+        check(f"{tag}_program_starts", s.wait_for("ready", 60), s.screen())
+        for location in ("add", "locals.c:13", "locals.c:25"):
+            check(f"{tag}_bp_set_{location.replace(':', '_').replace('.', '_')}", s.send({"cmd": "bp_set", "location": location}).get("status") == "ok")
+        s.type(["x"])
+
+        def stopped(name: str) -> dict:
+            check(f"{tag}_{name}_stops", s.wait_stopped(30))
+            here = s.send({"cmd": "locals"})
+            s.events.clear()
+            s.send({"cmd": "continue"})
+            return {v["name"]: v for v in here.get("locals", [])}
+
+        entry = stopped("entry")
+        check(f"{tag}_parameters_arrive_in_registers", entry.get("first", {}).get("register") == "EAX" and
+              entry["first"].get("value") == 3 and entry.get("second", {}).get("value") == 4, entry)
+        body = stopped("body")
+        check(f"{tag}_parameters_are_on_the_stack_once_stored", body.get("first", {}).get("storage") == "cfa" and
+              body["first"].get("value") == 3 and body["second"].get("value") == 4, body)
+        check(f"{tag}_a_local_reads_through_the_frame_base", body.get("sum", {}).get("value") == 7, body)
+        end = stopped("end")
+        p = end.get("p", {})
+        check(f"{tag}_a_struct_reads_by_field", p.get("type") == "struct pt" and
+              [f.get("value") for f in p.get("fields", [])] == [3, 21], p)
+        check(f"{tag}_an_array_reads_by_element", end.get("values", {}).get("type") == "int[3]" and
+              end["values"].get("values") == [11, 22, 33], end)
+    finally:
+        s.close()
+
+
 run(sys.argv[1], "led", ["SYMLED.EXE"], "SYMLED.EXE")
+locals_run(sys.argv[1])
 
 hx = Path(os.environ.get("HX_DOS", "/nonexistent"))
 if (hx / "DPMILD32.EXE").is_file():

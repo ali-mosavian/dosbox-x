@@ -41,6 +41,15 @@ struct DebugScopeEntry {
 	std::vector<DebugLocal> locals;
 };
 
+/* The canonical frame address over a range of linear addresses. */
+struct DebugCfaEntry {
+	uint32_t begin = 0;
+	uint32_t end = 0;
+	uint16_t reg = 4;
+	int32_t offset = 4;
+	std::string program;
+};
+
 /* Where a location spec landed, and what it went through to get there. */
 struct DebugLocation {
 	uint32_t linear = 0;
@@ -104,6 +113,10 @@ public:
 	 * innermost one, the way the language scopes it. */
 	bool ResolveLocal(uint32_t pcLinear,const std::string &name,DebugLocal &out,std::string &function) const;
 
+	/* What the canonical frame address is measured from at an address, for the program whose
+	 * call frame information covers it. */
+	bool CfaAt(uint32_t pcLinear,uint16_t &reg,int32_t &offset) const;
+
 	/* Everything in scope at an address, innermost first. functions[i] names
 	 * the scope out[i] came from. */
 	void LocalsAt(uint32_t pcLinear,std::vector<DebugLocal> &out,std::vector<std::string> &functions) const;
@@ -140,6 +153,7 @@ private:
 	std::vector<DebugSymbol> symbols;
 	std::vector<DebugSourceLine> lines;
 	std::vector<DebugScopeEntry> scopes;
+	std::vector<DebugCfaEntry> cfaRows;
 	std::vector<DebugProgramSegment> segments;
 	/* segments flattened: sorted, disjoint, code winning where they overlap */
 	std::vector<DebugProgramSegment> pieces;

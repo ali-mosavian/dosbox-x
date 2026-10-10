@@ -8,5 +8,8 @@ llrm-c -m32 -g -O0 -fobject-format=omf -o prog.obj prog.c
 jwasm -q -omf -Zi -Fo start.o start.asm
 jwlink option quiet option map=SYMLED.MAP debug dwarf format os2 le option stub="$OW_ROOT/bld/redist/dos32a/stub32a.exe" name SYMLED.EXE file start.o file prog.obj
 jwlink option quiet option map=SYMPED.MAP debug dwarf format windows nt runtime console name SYMPED.EXE file start.o file prog.obj
-mv SYMLED.EXE SYMPED.EXE ../fixtures/
-rm -f prog.obj start.o SYMLED.MAP SYMPED.MAP
+# locals.c needs llrm's own DWARF in the object (-gdwarf, DWARF 5): llrm-c from alim/feat/dwarf-omf or later
+llrm-c -m32 -gdwarf -O0 -fobject-format=omf -o locals.obj locals.c
+jwlink option quiet debug dwarf format os2 le option stub="$OW_ROOT/bld/redist/dos32a/stub32a.exe" name SYMLOC.EXE file start.o file locals.obj
+mv SYMLED.EXE SYMPED.EXE SYMLOC.EXE ../fixtures/
+rm -f prog.obj locals.obj start.o SYMLED.MAP SYMPED.MAP
