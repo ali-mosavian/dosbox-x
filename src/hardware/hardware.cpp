@@ -998,11 +998,23 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 		png_destroy_write_struct(&png_ptr, &info_ptr);
 		/*close file*/
 		fclose(fp);
+#if C_DEBUG
+		extern void DEBUG_Socket_ScreenshotWritten(bool written);
+		DEBUG_Socket_ScreenshotWritten(true);
+#endif
 		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
 
 	}
 	pathscr = "";
+	goto shot_done;
 skip_shot:
+#if C_DEBUG
+	{
+		extern void DEBUG_Socket_ScreenshotWritten(bool written);
+		DEBUG_Socket_ScreenshotWritten(false);
+	}
+#endif
+shot_done:
 	if (CaptureState & CAPTURE_VIDEO) {
 #if defined(USE_TTF)
 		ttf_switch_off();
