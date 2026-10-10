@@ -565,6 +565,7 @@ struct DwarfVariable {
 /* A function, or a block inside one. */
 struct DwarfScope {
 	std::string function;
+	uint16_t segment = 0;		/* DW_AT_segment: where a 16-bit program's offsets are measured from */
 	uint32_t begin = 0;
 	uint32_t end = 0;
 	int parent = -1;
@@ -575,6 +576,7 @@ struct DwarfScope {
 
 /* The canonical frame address is `reg` plus `offset` over [begin, end). */
 struct DwarfCfaRow {
+	uint16_t segment = 0;		/* a 16-bit FDE names the segment its range is in */
 	uint32_t begin = 0;
 	uint32_t end = 0;
 	uint16_t reg = 4;
@@ -599,6 +601,7 @@ struct DwarfType {
 
 struct DwarfInfo {
 	uint16_t version = 0;		/* the newest info unit's */
+	uint8_t addressSize = 0;	/* 2 for a 16-bit program: Open Watcom's register numbers, segment:offset addresses */
 	std::vector<DwarfLine> lines;
 	std::vector<DwarfSymbol> symbols;
 	std::vector<DwarfScope> scopes;

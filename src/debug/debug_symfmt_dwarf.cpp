@@ -402,6 +402,8 @@ void ReadUnits(const Sections &sections,std::vector<Unit> &units,std::vector<Die
 			unit.addressSize = r.u8();
 		}
 		out.version = std::max(out.version,unit.version);
+		if (unit.addressSize == 2) out.addressSize = 2;
+		else if (out.addressSize == 0) out.addressSize = unit.addressSize;
 
 		const std::map<uint64_t,Abbreviation> abbreviations = ReadAbbreviations(sections.abbrev,abbrevAt);
 		const size_t unitIndex = units.size();
@@ -456,14 +458,14 @@ void ReadUnits(const Sections &sections,std::vector<Unit> &units,std::vector<Die
 /* ---- locations ---- */
 
 /* The place a one-operation DWARF expression names; false for one that is not simple enough to read. */
-bool ReadLocation(const DebugBytes &expression,DwarfLocation &out)
+bool ReadLocation(const DebugBytes &expression,uint8_t addressSize,DwarfLocation &out)
 {
 	if (expression.size() == 0) return false;
 	Reader r(expression,0);
 	const uint8_t op = r.u8();
 	if (op == DW_OP_addr) {
 		out.kind = DWARF_LOCATION_ADDRESS;
-		out.address = r.u32();
+		out.address = addressSize == 2 ? r.u16() : r.u32();
 		return r.at == expression.size();
 	}
 	if (op == DW_OP_fbreg) {
@@ -513,7 +515,7 @@ void ReadLocationList(const Sections &sections,uint16_t version,uint32_t unitBas
 			if (!range) continue;
 			const size_t length = (size_t)r.uleb();
 			DwarfLocation where;
-			if (ReadLocation(r.data.sub(r.at,length),where)) {
+			if (ReadLocation(r.data.sub(r.at,length),addressSize,where)) {
 				where.begin = begin;
 				where.end = finish;
 				out.push_back(where);
@@ -524,7 +526,6 @@ void ReadLocationList(const Sections &sections,uint16_t version,uint32_t unitBas
 	}
 
 	Reader r(sections.loc,at);
-	(void)addressSize;
 	while (!r.done(sections.loc.size())) {
 		const uint32_t first = r.u32();
 		const uint32_t second = r.u32();
@@ -535,7 +536,7 @@ void ReadLocationList(const Sections &sections,uint16_t version,uint32_t unitBas
 		}
 		const size_t length = r.u16();
 		DwarfLocation where;
-		if (ReadLocation(r.data.sub(r.at,length),where)) {
+		if (ReadLocation(r.data.sub(r.at,length),addressSize,where)) {
 			where.begin = base + first;
 			where.end = base + second;
 			out.push_back(where);
@@ -559,6 +560,8 @@ void ReadFrames(const DebugBytes &frame,DwarfInfo &out)
 		uint32_t codeAlign;
 		int32_t dataAlign;
 		CfaState initial;
+		uint8_t addressSize;
+		uint8_t segmentSize;
 	};
 	std::map<size_t,Cie> cies;
 
@@ -574,8 +577,13 @@ void ReadFrames(const DebugBytes &frame,DwarfInfo &out)
 		if (id == 0xffffffffu) {					/* a CIE */
 			const uint8_t version = r.u8();
 			const std::string augmentation = r.cstr();
-			if (version >= 4) { r.u8(); r.u8(); }			/* address size, segment selector size */
 			Cie cie;
+			cie.addressSize = 4;
+			cie.segmentSize = 0;
+			if (version >= 4) {
+				cie.addressSize = r.u8();
+				cie.segmentSize = r.u8();
+			}
 			cie.codeAlign = (uint32_t)r.uleb();
 			cie.dataAlign = (int32_t)r.sleb();
 			if (version == 1) r.u8(); else r.uleb();		/* return address register */
@@ -598,8 +606,10 @@ void ReadFrames(const DebugBytes &frame,DwarfInfo &out)
 		const std::map<size_t,Cie>::const_iterator parent = cies.find(id);
 		if (parent == cies.end()) continue;
 		const Cie &cie = parent->second;
-		uint32_t location = r.u32();
-		const uint32_t finish = location + r.u32();
+		/* A 16-bit program names the segment of each range ahead of it, and writes its offsets in 2 bytes. */
+		const uint16_t segment = cie.segmentSize == 2 ? r.u16() : 0;
+		uint32_t location = cie.addressSize == 2 ? r.u16() : r.u32();
+		const uint32_t finish = location + (cie.addressSize == 2 ? r.u16() : r.u32());
 
 		CfaState state = cie.initial;
 		std::vector<CfaState> saved;
@@ -607,10 +617,12 @@ void ReadFrames(const DebugBytes &frame,DwarfInfo &out)
 		bool known = true;
 		const struct {
 			DwarfInfo &out;
+			uint16_t segment;
 			void close(uint32_t &from,uint32_t to,const CfaState &state) const
 			{
 				if (to > from) {
 					DwarfCfaRow row;
+					row.segment = segment;
 					row.begin = from;
 					row.end = to;
 					row.reg = state.reg;
@@ -619,7 +631,7 @@ void ReadFrames(const DebugBytes &frame,DwarfInfo &out)
 				}
 				from = to;
 			}
-		} rows = {out};
+		} rows = {out,segment};
 
 		while (!r.done(end) && known) {
 			const uint8_t op = r.u8();
@@ -714,6 +726,7 @@ void CollectScopes(const Sections &sections,const std::vector<Unit> &units,const
 			DwarfScope scope;
 			scope.function = die.tag == DW_TAG_subprogram ? die.name() : std::string();
 			scope.begin = (uint32_t)die.number(DW_AT_low_pc);
+			if (die.has(DW_AT_segment)) scope.segment = SegmentOf(die.attributes.find(DW_AT_segment)->second.block);
 			const Value &high = die.attributes.find(DW_AT_high_pc)->second;
 			scope.end = high.form == DW_FORM_addr ? (uint32_t)high.number : scope.begin + (uint32_t)high.number;
 			for (int up = die.parent;up >= 0 && scope.parent < 0;up = dies[(size_t)up].parent)
@@ -769,7 +782,7 @@ void CollectScopes(const Sections &sections,const std::vector<Unit> &units,const
 		std::vector<DwarfLocation> locations;
 		if (where.block.size() != 0) {
 			DwarfLocation location;
-			if (ReadLocation(where.block,location)) locations.push_back(location);
+			if (ReadLocation(where.block,unit.addressSize,location)) locations.push_back(location);
 		} else if (where.form == DW_FORM_sec_offset || where.form == DW_FORM_data4) {
 			ReadLocationList(sections,unit.version,unit.base,(size_t)where.number,unit.addressSize,locations);
 		}
@@ -787,6 +800,7 @@ void CollectScopes(const Sections &sections,const std::vector<Unit> &units,const
 			DwarfSymbol symbol;
 			symbol.name = die.name();
 			symbol.address = locations[0].address;
+			symbol.segment = die.has(DW_AT_segment) ? SegmentOf(die.attributes.find(DW_AT_segment)->second.block) : 0;
 			symbol.unit = unit.name;
 			symbol.type = die.has(DW_AT_type) ? die.number(DW_AT_type) : 0;
 			out.symbols.push_back(symbol);

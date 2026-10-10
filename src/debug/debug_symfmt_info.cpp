@@ -744,41 +744,6 @@ static bool DwarfObjectOf(const DebugPlacement &layout,uint32_t address,uint16_t
 	return found;
 }
 
-/* A real-mode image: an address is an offset in the segment its symbol names, a frame paragraph relative to
- * the load segment (0 for code), the way a LINK .MAP writes it. */
-static void DwarfToRealMode(const DwarfInfo &dwarf,DebugInfo &out)
-{
-	for (size_t i = 0;i < dwarf.symbols.size();i++) {
-		const DwarfSymbol &source = dwarf.symbols[i];
-		DebugSymbol symbol;
-		symbol.name = source.name;
-		symbol.segment = source.segment;
-		symbol.offset = source.address;
-		symbol.segmentBase = (uint32_t)source.segment << 4u;
-		symbol.linear = out.loadLinear + symbol.segmentBase + source.address;
-		symbol.size = source.size;
-		symbol.hasSize = source.hasSize;
-		symbol.module = source.unit;
-		symbol.isFunction = source.function;
-		symbol.source = DEBUG_FORMAT_DWARF;
-		out.symbols.push_back(symbol);
-	}
-
-	for (size_t i = 0;i + 1 < dwarf.lines.size();i++) {
-		const DwarfLine &row = dwarf.lines[i];
-		const uint32_t next = dwarf.lines[i+1].address;
-		if (row.endSequence || !row.statement || row.line == 0 || next <= row.address) continue;
-
-		DebugLine line;
-		line.module = row.unit;
-		line.file = row.file;
-		line.line = (uint16_t)row.line;
-		line.imageOffset = row.address;
-		line.endOffset = next;
-		out.lines.push_back(line);
-	}
-}
-
 /* A DWARF type as the store describes one: a printable name, how many bytes to read, how to read them. */
 struct DwarfTypeText {
 	std::string name;
@@ -884,15 +849,52 @@ static bool DwarfPlaced(const DebugPlacement &placement,const DebugPlacement &la
 	return true;
 }
 
-static void DwarfScopes(const DwarfInfo &dwarf,const DebugPlacement &placement,const DebugPlacement &layout,DebugInfo &out)
+/* How a DWARF address becomes a load-relative one. A protected-mode image's objects were placed, and jwlink
+ * measures an address from the first of them; a real-mode one names the segment its offset is in. */
+struct DwarfAddresses {
+	const DebugPlacement *placement;
+	const DebugPlacement *layout;
+	bool real;
+
+	bool place(uint32_t address,uint16_t segment,uint32_t &placed) const
+	{
+		if (real) {
+			placed = ((uint32_t)segment << 4u) + address;
+			return true;
+		}
+		return DwarfPlaced(*placement,*layout,address,placed);
+	}
+};
+
+/* The x86 register index (0 AX, 1 CX, 2 DX, 3 BX, 4 SP, 5 BP, 6 SI, 7 DI) of a DWARF register number: the
+ * psABI's for 32-bit code, Open Watcom's for 16-bit. False for any other register. */
+static bool DwarfRegister(const DwarfInfo &dwarf,uint16_t number,uint16_t &index)
+{
+	if (dwarf.addressSize != 2) {
+		index = number;
+		return number < 8;
+	}
+	static const struct { uint16_t dwarf; uint16_t index; } map[8] = {
+		{27,0},{29,1},{30,2},{28,3},{34,4},{33,5},{31,6},{32,7}
+	};
+	for (size_t i = 0;i < 8;i++) {
+		if (map[i].dwarf != number) continue;
+		index = map[i].index;
+		return true;
+	}
+	return false;
+}
+
+static void DwarfScopes(const DwarfInfo &dwarf,const DwarfAddresses &space,DebugInfo &out)
 {
 	for (size_t i = 0;i < dwarf.cfa.size();i++) {
 		DebugCfaRow row;
 		uint32_t end = 0;
-		if (!DwarfPlaced(placement,layout,dwarf.cfa[i].begin,row.begin) ||
-		    !DwarfPlaced(placement,layout,dwarf.cfa[i].end - 1,end)) continue;
+		uint16_t reg = 0;
+		if (!space.place(dwarf.cfa[i].begin,dwarf.cfa[i].segment,row.begin) ||
+		    !space.place(dwarf.cfa[i].end - 1,dwarf.cfa[i].segment,end) || !DwarfRegister(dwarf,dwarf.cfa[i].reg,reg)) continue;
 		row.end = end + 1;
-		row.reg = dwarf.cfa[i].reg;
+		row.reg = reg;
 		row.offset = dwarf.cfa[i].offset;
 		out.cfa.push_back(row);
 	}
@@ -902,8 +904,8 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DebugPlacement &placement,c
 		const DwarfScope &source = dwarf.scopes[i];
 		DebugScope scope;
 		uint32_t last = 0;
-		if (!DwarfPlaced(placement,layout,source.begin,scope.imageOffset) ||
-		    !DwarfPlaced(placement,layout,source.end - 1,last)) continue;
+		if (!space.place(source.begin,source.segment,scope.imageOffset) ||
+		    !space.place(source.end - 1,source.segment,last)) continue;
 		scope.endOffset = last + 1;
 		scope.function = source.function;
 		scope.parent = source.parent >= 0 ? mapped[(size_t)source.parent] : -1;
@@ -919,23 +921,28 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DebugPlacement &placement,c
 				DebugLocalRange range;
 				switch (where.kind) {
 				case DWARF_LOCATION_REGISTER:
-					if (where.reg > 7) { readable = false; break; }
+					if (!DwarfRegister(dwarf,where.reg,range.reg)) { readable = false; break; }
 					range.storage = DEBUG_STORAGE_REGISTER;
-					range.reg = where.reg;
 					break;
-				case DWARF_LOCATION_FRAME:
+				case DWARF_LOCATION_FRAME: {
+					uint16_t frame = 0;
 					if (source.frame == DWARF_FRAME_CFA) range.storage = DEBUG_STORAGE_CFA;
-					else if (source.frameReg == 5) range.storage = DEBUG_STORAGE_FRAME;
-					else if (source.frameReg == 4) range.storage = DEBUG_STORAGE_STACK;
+					else if (!DwarfRegister(dwarf,source.frameReg,frame)) { readable = false; break; }
+					else if (frame == 5) range.storage = DEBUG_STORAGE_FRAME;
+					else if (frame == 4) range.storage = DEBUG_STORAGE_STACK;
 					else { readable = false; break; }
 					range.frameOffset = where.offset;
 					break;
-				case DWARF_LOCATION_REGISTER_OFFSET:
-					if (where.reg == 5) range.storage = DEBUG_STORAGE_FRAME;
-					else if (where.reg == 4) range.storage = DEBUG_STORAGE_STACK;
+				}
+				case DWARF_LOCATION_REGISTER_OFFSET: {
+					uint16_t base = 0;
+					if (!DwarfRegister(dwarf,where.reg,base)) { readable = false; break; }
+					if (base == 5) range.storage = DEBUG_STORAGE_FRAME;
+					else if (base == 4) range.storage = DEBUG_STORAGE_STACK;
 					else { readable = false; break; }
 					range.frameOffset = where.offset;
 					break;
+				}
 				default:
 					readable = false;
 					break;
@@ -944,8 +951,8 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DebugPlacement &placement,c
 
 				const bool whole = where.begin == 0 && where.end == 0xffffffffu;
 				uint32_t last = 0;
-				if (!whole && (!DwarfPlaced(placement,layout,where.begin,range.begin) ||
-				               !DwarfPlaced(placement,layout,where.end - 1,last))) { readable = false; break; }
+				if (!whole && (!space.place(where.begin,source.segment,range.begin) ||
+				               !space.place(where.end - 1,source.segment,last))) { readable = false; break; }
 				range.end = whole ? 0xffffffffu : last + 1;
 				if (whole) range.begin = 0;
 				local.ranges.push_back(range);
@@ -974,6 +981,48 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DebugPlacement &placement,c
 	}
 }
 
+/* A real-mode image: an address is an offset in the segment its symbol names, a frame paragraph relative to
+ * the load segment (0 for code), the way a LINK .MAP writes it. */
+static void DwarfToRealMode(const DwarfInfo &dwarf,DebugInfo &out)
+{
+	for (size_t i = 0;i < dwarf.symbols.size();i++) {
+		const DwarfSymbol &source = dwarf.symbols[i];
+		DebugSymbol symbol;
+		symbol.name = source.name;
+		symbol.segment = source.segment;
+		symbol.offset = source.address;
+		symbol.segmentBase = (uint32_t)source.segment << 4u;
+		symbol.linear = out.loadLinear + symbol.segmentBase + source.address;
+		symbol.size = source.size;
+		symbol.hasSize = source.hasSize;
+		symbol.module = source.unit;
+		symbol.isFunction = source.function;
+		symbol.source = DEBUG_FORMAT_DWARF;
+		if (source.type != 0) ApplyDwarfType(dwarf,source.type,symbol);
+		out.symbols.push_back(symbol);
+	}
+
+	DwarfAddresses space;
+	space.placement = NULL;
+	space.layout = NULL;
+	space.real = true;
+	DwarfScopes(dwarf,space,out);
+
+	for (size_t i = 0;i + 1 < dwarf.lines.size();i++) {
+		const DwarfLine &row = dwarf.lines[i];
+		const uint32_t next = dwarf.lines[i+1].address;
+		if (row.endSequence || !row.statement || row.line == 0 || next <= row.address) continue;
+
+		DebugLine line;
+		line.module = row.unit;
+		line.file = row.file;
+		line.line = (uint16_t)row.line;
+		line.imageOffset = row.address;
+		line.endOffset = next;
+		out.lines.push_back(line);
+	}
+}
+
 static void DwarfToDebugInfo(const DwarfInfo &dwarf,const DebugPlacement &placement,const DebugPlacement &layout,
                              DebugInfo &out)
 {
@@ -999,7 +1048,11 @@ static void DwarfToDebugInfo(const DwarfInfo &dwarf,const DebugPlacement &placem
 		if (source.type != 0) ApplyDwarfType(dwarf,source.type,symbol);
 		out.symbols.push_back(symbol);
 	}
-	DwarfScopes(dwarf,placement,layout,out);
+	DwarfAddresses space;
+	space.placement = &placement;
+	space.layout = &layout;
+	space.real = false;
+	DwarfScopes(dwarf,space,out);
 
 	/* A row covers the code up to the next row; one sharing its address with the next has no code. */
 	for (size_t i = 0;i + 1 < dwarf.lines.size();i++) {
