@@ -37,6 +37,10 @@
  *     a host file, either a LINK .MAP or a program with debug info in it. Each
  *     program's symbols load by themselves as DOS EXEC runs it, so this is for
  *     files the guest cannot see.
+ *   {"cmd":"images"} - Protected-mode programs the emulator watches for: each with
+ *     its object count, the linear address of each object found so far, and
+ *     whether all were. A module a program loads at run time (LE, NE, PE, D32X)
+ *     is placed by content, and its symbols register by themselves.
  *   {"cmd":"sym_clear"} - Drop every symbol, or one program's with "program".
  *   {"cmd":"regs"}            - Get registers
  *   {"cmd":"regs_set","reg":"EAX","val":X} - Set register
@@ -2923,6 +2927,24 @@ static void process_command(const std::string& json) {
         } else {
             send_error("File carries no LINK map or debug info this build can read");
         }
+        return;
+    }
+
+    if (cmd == "images") {
+        DEBUG_ImagesLocate();
+        std::string arr;
+        const std::vector<DebugImageStatus> images = DEBUG_ImagesStatus();
+        for (size_t i = 0; i < images.size(); i++) {
+            std::string placed;
+            for (DebugPlacement::const_iterator it = images[i].placed.begin(); it != images[i].placed.end(); ++it) {
+                if (!placed.empty()) placed += ",";
+                placed += "{" + json_num("object", it->first) + "," + json_hex("linear", it->second) + "}";
+            }
+            if (!arr.empty()) arr += ",";
+            arr += "{" + json_str("program", images[i].program) + "," + json_num("objects", (long long)images[i].objects) + "," +
+                   json_bool("complete", images[i].complete) + ",\"placed\":[" + placed + "]}";
+        }
+        send_ok("\"images\":[" + arr + "]");
         return;
     }
 

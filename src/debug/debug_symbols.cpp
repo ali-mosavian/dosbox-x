@@ -157,6 +157,7 @@ struct PendingImage {
 	ProgramFiles files;
 	DebugImage image;
 	DebugPlacement registered;	/* what its symbols were last registered with */
+	bool complete = false;		/* every object with content is placed: nothing left to look for */
 };
 
 static std::vector<PendingImage> pendingImages;
@@ -174,7 +175,8 @@ void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placem
 	for (size_t i = 0;i < pendingImages.size();i++) {
 		if (pendingImages[i].program != program) continue;
 		RegisterPlaced(pendingImages[i],placement);
-		pendingImages.erase(pendingImages.begin() + i);
+		pendingImages[i].registered = placement;
+		pendingImages[i].complete = true;
 		return;
 	}
 }
@@ -229,7 +231,9 @@ static bool MappedMemory(std::vector<std::vector<uint8_t> > &runs,std::vector<De
 
 void DEBUG_ImagesLocate(void)
 {
-	if (pendingImages.empty()) return;
+	bool waiting = false;
+	for (size_t i = 0;i < pendingImages.size();i++) waiting |= !pendingImages[i].complete;
+	if (!waiting) return;
 
 	const uint8_t *ram = (const uint8_t *)GetMemBase();
 	if (ram == NULL) return;
@@ -238,7 +242,8 @@ void DEBUG_ImagesLocate(void)
 	std::vector<DebugMemoryRegion> mapped;
 	const bool paged = MappedMemory(runs,mapped);
 
-	for (size_t i = 0;i < pendingImages.size();) {
+	for (size_t i = 0;i < pendingImages.size();i++) {
+		if (pendingImages[i].complete) continue;
 		DebugPlacement placement;
 		/* A paging host's client is found in the linear space it runs in; any other
 		 * program (DOS/32A runs unpaged) is where RAM says it is. */
@@ -246,17 +251,55 @@ void DEBUG_ImagesLocate(void)
 		if (!complete && placement.empty())
 			complete = DEBUG_LocateObjects(pendingImages[i].image.objects,ram,(size_t)MEM_TotalPages() * 4096u,placement);
 
-		if (complete) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);	/* removes it */
-		else {
-			/* Some objects are there and some not yet, or never: what is placed is worth having,
-			 * and the rest is asked for again. */
-			if (placement.size() > pendingImages[i].registered.size()) {
-				pendingImages[i].registered = placement;
-				RegisterPlaced(pendingImages[i],placement);
-			}
-			i++;
+		if (complete) DEBUG_ImageLoadedAt(pendingImages[i].program,placement);
+		/* Some objects are there and some not yet, or never: what is placed is worth having,
+		 * and the rest is asked for again. */
+		else if (placement.size() > pendingImages[i].registered.size()) {
+			pendingImages[i].registered = placement;
+			RegisterPlaced(pendingImages[i],placement);
 		}
 	}
+}
+
+std::vector<DebugImageStatus> DEBUG_ImagesStatus(void)
+{
+	std::vector<DebugImageStatus> out;
+	for (size_t i = 0;i < pendingImages.size();i++) {
+		DebugImageStatus status;
+		status.program = pendingImages[i].program;
+		status.objects = pendingImages[i].image.objects.size();
+		status.placed = pendingImages[i].registered;
+		status.complete = pendingImages[i].complete;
+		out.push_back(status);
+	}
+	return out;
+}
+
+/* True when the file starts like an LE, NE or PE image, bound to a stub or bare, or a D32X module. */
+static bool LooksLikeImage(const char *program)
+{
+	uint16_t handle = 0;
+	if (!DOS_OpenFile(program,OPEN_READ,&handle)) return false;
+
+	uint8_t head[0x40];
+	uint16_t got = sizeof(head);
+	bool image = DOS_ReadFile(handle,head,&got) && got == sizeof(head);
+	if (image) {
+		const DebugBytes bytes(head,sizeof(head));
+		if (bytes.u32(0) == 0x58323344) image = true;			/* D32X */
+		else if (bytes.u16(0) == 0x5a4d || bytes.u16(0) == 0x4d5a) {
+			uint32_t at = bytes.u32(0x3c);
+			uint8_t sig[4];
+			uint16_t want = sizeof(sig);
+			image = DOS_SeekFile(handle,&at,DOS_SEEK_SET) && DOS_ReadFile(handle,sig,&want) && want == sizeof(sig);
+			if (image) {
+				const DebugBytes tag(sig,sizeof(sig));
+				image = tag.u32(0) == 0x4550 || tag.u16(0) == 0x454c || tag.u16(0) == 0x584c || tag.u16(0) == 0x454e;
+			}
+		} else image = bytes.u16(0) == 0x454c || bytes.u16(0) == 0x584c || bytes.u16(0) == 0x454e;
+	}
+	DOS_CloseFile(handle);
+	return image;
 }
 
 /* Reads a protected-mode executable and, when it is one, waits for its loader
@@ -266,7 +309,7 @@ static bool WatchForLoader(const char *program,uint16_t psp)
 	PendingImage pending;
 	pending.program = program;
 	pending.psp = psp;
-	if (!HasAppendedData(program) || !ReadGuestFile(program,pending.files.image,64u*1024u*1024u)) return false;
+	if (!LooksLikeImage(program) || !ReadGuestFile(program,pending.files.image,64u*1024u*1024u)) return false;
 	if (!DEBUG_ReadImage(DebugBytes(pending.files.image.data(),pending.files.image.size()),pending.image)) return false;
 
 	pending.files.hasMap = ReadSidecar(program,".MAP",pending.files.map);
@@ -317,7 +360,7 @@ void DEBUG_SymbolsOnFileOpen(const char *file)
 
 	const size_t length = strlen(file);
 	if (length < 4 || file[length - 4] != '.') return;
-	static const char *const extensions[] = {"EXE","DLL","DRV","LE","LX"};
+	static const char *const extensions[] = {"EXE","DLL","DRV","LE","LX","D32"};
 	bool candidate = false;
 	for (size_t i = 0;i < sizeof(extensions) / sizeof(extensions[0]);i++)
 		candidate |= strcasecmp(file + length - 3,extensions[i]) == 0;

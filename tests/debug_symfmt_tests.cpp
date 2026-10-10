@@ -526,6 +526,39 @@ TEST_F(DebugSymFmtTest, PeImageGivesSectionsWithRelocationsMaskedAndTheExports)
 	EXPECT_EQ(4u,image.exports[0].offset);
 }
 
+/* The MCP found D32X modules by searching memory for a magic number and kept the answer to itself; the emulator
+ * had no reader, so a module a program loads at run time had no symbols unless the MCP was there to register them. */
+TEST_F(DebugSymFmtTest, D32ImageGivesCodeAndDataWithRelocationsMaskedAndTheExports)
+{
+	std::vector<uint8_t> module(220,0);
+	const uint32_t fields[][2] = {{0,0x58323344},{8,180},{20,72},{24,16},{36,1},{40,88},{44,100},{48,100},
+	                              {52,112},{56,16},{60,128},{64,4},{68,4},{100,8},{104,4}};
+	for (size_t i = 0;i < sizeof(fields) / sizeof(fields[0]);i++)
+		for (int b = 0;b < 4;b++) module[fields[i][0] + b] = (uint8_t)(fields[i][1] >> (8 * b));
+	module[32] = 1;						/* one export */
+	memcpy(&module[72],"add",4);
+	module[92] = 4;						/* export value 4 */
+	module[108] = 2;					/* a relocation of the code at offset 8 */
+	for (int i = 0;i < 16;i++) module[112+i] = (uint8_t)(0x40 + i);
+
+	DebugImage image;
+	ASSERT_TRUE(DEBUG_D32Image(DebugBytes(module.data(),module.size()),image));
+	ASSERT_EQ(3u,image.objects.size());
+	EXPECT_TRUE(image.objects[0].code);
+	ASSERT_EQ(1u,image.objects[0].pages.size());
+	const std::vector<uint8_t> fixed = image.objects[0].pages[0].fixed;
+	ASSERT_EQ(16u,fixed.size());
+	EXPECT_EQ(1,fixed[7]);
+	EXPECT_EQ(0,fixed[8]); EXPECT_EQ(0,fixed[11]);
+	EXPECT_EQ(1,fixed[12]);
+	EXPECT_EQ(4u,image.objects[1].size);
+	EXPECT_TRUE(image.objects[2].pages.empty());
+	ASSERT_EQ(1u,image.exports.size());
+	EXPECT_EQ("add",image.exports[0].name);
+	EXPECT_EQ(1u,image.exports[0].object);
+	EXPECT_EQ(4u,image.exports[0].offset);
+}
+
 TEST_F(DebugSymFmtTest, TheMzImageEndFindsTheBlockWhenTheTrailerIsUnusable)
 {
 	std::vector<uint8_t> data;

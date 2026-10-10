@@ -125,7 +125,7 @@ bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint
 bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out)
 {
 	typedef bool (*Reader)(const DebugBytes &,DebugImage &);
-	static const Reader readers[] = {DEBUG_LeImage,DEBUG_NeImage,DEBUG_PeImage};
+	static const Reader readers[] = {DEBUG_LeImage,DEBUG_NeImage,DEBUG_PeImage,DEBUG_D32Image};
 
 	for (size_t i = 0;i < sizeof(readers) / sizeof(readers[0]);i++) {
 		DebugImage image;

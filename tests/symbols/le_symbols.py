@@ -31,6 +31,12 @@ def run(dosbox: str, program: str, debug_info: bool) -> None:
         check(f"{tag}_sym_names_the_function_at_its_relocated_address", sym.get("status") == "ok" and sym.get("segment") == 1, sym)
         check(f"{tag}_the_function_is_in_extended_memory", int(sym.get("linear", "0"), 16) > EXTENDED, sym)
 
+        images = s.send({"cmd": "images"}).get("images", [])
+        mine = [i for i in images if i["program"].upper().endswith(program)]
+        placed = mine[0]["placed"] if mine else []
+        check(f"{tag}_images_lists_the_program_placed_in_extended_memory",
+              bool(mine) and mine[0]["complete"] and placed and int(placed[0]["linear"], 16) > EXTENDED, images)
+
         bp = s.send({"cmd": "bp_set", "location": FUNCTION})
         check(f"{tag}_bp_set_on_the_function", bp.get("status") == "ok" and bp.get("linear") == sym.get("linear"), bp)
         s.type(["x"])
