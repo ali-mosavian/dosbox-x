@@ -22,6 +22,7 @@
 #include <stddef.h>
 
 #include "cpu.h"
+#include "vtime.h"
 #include "dosrun.h"
 #include "debug.h"
 #include "mapper.h"
@@ -4379,6 +4380,7 @@ public:
 		if(CPU_CycleMax <= 0) CPU_CycleMax = 3000;
 		if(CPU_CycleUp <= 0)   CPU_CycleUp = 500;
 		if(CPU_CycleDown <= 0) CPU_CycleDown = 20;
+		VTIME_ConfigInit();	/* virtual time fixes the rate whatever "cycles" said */
 
 		if (enable_cmpxchg8b && CPU_ArchitectureType >= CPU_ARCHTYPE_PENTIUM) LOG_MSG("Pentium CMPXCHG8B emulation is enabled");
 

@@ -52,6 +52,7 @@
 #include <ctime>
 #include <unistd.h>
 #include "dosbox.h"
+#include "vtime.h"
 #include "debug.h"
 #include "debug/debug_socket.h"
 #include "dosrun.h"
@@ -438,6 +439,7 @@ static Bitu Normal_Loop(void) {
 #if C_DEBUG
     // Check for debug socket commands
     DEBUG_Socket_CheckCommands();
+    { extern void DEBUG_Socket_HoldAtStart(void); DEBUG_Socket_HoldAtStart(); }
 #endif
 
     if (!menu.hidecycles || menu.showrt) { /* sdlmain.cpp/render.cpp doesn't even maintain the frames count when hiding cycles! */
@@ -912,6 +914,7 @@ void DOSBOX_InitTickLoop() {
 
     ticksRemain = 0;
     ticksLocked = section->Get_bool("turbo");
+    VTIME_ConfigInit();
     ticksLastRTtime = 0;
     ticksLast = GetTicks();
     ticksLastRTcounter = GetTicks();
@@ -3218,6 +3221,19 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool = secprop->Add_bool("turbo",Property::Changeable::Always,false);
     Pbool->Set_help("Enables Turbo (Fast Forward) mode to speed up operations.");
     Pbool->SetBasic(true);
+
+    Pbool = secprop->Add_bool("virtual time",Property::Changeable::OnlyAtStart,false);
+    Pbool->Set_help("Guest time follows what the guest executes, the same on every run: the cycle count per emulated millisecond is fixed at \"virtual time rate\", the host throttle is off, nothing syncs the guest clock to the host's, and the guest starts at \"virtual time start\".");
+
+    Pint = secprop->Add_int("virtual time rate",Property::Changeable::OnlyAtStart,2000);
+    Pint->SetMinMax(100,1000000);
+    Pint->Set_help("With virtual time, the CPU cycles per emulated millisecond. A program that waits on the clock costs this many cycles for every millisecond it waits, so a smaller number makes delays cheaper.");
+
+    Pint = secprop->Add_int("virtual time start",Property::Changeable::OnlyAtStart,946684800);
+    Pint->Set_help("With virtual time, the time the guest's clock starts at, in seconds since 1970-01-01 (default 2000-01-01).");
+
+    Pbool = secprop->Add_bool("virtual idle skip",Property::Changeable::OnlyAtStart,true);
+    Pbool->Set_help("With virtual time, a program seen reading a clock again and again has the rest of that millisecond skipped, as if it had run it.");
 
     Pbool = secprop->Add_bool("stop turbo on key",Property::Changeable::Always,true);
     Pbool->Set_help("If set, the Turbo mode will be automatically stopped if a keyboard input is detected.");

@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 class Session:
-    def __init__(self, dosbox: str, fixtures: Path, files: list, command: str):
+    def __init__(self, dosbox: str, fixtures: Path, files: list, command: str, cpu: str = ""):
         """files: names under `fixtures`, or paths to copy in by their own name."""
         self.work = tempfile.TemporaryDirectory()
         work = Path(self.work.name)
@@ -20,7 +20,7 @@ class Session:
             (work / source.name).write_bytes(source.read_bytes())
         (work / "t.conf").write_text(
             "[sdl]\nautolock=false\n[dosbox]\nmemsize=32\nstartbanner=false\nquit warning=false\n"
-            f"[cpu]\ncore=normal\n[autoexec]\nmount c {work}\nc:\n{command}\n"
+            f"[cpu]\ncore=normal\n{cpu}\n[autoexec]\nmount c {work}\nc:\n{command}\n"
         )
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
