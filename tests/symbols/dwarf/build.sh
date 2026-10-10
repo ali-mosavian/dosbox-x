@@ -11,5 +11,9 @@ jwlink option quiet option map=SYMPED.MAP debug dwarf format windows nt runtime 
 # locals.c needs llrm's own DWARF in the object (-gdwarf, DWARF 5): llrm-c from alim/feat/dwarf-omf or later
 llrm-c -m32 -gdwarf -O0 -fobject-format=omf -o locals.obj locals.c
 jwlink option quiet debug dwarf format os2 le option stub="$OW_ROOT/bld/redist/dos32a/stub32a.exe" name SYMLOC.EXE file start.o file locals.obj
-mv SYMLED.EXE SYMPED.EXE SYMLOC.EXE ../fixtures/
-rm -f prog.obj locals.obj start.o SYMLED.MAP SYMPED.MAP
+# opt.c at -O2: a constant with no home (DW_OP_consts + DW_OP_stack_value), parameters moving between registers
+llrm-c -m32 -gdwarf -O2 -fobject-format=omf -o opt.obj opt.c
+llrm-c -m32 -gdwarf -O0 -fobject-format=omf -o sink.obj sink.c
+jwlink option quiet debug dwarf format os2 le option stub="$OW_ROOT/bld/redist/dos32a/stub32a.exe" name SYMOPT.EXE file start.o file opt.obj file sink.obj
+mv SYMLED.EXE SYMPED.EXE SYMLOC.EXE SYMOPT.EXE ../fixtures/
+rm -f prog.obj locals.obj opt.obj sink.obj start.o SYMLED.MAP SYMPED.MAP

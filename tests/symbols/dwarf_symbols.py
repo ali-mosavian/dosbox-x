@@ -89,7 +89,27 @@ def locals_run(dosbox: str) -> None:
         s.close()
 
 
+def optimized_run(dosbox: str) -> None:
+    """opt.c at -O2: `limit` is `DW_OP_consts 100; DW_OP_stack_value`, a value with no home, which the reader left out
+    of locals (a missing variable, not a wrong one)."""
+    tag = "opt"
+    s = Session(dosbox, FIXTURES, ["SYMOPT.EXE"], "SYMOPT.EXE")
+    try:
+        s.send({"cmd": "continue"})
+        check(f"{tag}_program_starts", s.wait_for("ready", 60), s.screen())
+        check(f"{tag}_bp_set", s.send({"cmd": "bp_set", "location": "opt.c:8"}).get("status") == "ok")
+        s.type(["x"])
+        check(f"{tag}_bp_fires", s.wait_stopped(30))
+        found = {v["name"]: v for v in s.send({"cmd": "locals"}).get("locals", [])}
+        check(f"{tag}_a_constant_with_no_home_is_listed", "limit" in found, list(found))
+        check(f"{tag}_its_value_is_the_constant", found.get("limit", {}).get("value") == 100 and
+              found["limit"].get("storage") == "constant", found.get("limit"))
+    finally:
+        s.close()
+
+
 run(sys.argv[1], "led", ["SYMLED.EXE"], "SYMLED.EXE")
+optimized_run(sys.argv[1])
 locals_run(sys.argv[1])
 
 hx = Path(os.environ.get("HX_DOS", "/nonexistent"))

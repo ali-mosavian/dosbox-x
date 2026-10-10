@@ -943,6 +943,31 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DwarfAddresses &space,Debug
 					range.frameOffset = where.offset;
 					break;
 				}
+				case DWARF_LOCATION_CONSTANT:
+					range.storage = DEBUG_STORAGE_CONSTANT;
+					range.constant = where.constant;
+					break;
+				case DWARF_LOCATION_PIECES:
+					range.storage = DEBUG_STORAGE_PIECES;
+					for (size_t p = 0;p < where.pieces.size() && readable;p++) {
+						const DwarfPiece &part = where.pieces[p];
+						DebugLocalPiece piece;
+						piece.size = part.size;
+						if (part.kind == DWARF_LOCATION_REGISTER) {
+							piece.storage = DEBUG_STORAGE_REGISTER;
+							readable = DwarfRegister(dwarf,part.reg,piece.reg);
+						} else if (part.kind == DWARF_LOCATION_FRAME) {
+							uint16_t frame = 0;
+							piece.frameOffset = part.offset;
+							if (source.frame == DWARF_FRAME_CFA) piece.storage = DEBUG_STORAGE_CFA;
+							else if (!DwarfRegister(dwarf,source.frameReg,frame)) readable = false;
+							else if (frame == 5) piece.storage = DEBUG_STORAGE_FRAME;
+							else if (frame == 4) piece.storage = DEBUG_STORAGE_STACK;
+							else readable = false;
+						}
+						range.pieces.push_back(piece);
+					}
+					break;
 				default:
 					readable = false;
 					break;
@@ -964,6 +989,8 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DwarfAddresses &space,Debug
 				local.storage = (DebugStorage)local.ranges[0].storage;
 				local.frameOffset = local.ranges[0].frameOffset;
 				local.reg = local.ranges[0].reg;
+				local.constant = local.ranges[0].constant;
+				local.pieces = local.ranges[0].pieces;
 				local.ranges.clear();
 			}
 
