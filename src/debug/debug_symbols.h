@@ -21,6 +21,16 @@ void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,
  * executable is waited for like a program EXEC loaded, whichever loader asked. */
 void DEBUG_SymbolsOnFileOpen(const char *file);
 
+/* An image the emulator is waiting to see placed, or has seen. */
+struct DebugImageStatus {
+	std::string program;
+	size_t objects = 0;
+	DebugPlacement placed;		/* object number -> linear address, the ones found so far */
+	bool complete = false;
+};
+
+std::vector<DebugImageStatus> DEBUG_ImagesStatus(void);
+
 /* The image-loaded event: a protected-mode program's objects were placed at
  * these addresses (by object number), so its symbols can be registered. */
 void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placement);

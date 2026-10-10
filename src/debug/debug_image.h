@@ -44,6 +44,7 @@ struct DebugImage {
 bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out);
 bool DEBUG_NeImage(const DebugBytes &data,DebugImage &out);
 bool DEBUG_PeImage(const DebugBytes &data,DebugImage &out);
+bool DEBUG_D32Image(const DebugBytes &data,DebugImage &out);
 
 /* Tries every format in turn. Adding one is a reader and a line in the table. */
 bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out);
