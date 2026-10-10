@@ -9,7 +9,8 @@
  *   {"cmd":"step"}            - Single step
  *   {"cmd":"step_over"}       - Step over (step past call)
  *   {"cmd":"bp_set","seg":X,"off":Y}  - Set breakpoint; or "addr":X (linear), or
- *     "location":"func" / "file.c:29" / "*0x9C7E", resolved like "resolve"
+ *     "location":"func" / "file.c:29" / "*0x9C7E", resolved like "resolve"; a
+ *     location is an execution breakpoint on the linear address, as bp_set_linear_exec
  *   {"cmd":"bp_clear","seg":X,"off":Y} - Clear breakpoint
  *   {"cmd":"bp_list"}         - List breakpoints
  *   {"cmd":"get_load_info"}   - Get latest DOS EXEC COM/EXE load metadata
@@ -603,6 +604,7 @@ static const char* symbol_source_name(DebugFormatId source) {
     case DEBUG_FORMAT_TDINFO:   return "tdinfo";
     case DEBUG_FORMAT_WATCOM:   return "watcom";
     case DEBUG_FORMAT_MAP:      return "map";
+    case DEBUG_FORMAT_EXPORT:   return "export";
     }
     return "unknown";
 }
@@ -2495,7 +2497,9 @@ static void process_command(const std::string& json) {
                 send_error(error.c_str());
                 return;
             }
-            CBreakpoint::AddBreakpointByAddr((PhysPt)at.linear, false);
+            /* Not a patched-in INT3: that writes through whatever address space the CPU
+             * is in when it is armed, which under a paging DPMI host is not the program's. */
+            add_linear_exec_breakpoint(at.linear, false);
             send_ok(json_str("msg", "Breakpoint set") + "," + location_json(at));
             return;
         }

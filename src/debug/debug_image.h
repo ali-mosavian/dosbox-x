@@ -27,8 +27,32 @@ struct DebugImageObject {
 	std::vector<DebugImagePage> pages;
 };
 
-/* The objects of an LE image (bound to a stub or bare), empty for anything else. */
-void DEBUG_LeImageObjects(const DebugBytes &data,std::vector<DebugImageObject> &out);
+/* A name the executable itself exports, at an address within one of its objects. */
+struct DebugImageExport {
+	std::string name;
+	uint16_t object = 0;		/* 1-based */
+	uint32_t offset = 0;
+};
+
+/* What a protected-mode executable says about itself, whatever its format. */
+struct DebugImage {
+	std::vector<DebugImageObject> objects;
+	std::vector<DebugImageExport> exports;
+};
+
+/* Each reader: false unless the bytes are its format. */
+bool DEBUG_LeImage(const DebugBytes &data,DebugImage &out);
+bool DEBUG_NeImage(const DebugBytes &data,DebugImage &out);
+
+/* Tries every format in turn. Adding one is a reader and a line in the table. */
+bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out);
+
+/* A run of guest memory whose first byte is at `linear` in the address space the program runs in. */
+struct DebugMemoryRegion {
+	const uint8_t *data = NULL;
+	size_t size = 0;
+	uint32_t linear = 0;
+};
 
 /*
  * Where each object sits in `memory`, by finding its pages. An object with
@@ -36,6 +60,10 @@ void DEBUG_LeImageObjects(const DebugBytes &data,std::vector<DebugImageObject> &
  * one whose pages match in more than one place. False unless every object
  * that has content was placed: a half-loaded image answers nothing yet.
  */
+bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std::vector<DebugMemoryRegion> &memory,
+                         DebugPlacement &out);
+
+/* The same for memory with no paging in the way: one run from address 0. */
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint8_t *memory,size_t memorySize,
                          DebugPlacement &out);
 

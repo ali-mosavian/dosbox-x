@@ -217,6 +217,30 @@ void DebugSymbolStore::AddLinkMap(const LinkMapFile &map,uint32_t loadLinear,con
 	}
 }
 
+void DebugSymbolStore::AddExports(const std::vector<DebugImageExport> &exports,const DebugPlacement &placement,
+                                  const std::string &program)
+{
+	for (size_t i = 0;i < exports.size();i++) {
+		const DebugPlacement::const_iterator base = placement.find(exports[i].object);
+		if (base == placement.end()) continue;
+
+		bool known = false;
+		for (size_t s = 0;s < symbols.size() && !known;s++)
+			known = symbols[s].program == program && symbols[s].name == exports[i].name;
+		if (known) continue;
+
+		DebugSymbol symbol;
+		symbol.name = exports[i].name;
+		symbol.segment = exports[i].object;
+		symbol.offset = exports[i].offset;
+		symbol.segmentBase = base->second;
+		symbol.linear = base->second + exports[i].offset;
+		symbol.source = DEBUG_FORMAT_EXPORT;
+		symbol.program = program;
+		symbols.push_back(symbol);
+	}
+}
+
 const DebugSymbol *DebugSymbolStore::Resolve(const std::string &name) const
 {
 	const size_t bang = name.find('!');

@@ -17,6 +17,10 @@
  * at. Silent and harmless when there is none. */
 void DEBUG_SymbolsOnProgramLoad(const char *program,bool isCom,uint16_t loadSeg,uint16_t psp,uint32_t imageBytes);
 
+/* Called when the guest opens a file: one that proves to be a protected-mode
+ * executable is waited for like a program EXEC loaded, whichever loader asked. */
+void DEBUG_SymbolsOnFileOpen(const char *file);
+
 /* The image-loaded event: a protected-mode program's objects were placed at
  * these addresses (by object number), so its symbols can be registered. */
 void DEBUG_ImageLoadedAt(const std::string &program,const DebugPlacement &placement);

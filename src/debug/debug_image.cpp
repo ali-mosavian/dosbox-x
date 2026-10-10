@@ -58,7 +58,7 @@ static void ObjectAnchors(const DebugImageObject &object,std::vector<Anchor> &ou
 
 /* Found, with `base` set; or not found. An object with nothing to look for
  * (pages of zeros, say) is `unlocatable`, which is no reason to wait. */
-static bool LocateObject(const DebugImageObject &object,const uint8_t *memory,size_t memorySize,uint32_t &base,
+static bool LocateObject(const DebugImageObject &object,const std::vector<DebugMemoryRegion> &memory,uint32_t &base,
                          bool &unlocatable)
 {
 	std::vector<Anchor> anchors;
@@ -68,13 +68,16 @@ static bool LocateObject(const DebugImageObject &object,const uint8_t *memory,si
 	std::map<uint32_t,size_t> votes;
 	for (size_t a = 0;a < anchors.size();a++) {
 		std::vector<uint32_t> hits;
-		const uint8_t *from = memory;
-		while (from < memory + memorySize) {
-			const uint8_t *hit = (const uint8_t *)memmem(from,(size_t)(memory + memorySize - from),anchors[a].bytes,ANCHOR_BYTES);
-			if (hit == NULL) break;
-			hits.push_back((uint32_t)(hit - memory));
-			if (hits.size() > ANCHOR_MAX_HITS) break;
-			from = hit + 1;
+		for (size_t r = 0;r < memory.size() && hits.size() <= ANCHOR_MAX_HITS;r++) {
+			const uint8_t *from = memory[r].data;
+			const uint8_t *end = memory[r].data + memory[r].size;
+			while (from < end) {
+				const uint8_t *hit = (const uint8_t *)memmem(from,(size_t)(end - from),anchors[a].bytes,ANCHOR_BYTES);
+				if (hit == NULL) break;
+				hits.push_back(memory[r].linear + (uint32_t)(hit - memory[r].data));
+				if (hits.size() > ANCHOR_MAX_HITS) break;
+				from = hit + 1;
+			}
 		}
 		if (hits.size() > ANCHOR_MAX_HITS) continue;
 		for (size_t h = 0;h < hits.size();h++)
@@ -96,15 +99,38 @@ static bool LocateObject(const DebugImageObject &object,const uint8_t *memory,si
 	return best > 0 && leaders == 1;
 }
 
-bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint8_t *memory,size_t memorySize,
+bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std::vector<DebugMemoryRegion> &memory,
                          DebugPlacement &out)
 {
 	out.clear();
 	for (size_t o = 0;o < objects.size();o++) {
 		uint32_t base = 0;
 		bool unlocatable = false;
-		if (LocateObject(objects[o],memory,memorySize,base,unlocatable)) out[objects[o].index] = base;
+		if (LocateObject(objects[o],memory,base,unlocatable)) out[objects[o].index] = base;
 		else if (!unlocatable) return false;
 	}
 	return !out.empty();
+}
+
+bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint8_t *memory,size_t memorySize,
+                         DebugPlacement &out)
+{
+	DebugMemoryRegion whole;
+	whole.data = memory;
+	whole.size = memorySize;
+	return DEBUG_LocateObjects(objects,std::vector<DebugMemoryRegion>(1,whole),out);
+}
+
+bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out)
+{
+	typedef bool (*Reader)(const DebugBytes &,DebugImage &);
+	static const Reader readers[] = {DEBUG_LeImage,DEBUG_NeImage};
+
+	for (size_t i = 0;i < sizeof(readers) / sizeof(readers[0]);i++) {
+		DebugImage image;
+		if (!readers[i](data,image) || image.objects.empty()) continue;
+		out = image;
+		return true;
+	}
+	return false;
 }

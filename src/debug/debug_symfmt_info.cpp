@@ -708,12 +708,15 @@ std::string DEBUG_SymbolExplanation(const DebugInfo &info,const DebugSymbol &sym
  * works in those addresses instead of the SegMap's frame:offset. */
 static void PlaceCodeView(CvInfo &info,const DebugPlacement &bases)
 {
+	std::vector<CvSegMapEntry> placed;
 	for (size_t i = 0;i < info.segments.size();i++) {
 		const DebugPlacement::const_iterator base = bases.find(info.segments[i].index);
-		if (base == bases.end()) continue;
+		if (base == bases.end()) continue;	/* nowhere to be relative to */
 		info.segments[i].frame = 0;
 		info.segments[i].offset = base->second;
+		placed.push_back(info.segments[i]);
 	}
+	info.segments.swap(placed);
 }
 
 bool DEBUG_ParseDebugInfoBytes(const DebugBytes &data,const char *file,uint32_t loadLinear,DebugInfo &out,

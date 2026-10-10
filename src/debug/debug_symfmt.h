@@ -509,7 +509,8 @@ enum DebugFormatId {
 	DEBUG_FORMAT_CODEVIEW,
 	DEBUG_FORMAT_TDINFO,
 	DEBUG_FORMAT_WATCOM,
-	DEBUG_FORMAT_MAP
+	DEBUG_FORMAT_MAP,
+	DEBUG_FORMAT_EXPORT		/* a name the executable itself exports */
 };
 
 struct DebugModule {
