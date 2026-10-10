@@ -474,6 +474,58 @@ TEST_F(DebugSymFmtTest, NeImageGivesSegmentsWithRelocationChainsMaskedAndTheExpo
 	EXPECT_EQ(0x10u,image.exports[0].offset);
 }
 
+/* A PE's sections were never read: the base relocations (the loader's rewrite of every absolute address) sat in
+ * the bytes the locator compared, and an exported name never reached the store. */
+TEST_F(DebugSymFmtTest, PeImageGivesSectionsWithRelocationsMaskedAndTheExports)
+{
+	std::vector<uint8_t> pe(0x300,0);
+	pe[0] = 'M'; pe[1] = 'Z'; pe[0x3c] = 0x40;
+	const size_t header = 0x40;
+	pe[header] = 'P'; pe[header+1] = 'E';
+	pe[header+6] = 1;					/* one section */
+	pe[header+20] = 0xe0;					/* optional header size */
+	const size_t optional = header + 24;
+	pe[optional] = 0x0b; pe[optional+1] = 0x01;		/* PE32 */
+	const size_t directories = optional + 96;
+	pe[directories] = 0x20; pe[directories+1] = 0x10;	/* export directory at RVA 0x1020 */
+	pe[directories+4] = 0x40;				/* 0x40 bytes */
+	pe[directories+5*8] = 0x10; pe[directories+5*8+1] = 0x10;	/* relocations at 0x1010 */
+	pe[directories+5*8+4] = 12;
+	const size_t section = optional + 0xe0;
+	pe[section+8] = 0x00; pe[section+9] = 0x01;		/* virtual size 0x100 */
+	pe[section+12] = 0x00; pe[section+13] = 0x10;		/* RVA 0x1000 */
+	pe[section+16] = 0x00; pe[section+17] = 0x01;		/* raw size 0x100 */
+	pe[section+20] = 0x00; pe[section+21] = 0x02;		/* raw offset 0x200 */
+	pe[section+36] = 0x20;					/* code */
+
+	const size_t raw = 0x200;
+	pe[raw+0x10] = 0x00; pe[raw+0x11] = 0x10;		/* relocation block: page 0x1000 */
+	pe[raw+0x14] = 12;
+	pe[raw+0x18] = 0x08; pe[raw+0x19] = 0x30;		/* HIGHLOW at page offset 8 */
+	pe[raw+0x20+24] = 1;					/* one name */
+	pe[raw+0x20+28] = 0x50; pe[raw+0x20+29] = 0x10;		/* functions */
+	pe[raw+0x20+32] = 0x54; pe[raw+0x20+33] = 0x10;		/* names */
+	pe[raw+0x20+36] = 0x58; pe[raw+0x20+37] = 0x10;		/* ordinals */
+	pe[raw+0x50] = 0x04; pe[raw+0x51] = 0x10;		/* function RVA 0x1004 */
+	pe[raw+0x54] = 0x60; pe[raw+0x55] = 0x10;		/* name RVA 0x1060 */
+	memcpy(&pe[raw+0x60],"pe_main",8);
+
+	DebugImage image;
+	ASSERT_TRUE(DEBUG_PeImage(DebugBytes(pe.data(),pe.size()),image));
+	ASSERT_EQ(1u,image.objects.size());
+	EXPECT_TRUE(image.objects[0].code);
+	ASSERT_EQ(1u,image.objects[0].pages.size());
+	const std::vector<uint8_t> fixed = image.objects[0].pages[0].fixed;
+	ASSERT_EQ(0x100u,fixed.size());
+	EXPECT_EQ(1,fixed[7]);
+	EXPECT_EQ(0,fixed[8]); EXPECT_EQ(0,fixed[9]); EXPECT_EQ(0,fixed[10]); EXPECT_EQ(0,fixed[11]);
+	EXPECT_EQ(1,fixed[12]);
+	ASSERT_EQ(1u,image.exports.size());
+	EXPECT_EQ("pe_main",image.exports[0].name);
+	EXPECT_EQ(1u,image.exports[0].object);
+	EXPECT_EQ(4u,image.exports[0].offset);
+}
+
 TEST_F(DebugSymFmtTest, TheMzImageEndFindsTheBlockWhenTheTrailerIsUnusable)
 {
 	std::vector<uint8_t> data;

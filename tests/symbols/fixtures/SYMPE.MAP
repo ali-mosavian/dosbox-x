@@ -1,0 +1,66 @@
+JWlink Version 1.9beta 13
+Portions Copyright (c) 1985-2002 Sybase, Inc. All Rights Reserved.
+Created on:       26/10/10 12:41:42
+Executable Image: SYMPE.EXE
+creating a PE executable
+
+
+                        +------------+
+                        |   Groups   |
+                        +------------+
+
+Group                           Address              Size
+=====                           =======              ====
+
+DGROUP                          00402000             0000003c
+
+
+
+                        +--------------+
+                        |   Segments   |
+                        +--------------+
+
+Segment                Class          Group          Address         Size
+=======                =====          =====          =======         ====
+
+.text                  CODE           AUTO           00401000        00000068
+.data                  DATA           DGROUP         00402000        0000003c
+
+
+                        +----------------+
+                        |   Memory Map   |
+                        +----------------+
+
+* = unreferenced symbol
++ = symbol only referenced locally
+
+Address        Symbol
+=======        ======
+
+Module: start.o(start.asm)
+00401000       _start
+Module: prog.obj(prog.c)
+00402008*      _counter
+0040200c*      _banner
+00401018*      twice_
+00401028*      bump_
+0040104a       run_
+
+
+                        +----------------------+
+                        |   Imported Symbols   |
+                        +----------------------+
+
+Symbol                              Module
+======                              ======
+
+
+
+                        +-----------------------+
+                        |   Linker Statistics   |
+                        +-----------------------+
+
+Stack size:  00100000 (1048576.)
+Memory size:  00a4 (164.)
+Entry point address: 00401000
+Link time: 00:00.89

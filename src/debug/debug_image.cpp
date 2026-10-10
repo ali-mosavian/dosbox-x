@@ -103,13 +103,14 @@ bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const std:
                          DebugPlacement &out)
 {
 	out.clear();
+	bool complete = true;
 	for (size_t o = 0;o < objects.size();o++) {
 		uint32_t base = 0;
 		bool unlocatable = false;
 		if (LocateObject(objects[o],memory,base,unlocatable)) out[objects[o].index] = base;
-		else if (!unlocatable) return false;
+		else if (!unlocatable) complete = false;
 	}
-	return !out.empty();
+	return complete && !out.empty();
 }
 
 bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint8_t *memory,size_t memorySize,
@@ -124,7 +125,7 @@ bool DEBUG_LocateObjects(const std::vector<DebugImageObject> &objects,const uint
 bool DEBUG_ReadImage(const DebugBytes &data,DebugImage &out)
 {
 	typedef bool (*Reader)(const DebugBytes &,DebugImage &);
-	static const Reader readers[] = {DEBUG_LeImage,DEBUG_NeImage};
+	static const Reader readers[] = {DEBUG_LeImage,DEBUG_NeImage,DEBUG_PeImage};
 
 	for (size_t i = 0;i < sizeof(readers) / sizeof(readers[0]);i++) {
 		DebugImage image;
