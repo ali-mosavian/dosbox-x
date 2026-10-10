@@ -46,7 +46,37 @@ def run(dosbox: str, tag: str, files: list, command: str) -> None:
         s.close()
 
 
+def omf(dosbox: str) -> None:
+    """locals.c with llrm's own 16-bit DWARF (-gdwarf-2, Open Watcom's convention): address size 2, DW_AT_segment
+    on each symbol, DW_OP_addr of 2 bytes, registers numbered ax 27 ... Before, `counter` was left out (the
+    location reader took DW_OP_addr for 4 bytes)."""
+    tag = "omf"
+    s = Session(dosbox, FIXTURES, ["SYMLOC16.EXE"], "SYMLOC16.EXE")
+    try:
+        s.send({"cmd": "continue"})
+        check(f"{tag}_program_starts", s.wait_for("ready", 60), s.screen())
+        counter = s.send({"cmd": "var", "name": "counter", "len": 2})
+        check(f"{tag}_a_global_with_a_16_bit_address_reads_through_its_segment", counter.get("bytes") == "0700", counter)
+        sym = s.send({"cmd": "sym", "name": "add"})
+        check(f"{tag}_sym_names_the_function", sym.get("status") == "ok" and sym.get("source") == "dwarf", sym)
+        s.send({"cmd": "bp_set", "location": "add"})
+        s.type(["x"])
+        check(f"{tag}_bp_fires_in_the_function", s.wait_stopped(30))
+        here = s.send({"cmd": "where"})
+        check(f"{tag}_where_names_function_and_line", here.get("symbol") == "add" and here.get("file") == "locals.c" and
+              here.get("line") == 10, here)
+        found = {v["name"]: v for v in s.send({"cmd": "locals"}).get("locals", [])}
+        check(f"{tag}_locals_are_named", {"first", "second", "sum"} <= set(found), list(found))
+        if all("value" in found.get(n, {}) for n in ("first", "second")):
+            check(f"{tag}_parameters_read", found["first"]["value"] == 3 and found["second"]["value"] == 4, found)
+        else:
+            skip(f"{tag}_parameters_read", "no .debug_frame in llrm's -m16 DWARF yet: the frame base has no CFA to measure from")
+    finally:
+        s.close()
+
+
 run(sys.argv[1], "mzd", ["SYMMZD.EXE"], "SYMMZD.EXE")
+omf(sys.argv[1])
 
 hx = Path(os.environ.get("HX_DOS", "/nonexistent"))
 if (hx / "DPMILD16.EXE").is_file():

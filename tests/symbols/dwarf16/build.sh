@@ -14,5 +14,8 @@ d = bytearray(open("SYMNED.EXE", "rb").read())
 d[int.from_bytes(d[0x3c:0x40], "little") + 0x36] = 5
 open("SYMNED.EXE", "wb").write(d)
 PY
-mv SYMMZD.EXE SYMNED.EXE ../fixtures/
-rm -f prog.obj start.o startne.o
+# locals.c with llrm's own 16-bit DWARF (Open Watcom's convention: address size 2, DW_AT_segment on each symbol)
+llrm-c -m16 -gdwarf-2 -O0 -fobject-format=omf -o locals.obj locals.c
+jwlink option quiet debug dwarf format dos name SYMLOC16.EXE file start.o file locals.obj
+mv SYMMZD.EXE SYMNED.EXE SYMLOC16.EXE ../fixtures/
+rm -f prog.obj locals.obj start.o startne.o
