@@ -266,6 +266,38 @@ TEST_F(DebugSymFmtTest, ParseSymbolRunReadsA32BitProcAndItsLocals)
 	EXPECT_EQ(-8,scopes[0].locals[0].frameOffset);
 }
 
+/* A frameless -m32 function names its locals off ESP (S_REGREL32); the reader dropped every one of them, so
+ * `locals` in such a function answered nothing. */
+TEST_F(DebugSymFmtTest, ParseSymbolRunReadsALocalNamedOffTheStackPointer)
+{
+	std::vector<uint8_t> proc;
+	AddU32(proc,0); AddU32(proc,0); AddU32(proc,0);
+	AddU32(proc,0x40); AddU32(proc,4); AddU32(proc,0x3c);
+	AddU32(proc,0x1000);
+	AddU16(proc,1); AddU16(proc,0x100);
+	proc.push_back(0);
+	proc.push_back(3); proc.push_back('b'); proc.push_back('u'); proc.push_back('m');
+
+	std::vector<uint8_t> local;
+	AddU32(local,8);				/* ESP + 8 */
+	AddU16(local,21);				/* CV4's ESP */
+	AddU16(local,0x74);				/* type */
+	local.push_back(1); local.push_back('n');
+
+	std::vector<uint8_t> body;
+	AddCvRecord(body,0x0205,proc);			/* S_GPROC32 */
+	AddCvRecord(body,0x020c,local);			/* S_REGREL32 */
+	AddCvRecord(body,0x0006,std::vector<uint8_t>());
+
+	std::vector<CvScope> scopes;
+	DEBUG_ParseCvSymbolRun(DebugBytes(body.data(),body.size()),1,0,body.size(),&scopes);
+	ASSERT_EQ(1u,scopes.size());
+	ASSERT_EQ(1u,scopes[0].locals.size());
+	EXPECT_EQ("n",scopes[0].locals[0].name);
+	EXPECT_EQ(CV_LOCAL_STACK,scopes[0].locals[0].storage);
+	EXPECT_EQ(8,scopes[0].locals[0].frameOffset);
+}
+
 /* An LE image whose name tables and entry table were never read: `sym` for an exported function found nothing. */
 TEST_F(DebugSymFmtTest, ParseLeReadsObjectsExportNamesAndEntries)
 {

@@ -268,7 +268,7 @@ static void CodeViewScopes(const CvInfo &info,DebugInfo &out)
 				if (!CvRegisterNumber(source.reg,local.reg)) continue;
 				local.storage = DEBUG_STORAGE_REGISTER;
 			} else {
-				local.storage = DEBUG_STORAGE_FRAME;
+				local.storage = source.storage == CV_LOCAL_STACK ? DEBUG_STORAGE_STACK : DEBUG_STORAGE_FRAME;
 				local.frameOffset = source.frameOffset;
 			}
 

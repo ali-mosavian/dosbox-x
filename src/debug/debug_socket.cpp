@@ -820,7 +820,8 @@ static bool register_value(uint16_t reg, uint32_t& out) {
 // this was read through is reported with it.
 static std::string local_json(const DebugLocal& local, const std::string& function) {
     std::string out = json_str("name", local.name) + "," +
-                      json_str("storage", local.storage == DEBUG_STORAGE_REGISTER ? "register" : "frame");
+                      json_str("storage", local.storage == DEBUG_STORAGE_REGISTER ? "register"
+                                          : local.storage == DEBUG_STORAGE_STACK ? "stack" : "frame");
     if (!function.empty()) out += "," + json_str("function", function);
     if (!local.typeName.empty()) out += "," + json_str("type", local.typeName);
 
@@ -839,8 +840,10 @@ static std::string local_json(const DebugLocal& local, const std::string& functi
         return out;
     }
 
+    /* A 32-bit stack is addressed by the whole of EBP or ESP, a 16-bit one by BP or SP. */
     const uint16_t ss = SegValue(SegNames::ss);
-    const uint32_t at = (uint32_t)GetAddress(ss, (uint32_t)(((int32_t)reg_bp + local.frameOffset) & 0xFFFF));
+    const uint32_t base = local.storage == DEBUG_STORAGE_STACK ? (uint32_t)reg_esp : (uint32_t)reg_ebp;
+    const uint32_t at = (uint32_t)GetAddress(ss, (uint32_t)((int32_t)base + local.frameOffset) & (uint32_t)cpu.stack.mask);
     uint32_t length = local.valueSize != 0 ? local.valueSize : 2;
     if (length > 4096) length = 4096;
 
@@ -849,7 +852,7 @@ static std::string local_json(const DebugLocal& local, const std::string& functi
     const std::string hex = read_guest_hex(at, length, bytes, complete);
 
     char frame[64];
-    snprintf(frame, sizeof(frame), "%04X:%04X", ss, (unsigned int)reg_bp);
+    snprintf(frame, sizeof(frame), cpu.stack.big ? "%04X:%08X" : "%04X:%04X", ss, (unsigned int)(base & (uint32_t)cpu.stack.mask));
     out += "," + json_num("frame_offset", local.frameOffset) +
            "," + json_hex("linear", at) +
            "," + json_str("frame", frame) +

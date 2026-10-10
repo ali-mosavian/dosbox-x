@@ -104,7 +104,8 @@ struct CvSymbol {
 /* A proc's frame: what CodeView records between the proc and its S_ENDBLK. */
 enum CvLocalStorage {
 	CV_LOCAL_FRAME,
-	CV_LOCAL_REGISTER
+	CV_LOCAL_REGISTER,
+	CV_LOCAL_STACK		/* S_REGREL32 off ESP: a frameless function's local */
 };
 
 struct CvLocal {
@@ -579,7 +580,12 @@ struct DebugLine {
 /* Where a local lives while its function runs. */
 enum DebugStorage {
 	DEBUG_STORAGE_FRAME,		/* at a displacement from BP */
-	DEBUG_STORAGE_REGISTER
+	DEBUG_STORAGE_REGISTER,
+	/* At a displacement from SP. A function that keeps no frame pointer moves SP as
+	 * it pushes and pops, so the displacement holds only where the stack stands at
+	 * the depth the compiler measured it from: the function's body, between its
+	 * prologue and its epilogue. */
+	DEBUG_STORAGE_STACK
 };
 
 struct DebugLocal {
