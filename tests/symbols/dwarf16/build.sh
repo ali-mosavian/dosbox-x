@@ -17,5 +17,8 @@ PY
 # locals.c with llrm's own 16-bit DWARF (Open Watcom's convention: address size 2, DW_AT_segment on each symbol)
 llrm-c -m16 -gdwarf-2 -O0 -fobject-format=omf -o locals.obj locals.c
 jwlink option quiet debug dwarf format dos name SYMLOC16.EXE file start.o file locals.obj
-mv SYMMZD.EXE SYMNED.EXE SYMLOC16.EXE ../fixtures/
-rm -f prog.obj locals.obj start.o startne.o
+# far and huge pointers carry DW_AT_address_class (Open Watcom's: far16 2, huge16 3)
+llrm-c -m16 -gdwarf-2 -O0 -fobject-format=omf -o farptr.obj farptr.c
+jwlink option quiet debug dwarf format dos name SYMFAR16.EXE file start.o file farptr.obj
+mv SYMMZD.EXE SYMNED.EXE SYMLOC16.EXE SYMFAR16.EXE ../fixtures/
+rm -f prog.obj locals.obj farptr.obj start.o startne.o

@@ -75,8 +75,35 @@ def omf(dosbox: str) -> None:
         s.close()
 
 
+def far_pointers(dosbox: str) -> None:
+    """farptr.c: `char __far *where` and `char __huge *wide` point at `buffer`. llrm writes them as pointers with
+    DW_AT_address_class 2 and 3; before, the reader dropped the class, so `locals` gave a bare 32-bit number and nothing
+    said it was a segment and an offset, or where it led."""
+    tag = "far"
+    s = Session(dosbox, FIXTURES, ["SYMFAR16.EXE"], "SYMFAR16.EXE")
+    try:
+        s.send({"cmd": "continue"})
+        check(f"{tag}_program_starts", s.wait_for("ready", 60), s.screen())
+        buffer = s.send({"cmd": "sym", "name": "buffer"})
+        s.send({"cmd": "bp_set", "location": "farptr.c:7"})
+        s.type(["x"])
+        check(f"{tag}_bp_fires", s.wait_stopped(30))
+        ds = int(s.send({"cmd": "regs"}).get("DS", 0))
+        found = {v["name"]: v for v in s.send({"cmd": "locals"}).get("locals", [])}
+        for name, reach in (("where", "far"), ("wide", "huge")):
+            pointer = found.get(name, {}).get("pointer", {})
+            check(f"{tag}_{name}_is_a_{reach}_pointer", pointer.get("reach") == reach, found.get(name))
+            check(f"{tag}_{name}_is_a_segment_and_an_offset", pointer.get("segment") == ds and
+                  pointer.get("offset") == int(buffer.get("offset", "-1"), 16), (pointer, ds, buffer))
+            check(f"{tag}_{name}_is_followed_to_what_it_points_at", pointer.get("bytes") == "05" and pointer.get("value") == 5 and
+                  pointer.get("target_type") == "char", pointer)
+    finally:
+        s.close()
+
+
 run(sys.argv[1], "mzd", ["SYMMZD.EXE"], "SYMMZD.EXE")
 omf(sys.argv[1])
+far_pointers(sys.argv[1])
 
 hx = Path(os.environ.get("HX_DOS", "/nonexistent"))
 if (hx / "DPMILD16.EXE").is_file():

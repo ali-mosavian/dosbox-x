@@ -608,6 +608,7 @@ struct DwarfType {
 	uint8_t encoding = 0;		/* DW_ATE_* of a base type */
 	size_t target = 0;		/* what a pointer, typedef, array or qualifier refers to */
 	uint32_t count = 0;		/* elements of an array */
+	uint8_t addressClass = 0;	/* DW_AT_address_class of a pointer: Open Watcom's far16 2, huge16 3, far32 5 */
 	std::vector<DwarfField> members;
 };
 
@@ -649,6 +650,21 @@ enum DebugValueKind {
 	DEBUG_VALUE_FLOAT
 };
 
+/* A far or huge pointer is a segment and an offset: following it reads what it points at through that segment. */
+enum DebugReach {
+	DEBUG_REACH_NEAR,		/* the pointer is an offset: no segment of its own */
+	DEBUG_REACH_FAR,
+	DEBUG_REACH_HUGE
+};
+
+struct DebugPointer {
+	DebugReach reach = DEBUG_REACH_NEAR;
+	uint32_t targetSize = 0;	/* bytes to read at the target; 0 when it has no type to read */
+	DebugValueKind targetKind = DEBUG_VALUE_UNKNOWN;
+	std::string targetType;
+};
+
+
 /* One field of a structure, placed within it. */
 struct DebugField {
 	std::string name;
@@ -682,6 +698,7 @@ struct DebugSymbol {
 	/* Set when the type is a structure, or an array of one: elementSize is
 	 * then the stride between elements. */
 	std::vector<DebugField> fields;
+	DebugPointer pointer;
 	bool isFunction = false;
 	/* A BASIC array: the symbol addresses a runtime descriptor, and the
 	 * elements are wherever that points. elementSize is one element. */
@@ -761,6 +778,7 @@ struct DebugLocal {
 	DebugValueKind valueKind = DEBUG_VALUE_UNKNOWN;
 	uint32_t elementSize = 0;
 	std::vector<DebugField> fields;
+	DebugPointer pointer;
 	bool isBasicArray = false;
 	/* When non-empty, where the value is at an address: the range covering it, in place of
 	 * storage, frameOffset and reg above. */

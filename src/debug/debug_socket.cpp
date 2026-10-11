@@ -783,6 +783,34 @@ static std::string fields_json(const std::vector<uint8_t>& bytes, size_t at,
 // them, as an array of scalars, or as a single scalar.
 static const uint32_t VAR_MAX_ELEMENTS = 64;
 
+// A far or huge pointer, followed: the segment and offset in its bytes, and what they point at read through that segment.
+// 16:16 is two words, 16:32 a word after a dword.
+static std::string pointer_json(const std::vector<uint8_t>& bytes, const DebugPointer& pointer) {
+    if (pointer.reach == DEBUG_REACH_NEAR || (bytes.size() != 4 && bytes.size() != 6)) return std::string();
+    uint32_t offset = (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8;
+    if (bytes.size() == 6) offset |= (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+    const uint16_t segment = (uint16_t)((uint32_t)bytes[bytes.size() - 2] | (uint32_t)bytes[bytes.size() - 1] << 8);
+    char text[32];
+    snprintf(text, sizeof(text), bytes.size() == 6 ? "%04X:%08X" : "%04X:%04X", segment, (unsigned int)offset);
+    std::string out = ",\"pointer\":{" + json_str("reach", pointer.reach == DEBUG_REACH_HUGE ? "huge" : "far") + "," +
+                      json_num("segment", segment) + "," + json_num("offset", (long long)offset) + "," + json_str("address", text);
+    if (!pointer.targetType.empty()) out += "," + json_str("target_type", pointer.targetType);
+    if (pointer.targetSize != 0) {
+        const uint32_t linear = (uint32_t)GetAddress(segment, offset);
+        std::vector<uint8_t> target;
+        bool complete = true;
+        const uint32_t length = pointer.targetSize > 256 ? 256 : pointer.targetSize;
+        const std::string hex = read_guest_hex(linear, length, target, complete);
+        out += "," + json_hex("linear", linear) + "," + json_num("length", length) + "," + json_bool("readable", complete) + "," +
+               json_str("bytes", hex);
+        if (pointer.targetKind != DEBUG_VALUE_UNKNOWN) {
+            const std::string one = decode_value(target, 0, length, pointer.targetKind);
+            if (!one.empty()) out += "," + json_raw("value", one);
+        }
+    }
+    return out + "}";
+}
+
 static std::string decoded_value_json(const std::vector<uint8_t>& bytes, uint32_t length,
                                       DebugValueKind kind, uint32_t elementSize,
                                       const std::vector<DebugField>& fields) {
@@ -960,6 +988,7 @@ static std::string local_json(const DebugLocal& declared, const std::string& fun
         const uint32_t length = (uint32_t)bytes.size();
         out += "," + json_num("length", length) + "," + json_str("bytes", hex_string(bytes));
         out += decoded_value_json(bytes, length, local.valueKind, local.elementSize, local.fields);
+        out += pointer_json(bytes, local.pointer);
         return out;
     }
 
@@ -1002,6 +1031,7 @@ static std::string local_json(const DebugLocal& declared, const std::string& fun
            "," + json_str("bytes", hex);
 
     out += decoded_value_json(bytes, length, local.valueKind, local.elementSize, local.fields);
+    out += pointer_json(bytes, local.pointer);
     return out;
 }
 
@@ -2959,6 +2989,7 @@ static void process_command(const std::string& json) {
                                                        symbol->elementSize, symbol->fields);
         if (!decoded.empty()) {
             out += decoded;
+            out += pointer_json(bytes, symbol->pointer);
         } else if (length == 1 || length == 2 || length == 4) {
             // No type to go on: give both readings of the bytes rather than
             // picking one and calling it the value.

@@ -751,6 +751,7 @@ struct DwarfTypeText {
 	DebugValueKind kind = DEBUG_VALUE_UNKNOWN;
 	uint32_t elementSize = 0;
 	std::vector<DebugField> fields;
+	DebugPointer pointer;
 };
 
 static DwarfTypeText DescribeDwarfType(const DwarfInfo &dwarf,size_t offset,unsigned depth = 0)
@@ -775,10 +776,20 @@ static DwarfTypeText DescribeDwarfType(const DwarfInfo &dwarf,size_t offset,unsi
 		break;
 	}
 	case 0x0f:						/* pointer */
-		text.name = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1).name + "*";
+	{
+		const DwarfTypeText target = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1);
+		text.name = target.name + "*";
 		text.size = type.size ? type.size : 4;
 		text.kind = DEBUG_VALUE_UNSIGNED;
+		if (type.addressClass == 2 || type.addressClass == 3 || type.addressClass == 5) {
+			text.pointer.reach = type.addressClass == 3 ? DEBUG_REACH_HUGE : DEBUG_REACH_FAR;
+			/* what a pointer to a structure or an array points at is read as bytes, whole */
+			text.pointer.targetSize = target.size;
+			text.pointer.targetKind = target.fields.empty() ? target.kind : DEBUG_VALUE_UNKNOWN;
+			text.pointer.targetType = target.name;
+		}
 		break;
+	}
 	case 0x16:						/* typedef */
 	{
 		const DwarfTypeText target = DescribeDwarfType(dwarf,(size_t)type.target,depth + 1);
@@ -835,6 +846,7 @@ static void ApplyDwarfType(const DwarfInfo &dwarf,size_t offset,DebugSymbol &sym
 	symbol.valueKind = text.kind;
 	symbol.elementSize = text.elementSize;
 	symbol.fields = text.fields;
+	symbol.pointer = text.pointer;
 }
 
 /* A DWARF address, placed: the load-relative offset it comes to once its object is where the loader put it. */
@@ -1001,6 +1013,7 @@ static void DwarfScopes(const DwarfInfo &dwarf,const DwarfAddresses &space,Debug
 			local.valueKind = typed.valueKind;
 			local.elementSize = typed.elementSize;
 			local.fields = typed.fields;
+			local.pointer = typed.pointer;
 			scope.locals.push_back(local);
 		}
 		mapped[i] = (int32_t)out.scopes.size();
