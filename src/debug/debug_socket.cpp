@@ -3290,9 +3290,19 @@ static void process_command(const std::string& json) {
             return;
         }
         
+        // The CPU's own write: through the page handler of the address, so video memory takes the byte the way the
+        // adapter does (write mode, map mask, latches), and a page that is not there says so.
         for (size_t i = 0; i + 1 < data.length(); i += 2) {
             uint8_t val = (uint8_t)strtol(data.substr(i, 2).c_str(), nullptr, 16);
-            phys_writeb(addr + i/2, val);
+            const LinearPt at = (LinearPt)(addr + i/2);
+            const HostPt host = get_tlb_write(at);
+            bool faulted = false;
+            if (host) host_writeb(host + at, val);
+            else faulted = get_tlb_writehandler(at)->writeb_checked(at, val);
+            if (faulted) {
+                send_error("Page fault writing the byte");
+                return;
+            }
         }
         send_ok();
         return;

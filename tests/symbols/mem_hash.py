@@ -40,6 +40,32 @@ def planar(dosbox: str) -> None:
         s.close()
 
 
+def video_writes(dosbox: str) -> None:
+    """mem_write wrote the machine's physical memory behind the adapter, so a byte sent to A0000 never reached the video
+    memory: the screen did not change and reading it back gave what had been there. It goes through the same handler
+    as the CPU's own write now, which in the planar mode 12h means the write mode, the map mask and the latches."""
+    s = Session(dosbox, Path(__file__).parent / "fixtures", ["MODE12.COM"], "MODE12.COM")
+    try:
+        s.send({"cmd": "continue"})
+        for _ in range(100):
+            if s.send({"cmd": "text_screen"}).get("video_mode") == 0x12:
+                break
+            time.sleep(0.1)
+        time.sleep(0.3)
+        before = s.send({"cmd": "mem_hash", "addr": 0, "len": 0x28000, "vram": True})
+        seen_before = s.send({"cmd": "mem_hash", "addr": 0xA0000, "len": 1})
+        s.send({"cmd": "mem_write", "addr": 0xA0000, "data": "FF"})
+        after = s.send({"cmd": "mem_hash", "addr": 0, "len": 0x28000, "vram": True})
+        check("write_a_byte_to_planar_video_memory_reaches_the_adapter", before.get("hash") != after.get("hash"), (before, after))
+        seen = s.send({"cmd": "mem_hash", "addr": 0xA0000, "len": 1})
+        check("write_and_the_cpu_reads_it_back", seen.get("hash") == fnv1a64(b"\xff") and seen.get("hash") != seen_before.get("hash"), (seen_before, seen))
+        s.send({"cmd": "mem_write_linear", "addr": 0xA0001, "data": "FF"})
+        linear = s.send({"cmd": "mem_hash", "addr": 0xA0001, "len": 1})
+        check("write_linear_reaches_the_adapter_too", linear.get("hash") == fnv1a64(b"\xff"), linear)
+    finally:
+        s.close()
+
+
 def run(dosbox: str) -> None:
     s = Session(dosbox, Path(__file__).parent / "fixtures", ["MODE13.COM"], "MODE13.COM")
     try:
@@ -76,4 +102,5 @@ def run(dosbox: str) -> None:
 
 run(sys.argv[1])
 planar(sys.argv[1])
+video_writes(sys.argv[1])
 finish()
