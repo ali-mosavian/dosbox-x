@@ -298,7 +298,7 @@ enum {
 	DW_TAG_typedef = 0x16,DW_TAG_union_type = 0x17,DW_TAG_subrange_type = 0x21,DW_TAG_base_type = 0x24,
 	DW_TAG_const_type = 0x26,DW_TAG_subprogram = 0x2e,DW_TAG_variable = 0x34,DW_TAG_volatile_type = 0x35,
 	DW_AT_location = 0x02,DW_AT_name = 0x03,DW_AT_byte_size = 0x0b,DW_AT_low_pc = 0x11,DW_AT_high_pc = 0x12,
-	DW_AT_upper_bound = 0x2f,DW_AT_count = 0x37,DW_AT_data_member_location = 0x38,DW_AT_encoding = 0x3e,
+	DW_AT_upper_bound = 0x2f,DW_AT_address_class = 0x33,DW_AT_count = 0x37,DW_AT_data_member_location = 0x38,DW_AT_encoding = 0x3e,
 	DW_AT_frame_base = 0x40,DW_AT_type = 0x49,DW_AT_segment = 0x46,
 	DW_OP_addr = 0x03,DW_OP_call_frame_cfa = 0x9c,DW_OP_fbreg = 0x91,DW_OP_regx = 0x90,DW_OP_piece = 0x93,DW_OP_stack_value = 0x9f
 };
@@ -740,6 +740,7 @@ void CollectTypes(const std::vector<Die> &dies,DwarfInfo &out)
 			type.name = die.name();
 			type.size = (uint32_t)die.number(DW_AT_byte_size);
 			type.encoding = (uint8_t)die.number(DW_AT_encoding);
+			type.addressClass = (uint8_t)die.number(DW_AT_address_class);
 			type.target = die.has(DW_AT_type) ? die.number(DW_AT_type) : 0;
 			out.typeIndex[die.offset] = out.types.size();
 			out.types.push_back(type);
