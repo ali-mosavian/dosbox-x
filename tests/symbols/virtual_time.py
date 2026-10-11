@@ -51,6 +51,22 @@ def waiting(dosbox: str, skip: bool) -> dict:
         s.close()
 
 
+def native(dosbox: str, program: str, charge: str) -> int:
+    """The ticks 1000 calls of a natively emulated service take at 2000 cycles per millisecond, `charge` being the
+    \"native call cycles\" setting."""
+    s = Session(dosbox, FIXTURES, [program], program,
+                cpu=f"virtual time=true\nvirtual time rate=2000\nvirtual idle skip=false\nnative call cycles={charge}")
+    try:
+        s.send({"cmd": "continue"})
+        for _ in range(600):
+            if s.send({"cmd": "mem_read", "addr": 0xB8F02, "len": 1})["data"] == "55":
+                break
+            time.sleep(0.05)
+        return int(s.send({"cmd": "mem_read", "addr": 0xB8F00, "len": 1})["data"], 16)
+    finally:
+        s.close()
+
+
 def run(dosbox: str) -> None:
     results = [busy(dosbox, 2000) for _ in range(3)]
     ticks = [t for t, _ in results]
@@ -79,6 +95,16 @@ def run(dosbox: str) -> None:
     check("vt_without_skipping_nothing_is_skipped", plain.get("skipped_ms") == 0, plain)
     check("vt_a_wait_on_the_clock_is_skipped", skipping.get("skipped_ms", 0) > 100, skipping)
     check("vt_and_costs_fewer_clock_reads", skipping.get("clock_reads", 1 << 30) < plain.get("clock_reads", 0), (plain, skipping))
+
+    # The emulated BIOS and DOS run natively: before, 1000 calls took no guest time and a program using them looked
+    # free. 1000 calls of 10000 cycles at 2000 per millisecond are 5000 ms: 91 ticks.
+    free, charged = native(dosbox, "VTINT10.COM", ""), native(dosbox, "VTINT10.COM", "10:10000")
+    check("vt_native_calls_cost_the_guest_nothing_by_default", free <= 1, free)
+    check("vt_int10_calls_cost_what_they_are_charged", 88 <= charged <= 94, charged)
+    # Any vector, not only the one that was asked for first; and only the one named.
+    dos, dos_other = native(dosbox, "VTINT21.COM", "10:10000 21:4000"), native(dosbox, "VTINT21.COM", "10:10000")
+    check("vt_a_second_vector_is_charged_its_own_cost", 34 <= dos <= 39, dos)  # 1000 * 4000 / 2000 = 2000 ms = 36 ticks
+    check("vt_a_vector_not_named_is_not_charged", dos_other <= 1, dos_other)
 
 
 run(sys.argv[1])

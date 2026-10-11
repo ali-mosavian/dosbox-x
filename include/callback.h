@@ -25,6 +25,12 @@
 typedef Bitu (*CallBack_Handler)(void);
 extern CallBack_Handler CallBack_Handlers[];
 
+/* Guest time for natively emulated services: [cpu] "native call cycles" names a cost per interrupt vector, and a
+ * callback some vector points at is charged it each time it runs. Unset until the first callback decides. */
+enum { CB_COST_UNSET, CB_COST_NONE, CB_COST_ACTIVE };
+extern int callback_native_cost;
+void CALLBACK_ChargeNative(Bitu callback);
+
 enum { CB_RETN,CB_RETF,CB_RETF8,CB_IRET,CB_IRETD,CB_IRET_STI,CB_IRET_EOI_PIC1,
 		CB_IRQ0,CB_IRQ1,CB_IRQ1_BREAK,CB_IRQ9,CB_IRQ12,CB_IRQ12_RET,CB_MOUSE,
 		CB_INT28,CB_INT29,CB_INT16,CB_HOOKABLE,CB_TDE_IRET,CB_IPXESR,CB_IPXESR_RET,
