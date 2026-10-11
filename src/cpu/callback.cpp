@@ -19,11 +19,14 @@
 #include <assert.h>
 #include <string.h>
 #include <cstdint>
+#include <map>
+#include <string>
 
 #include "callback.h"
 #include "logging.h"
 #include "bios.h"
 #include "cpu.h"
+#include "regs.h"
 #include "control.h"
 #include "setup.h"
 #include "mem.h"
@@ -47,10 +50,12 @@ CallBack_Handler CallBack_Handlers[CB_MAX] = {NULL};
 
 int callback_native_cost = CB_COST_UNSET;
 static int native_vector_cost[256];
+static std::map<unsigned int,int> native_function_cost;	/* vector << 8 | AH: a function's own cost, over its vector's */
 static int8_t native_cost_known[CB_MAX];	/* 0 not looked at yet, 1 looked at */
 static int native_cost[CB_MAX];
+static int native_vector[CB_MAX];
 
-/* Reads "native call cycles" once, at the first callback. */
+/* Reads "native call cycles" once, at the first callback: vector[.function]:cycles, all but the cycles in hex. */
 static void NativeCostParse(void) {
 	callback_native_cost = CB_COST_NONE;
 	const Section_prop *section = static_cast<Section_prop *>(control->GetSection("cpu"));
@@ -61,37 +66,52 @@ static void NativeCostParse(void) {
 		const unsigned long vector = strtoul(list.c_str() + at,&end,16);
 		if (end == list.c_str() + at) { at++; continue; }
 		at = (size_t)(end - list.c_str());
+		long function = -1;
+		if (at < list.size() && list[at] == '.') {
+			function = (long)strtoul(list.c_str() + at + 1,&end,16);
+			at = (size_t)(end - list.c_str());
+		}
 		if (at >= list.size() || list[at] != ':') continue;
 		const long cost = strtol(list.c_str() + at + 1,&end,10);
 		at = (size_t)(end - list.c_str());
-		if (vector > 255 || cost <= 0) continue;
-		native_vector_cost[vector] = (int)cost;
+		if (vector > 255 || function > 255 || cost <= 0) continue;
+		if (function < 0) native_vector_cost[vector] = (int)cost;
+		else native_function_cost[(unsigned int)(vector << 8 | (unsigned long)function)] = (int)cost;
 		callback_native_cost = CB_COST_ACTIVE;
 	}
 }
 
-/* The cost of a callback is that of the vector that points at it the first time it runs: a callback is set up
- * before the vector that names it, so earlier would find nothing. */
+/* A callback belongs to the vector that points at it the first time it runs: a callback is set up before the
+ * vector that names it, so earlier would find nothing. */
 void CALLBACK_ChargeNative(Bitu callback) {
 	if (callback_native_cost == CB_COST_UNSET) NativeCostParse();
 	if (callback_native_cost != CB_COST_ACTIVE) return;
 	if (!native_cost_known[callback]) {
 		native_cost_known[callback] = 1;
+		native_vector[callback] = -1;
 		for (unsigned int vector = 0;vector < 256;vector++) {
-			if (native_vector_cost[vector] == 0) continue;
+			bool named = native_vector_cost[vector] != 0;
+			for (std::map<unsigned int,int>::const_iterator f = native_function_cost.begin();!named && f != native_function_cost.end();++f)
+				named = (f->first >> 8) == vector;
+			if (!named) continue;
 			/* The video BIOS's vector goes through a far jump in its ROM to the callback. */
 			RealPt target = RealGetVec((uint8_t)vector);
 			for (int hop = 0;hop < 2 && target != CALLBACK_RealPointer(callback) && mem_readb(Real2Phys(target)) == 0xEA;hop++)
 				target = RealMake(mem_readw(Real2Phys(target) + 3),mem_readw(Real2Phys(target) + 1));
 			if (target != CALLBACK_RealPointer(callback)) continue;
+			native_vector[callback] = (int)vector;
 			native_cost[callback] = native_vector_cost[vector];
 			break;
 		}
 	}
-	if (native_cost[callback] == 0) return;
+	if (native_vector[callback] < 0) return;
+	int cost = native_cost[callback];
+	const std::map<unsigned int,int>::const_iterator own = native_function_cost.find((unsigned int)native_vector[callback] << 8 | reg_ah);
+	if (own != native_function_cost.end()) cost = own->second;
+	if (cost == 0) return;
 	/* The guest's time passes in the cycles it has left, as an I/O delay's does. */
-	CPU_Cycles -= native_cost[callback];
-	CPU_IODelayRemoved += native_cost[callback];
+	CPU_Cycles -= cost;
+	CPU_IODelayRemoved += cost;
 }
 char* CallBack_Description[CB_MAX] = {NULL};
 

@@ -105,6 +105,12 @@ def run(dosbox: str) -> None:
     dos, dos_other = native(dosbox, "VTINT21.COM", "10:10000 21:4000"), native(dosbox, "VTINT21.COM", "10:10000")
     check("vt_a_second_vector_is_charged_its_own_cost", 34 <= dos <= 39, dos)  # 1000 * 4000 / 2000 = 2000 ms = 36 ticks
     check("vt_a_vector_not_named_is_not_charged", dos_other <= 1, dos_other)
+    # A function's own cost replaces its vector's; another function's does not touch it. AH=3 is get cursor.
+    own, other = native(dosbox, "VTINT10.COM", "10:10000 10.03:2000"), native(dosbox, "VTINT10.COM", "10:10000 10.09:5000")
+    check("vt_a_function_is_charged_its_own_cost_over_the_vectors", 17 <= own <= 20, own)  # 1000 * 2000 / 2000 = 1000 ms
+    check("vt_another_function_leaves_the_vectors_cost_alone", 88 <= other <= 94, other)
+    only = native(dosbox, "VTINT10.COM", "10.03:10000")
+    check("vt_a_function_can_be_charged_with_no_vector_cost", 88 <= only <= 94, only)
 
 
 run(sys.argv[1])
