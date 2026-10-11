@@ -59,18 +59,18 @@ def omf(dosbox: str) -> None:
         check(f"{tag}_a_global_with_a_16_bit_address_reads_through_its_segment", counter.get("bytes") == "0700", counter)
         sym = s.send({"cmd": "sym", "name": "add"})
         check(f"{tag}_sym_names_the_function", sym.get("status") == "ok" and sym.get("source") == "dwarf", sym)
-        s.send({"cmd": "bp_set", "location": "add"})
+        s.send({"cmd": "bp_set", "location": "locals.c:11"})
         s.type(["x"])
-        check(f"{tag}_bp_fires_in_the_function", s.wait_stopped(30))
+        check(f"{tag}_bp_fires_on_the_line", s.wait_stopped(30))
         here = s.send({"cmd": "where"})
         check(f"{tag}_where_names_function_and_line", here.get("symbol") == "add" and here.get("file") == "locals.c" and
-              here.get("line") == 10, here)
+              here.get("line") == 11, here)
         found = {v["name"]: v for v in s.send({"cmd": "locals"}).get("locals", [])}
         check(f"{tag}_locals_are_named", {"first", "second", "sum"} <= set(found), list(found))
-        if all("value" in found.get(n, {}) for n in ("first", "second")):
-            check(f"{tag}_parameters_read", found["first"]["value"] == 3 and found["second"]["value"] == 4, found)
-        else:
-            skip(f"{tag}_parameters_read", "no .debug_frame in llrm's -m16 DWARF yet: the frame base has no CFA to measure from")
+        # The frame base is the call frame address, and only .debug_frame says where that is at each instruction: without
+        # llrm's -m16 frame rows these were read from a guess and gave other words of the stack.
+        values = {n: found.get(n, {}).get("value") for n in ("first", "second", "sum")}
+        check(f"{tag}_parameters_and_locals_read_through_the_frame_rows", values == {"first": 3, "second": 4, "sum": 7}, found)
     finally:
         s.close()
 
