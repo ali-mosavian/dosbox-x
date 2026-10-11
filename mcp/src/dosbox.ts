@@ -15,6 +15,7 @@
  * command (same pattern as tools/dbg_cmd.py).
  */
 
+import { EventLog } from "./eventLog.js";
 import net from "net";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { existsSync, readFileSync, unlinkSync } from "fs";
@@ -465,7 +466,7 @@ function isIgnoredInt3Stop(event: JsonObject): boolean {
     stopIntNumber(event) === 3;
 }
 
-class DosboxSession {
+export class DosboxSession {
   private socket: net.Socket | null = null;
   private connecting: Promise<void> | null = null;
   private buffer = "";
@@ -475,6 +476,7 @@ class DosboxSession {
   private stopWaiters: StopWaiter[] = [];
   private lastStop: JsonObject | undefined;
   private connectedState: string | undefined;
+  readonly events = new EventLog();
 
   constructor(private readonly port: number) {}
 
@@ -631,6 +633,16 @@ class DosboxSession {
       }
       return;
     }
+    /* An event the emulator sends by itself (key_wait, image_loaded, profile ...) is not the reply to a command, which
+     * has a status: taking it for one left the real reply to answer the next command. */
+    if (typeof event === "string" && msg["status"] === undefined && event !== "process_exit") {
+      this.events.push(msg);
+      if (msg["stopped"] === true) {
+        this.lastStop = msg;
+        this.resolveStopWaiters(msg);
+      }
+      return;
+    }
     if (event === "process_exit") {
       // Async event — deliver to registered listeners; do NOT resolve pending commands.
       for (const cb of asyncEventListeners) {
@@ -776,6 +788,10 @@ export function continueAndWait(
   timeoutMs = 30_000,
 ): Promise<JsonObject> {
   return sessionFor(port).continueAndWait(timeoutMs);
+}
+
+export function events(port: number = _port): EventLog {
+  return sessionFor(port).events;
 }
 
 export function waitForStop(

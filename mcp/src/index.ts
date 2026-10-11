@@ -3528,6 +3528,139 @@ server.tool(
   },
 );
 
+// ─── Measurement and timing ──────────────────────────────────────────────── //
+
+server.tool(
+  "dosbox_mem_hash",
+  "A 64-bit FNV-1a hash of a memory range, to tell whether a region (a screen, a buffer) changed without moving its bytes. " +
+  "Give addr (linear) or seg+off. vram=true hashes the video adapter's own memory, every plane, with addr as the offset into it.",
+  {
+    addr: z.number().optional().describe("Linear address (or offset into video memory with vram)."),
+    seg: z.number().optional().describe("Segment (with off)."),
+    off: z.number().optional().describe("Offset (with seg)."),
+    len: z.number().int().min(1).describe("Bytes to hash."),
+    vram: z.boolean().optional().describe("Hash the adapter's memory, not what the CPU reads."),
+  },
+  async ({ addr, seg, off, len, vram }) => {
+    const resp = await db.sendCommand({
+      cmd: "mem_hash", len,
+      ...(addr !== undefined ? { addr } : {}),
+      ...(seg !== undefined && off !== undefined ? { seg, off } : {}),
+      ...(vram ? { vram: true } : {}),
+    });
+    return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+  },
+);
+
+server.tool(
+  "dosbox_profile",
+  "Count the program's executed instructions and memory operands by function and source line, self and inclusive, " +
+  "for every image format the symbol store reads. op='start' begins counting, 'stop' ends it, 'report' returns the " +
+  "totals, the busiest functions (self, inclusive, calls) and lines; the functions add up to the program's total.",
+  {
+    op: z.enum(["start", "stop", "report"]).describe("start, stop or report."),
+    top: z.number().int().min(1).max(500).optional().describe("For report, how many functions and lines to keep (default 25)."),
+  },
+  async ({ op, top = 25 }) => {
+    if (op !== "report") {
+      const resp = await db.sendCommand({ cmd: op === "start" ? "profile_start" : "profile_stop" });
+      return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+    }
+    const resp = await db.sendCommand({ cmd: "profile" }, 30_000);
+    for (const key of ["functions", "lines"]) {
+      const rows = resp[key];
+      if (Array.isArray(rows)) resp[key] = rows.slice(0, top);
+    }
+    return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+  },
+);
+
+server.tool(
+  "dosbox_virtual_time",
+  "Guest time that follows what the guest runs, the same on every run: a fixed number of cycles per emulated " +
+  "millisecond, no host throttle, and (skipIdle) a program that only polls a clock has the rest of the millisecond skipped. " +
+  "op='set' turns it on (or off with on=false); op='status' shows the rate, skipped milliseconds and emulated time. " +
+  "Charging cycles for natively emulated services (INT 10h, 21h ...) is the config setting [cpu] 'native call cycles', " +
+  "not a command: set it in the conf given to dosbox_launch.",
+  {
+    op: z.enum(["set", "status"]).describe("set or status."),
+    on: z.boolean().optional().describe("For set: false turns virtual time off (default true)."),
+    cyclesPerMs: z.number().int().min(1).optional().describe("For set: cycles per emulated millisecond (default 25000)."),
+    skipIdle: z.boolean().optional().describe("For set: skip the idle part of a clock-polling wait (default true)."),
+    epoch: z.number().int().optional().describe("For set: the guest's start time, seconds since 1970 (default: the configured one)."),
+  },
+  async ({ op, on = true, cyclesPerMs, skipIdle, epoch }) => {
+    const resp = await db.sendCommand(op === "status" ? { cmd: "virtual_time_status" } : {
+      cmd: "virtual_time", on: on ? 1 : 0,
+      ...(cyclesPerMs !== undefined ? { cycles_per_ms: cyclesPerMs } : {}),
+      ...(skipIdle !== undefined ? { skip_idle: skipIdle } : {}),
+      ...(epoch !== undefined ? { epoch } : {}),
+    });
+    return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+  },
+);
+
+server.tool(
+  "dosbox_key_wait",
+  "Wait until the guest reads the keyboard and finds nothing there, so a key sent now is not lost to a flush that comes " +
+  "first. Arms the event and waits for one that comes after this call; send the key when it returns.",
+  {
+    timeoutMs: z.number().int().optional().describe("Max wait in ms (default 30 000)."),
+  },
+  async ({ timeoutMs = 30_000 }) => {
+    const mark = db.events().mark();
+    const armed = await db.sendCommand({ cmd: "key_wait_arm" });
+    if (isErr(armed)) return { content: [{ type: "text", text: j(armed) }], isError: true };
+    const event = await db.events().wait("key_wait", mark, timeoutMs);
+    return event === undefined
+      ? { content: [{ type: "text", text: j({ status: "timeout", msg: `no key_wait within ${timeoutMs} ms` }) }], isError: true }
+      : { content: [{ type: "text", text: j(event) }] };
+  },
+);
+
+server.tool(
+  "dosbox_events",
+  "The events the emulator sends on its own (key_wait, image_loaded ...), kept in order. op='list' returns them, " +
+  "'wait' returns the next one (of 'name') or times out, 'clear' forgets them.",
+  {
+    op: z.enum(["list", "wait", "clear"]).describe("list, wait or clear."),
+    name: z.string().optional().describe("Only events of this name, e.g. key_wait or image_loaded."),
+    timeoutMs: z.number().int().optional().describe("For wait: max wait in ms (default 30 000)."),
+  },
+  async ({ op, name, timeoutMs = 30_000 }) => {
+    const log = db.events();
+    if (op === "clear") {
+      log.clear();
+      return { content: [{ type: "text", text: j({ status: "ok" }) }] };
+    }
+    if (op === "list") return { content: [{ type: "text", text: j({ status: "ok", events: log.list(name) }) }] };
+    const event = await log.wait(name, log.mark(), timeoutMs);
+    return event === undefined
+      ? { content: [{ type: "text", text: j({ status: "timeout" }) }], isError: true }
+      : { content: [{ type: "text", text: j(event) }] };
+  },
+);
+
+server.tool(
+  "dosbox_bp_on_image",
+  "Stop when a program is placed in memory by a loader (LE, NE, PE, D32X), before it starts. op='load' stops at the entry of " +
+  "the next image placed (an image_loaded event says which); op='symbol' arms a breakpoint at 'location' (symbol or file:line) " +
+  "for when its image is placed; op='clear' drops them all.",
+  {
+    op: z.enum(["load", "symbol", "clear"]).describe("load, symbol or clear."),
+    location: z.string().optional().describe("For symbol: the symbol or file:line."),
+  },
+  async ({ op, location }) => {
+    if (op === "symbol" && location === undefined) {
+      return { content: [{ type: "text", text: "ERROR: symbol needs location" }], isError: true };
+    }
+    const resp = await db.sendCommand(
+      op === "load" ? { cmd: "bp_on_image_load" } : op === "clear" ? { cmd: "bp_on_symbol_load_clear" } : { cmd: "bp_on_symbol_load", location },
+    );
+    return { content: [{ type: "text", text: j(resp) }], isError: isErr(resp) };
+  },
+);
+
 // ─── 10. Protected-mode info ─────────────────────────────────────────────── //
 
 server.tool(
