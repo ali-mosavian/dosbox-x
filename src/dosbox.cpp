@@ -3238,7 +3238,7 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("With virtual time, a program seen reading a clock again and again has the rest of that millisecond skipped, as if it had run it.");
 
     Pstring = secprop->Add_string("native call cycles",Property::Changeable::OnlyAtStart,"");
-    Pstring->Set_help("CPU cycles the guest is charged for each call of a service the emulator runs natively, per interrupt vector: a list of vector:cycles pairs, the vector in hex, e.g. \"10:3000 21:800 33:500\". The emulated BIOS and DOS take no guest time, so what a program draws or reads through them looks free; a real one takes thousands of cycles. Empty charges nothing. A vector counts if it pointed at the emulator's own handler when that handler first ran.");
+    Pstring->Set_help("CPU cycles the guest is charged for each call of a service the emulator runs natively, per interrupt vector: a list of vector:cycles pairs, the vector in hex, e.g. \"10:3000 21:800 33:500\"; vector.function:cycles, the function (AH) in hex, sets one function's cost over its vector's, e.g. \"10:100 10.09:1000 10.06:30000\". The emulated BIOS and DOS take no guest time, so what a program draws or reads through them looks free; a real one takes thousands of cycles. Empty charges nothing. A vector counts if it pointed at the emulator's own handler when that handler first ran.");
 
     Pbool = secprop->Add_bool("stop turbo on key",Property::Changeable::Always,true);
     Pbool->Set_help("If set, the Turbo mode will be automatically stopped if a keyboard input is detected.");
