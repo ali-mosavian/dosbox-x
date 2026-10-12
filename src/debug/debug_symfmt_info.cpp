@@ -77,6 +77,10 @@ static std::string CvPrimitiveName(uint16_t type,DebugSymbol &out)
 
 	/* A pointer is the address, whatever it points at. */
 	const char * const kinds[3] = {"near ptr","far ptr","huge ptr"};
+	out.pointer.reach = mode == 1 ? DEBUG_REACH_NEAR : mode == 2 ? DEBUG_REACH_FAR : DEBUG_REACH_HUGE;
+	out.pointer.targetSize = out.valueSize;
+	out.pointer.targetKind = out.valueKind;
+	out.pointer.targetType = name;
 	out.valueSize = mode == 1 ? 2u : 4u;
 	out.valueKind = DEBUG_VALUE_UNSIGNED;
 	return std::string(kinds[mode <= 3 ? mode - 1 : 2]) + (name.empty() ? "" : " to " + name);
@@ -90,6 +94,7 @@ static std::string CodeViewTypeName(const std::vector<CvType> &types,uint16_t ty
 	out.elementSize = 0;
 	out.fields.clear();
 	out.isBasicArray = false;
+	out.pointer = DebugPointer();
 	if (depth > 8) return std::string();
 
 	if (type < 0x1000) return CvPrimitiveName(type,out);
@@ -111,6 +116,10 @@ static std::string CodeViewTypeName(const std::vector<CvType> &types,uint16_t ty
 	case 0x0002:					/* LF_POINTER */
 		out.valueSize = record.size != 0 ? record.size : 2u;
 		out.valueKind = DEBUG_VALUE_UNSIGNED;
+		out.pointer.reach = out.valueSize == 2 ? DEBUG_REACH_NEAR : DEBUG_REACH_FAR;
+		out.pointer.targetSize = inner.valueSize;
+		out.pointer.targetKind = inner.fields.empty() ? inner.valueKind : DEBUG_VALUE_UNKNOWN;
+		out.pointer.targetType = underlying;
 		return (out.valueSize == 2 ? "near ptr" : "far ptr") +
 		       (underlying.empty() ? std::string() : " to " + underlying);
 	case 0x0003: {					/* LF_ARRAY */
@@ -278,6 +287,7 @@ static void CodeViewScopes(const CvInfo &info,DebugInfo &out)
 			local.valueKind = typed.valueKind;
 			local.elementSize = typed.elementSize;
 			local.fields = typed.fields;
+			local.pointer = typed.pointer;
 			local.isBasicArray = typed.isBasicArray;
 			out_scope.locals.push_back(local);
 		}
@@ -781,8 +791,9 @@ static DwarfTypeText DescribeDwarfType(const DwarfInfo &dwarf,size_t offset,unsi
 		text.name = target.name + "*";
 		text.size = type.size ? type.size : 4;
 		text.kind = DEBUG_VALUE_UNSIGNED;
-		if (type.addressClass == 2 || type.addressClass == 3 || type.addressClass == 5) {
-			text.pointer.reach = type.addressClass == 3 ? DEBUG_REACH_HUGE : DEBUG_REACH_FAR;
+		{
+			text.pointer.reach = type.addressClass == 3 ? DEBUG_REACH_HUGE
+			                   : type.addressClass == 2 || type.addressClass == 5 ? DEBUG_REACH_FAR : DEBUG_REACH_NEAR;
 			/* what a pointer to a structure or an array points at is read as bytes, whole */
 			text.pointer.targetSize = target.size;
 			text.pointer.targetKind = target.fields.empty() ? target.kind : DEBUG_VALUE_UNKNOWN;
