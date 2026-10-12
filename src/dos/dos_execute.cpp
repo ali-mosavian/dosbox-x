@@ -403,6 +403,12 @@ bool DOS_Execute(const char* name, PhysPt block_pt, uint16_t flags) {
 			head.pages&=0x07ffu;
 			headersize = head.headersize*16u;
 			imagesize = memimagesize = head.pages*512u-headersize; 
+			/* The file is the last page's bytes (`extrabytes`; 0: all 512) after the full pages before it, as DOS loads it: what
+			 * a linker appends after the image (debug information) is no part of it, and read into the memory after the
+			 * program it broke one that expects that memory as it was. */
+			if (head.extrabytes != 0 && head.extrabytes < 512u && head.pages != 0 &&
+			    (head.pages-1u)*512u+head.extrabytes > headersize)
+				imagesize = memimagesize = (head.pages-1u)*512u+head.extrabytes-headersize;
 			if (imagesize+headersize<512u) imagesize = 512u-headersize;
 		}
 	}
