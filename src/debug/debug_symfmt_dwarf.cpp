@@ -293,7 +293,7 @@ bool ReadLineUnit(const DebugBytes &lines,size_t &at,const Sections &sections,Dw
 
 enum {
 	DW_TAG_array_type = 0x01,DW_TAG_enumeration_type = 0x04,DW_TAG_formal_parameter = 0x05,
-	DW_TAG_label = 0x0a,DW_TAG_lexical_block = 0x0b,DW_TAG_member = 0x0d,DW_TAG_pointer_type = 0x0f,
+	DW_TAG_label = 0x0a,DW_TAG_lexical_block = 0x0b,DW_TAG_member = 0x0d,DW_TAG_pointer_type = 0x0f,DW_TAG_reference_type = 0x10,
 	DW_TAG_compile_unit = 0x11,DW_TAG_structure_type = 0x13,DW_TAG_subroutine_type = 0x15,
 	DW_TAG_typedef = 0x16,DW_TAG_union_type = 0x17,DW_TAG_subrange_type = 0x21,DW_TAG_base_type = 0x24,
 	DW_TAG_const_type = 0x26,DW_TAG_subprogram = 0x2e,DW_TAG_variable = 0x34,DW_TAG_volatile_type = 0x35,
@@ -732,11 +732,12 @@ void CollectTypes(const std::vector<Die> &dies,DwarfInfo &out)
 	for (size_t i = 0;i < dies.size();i++) {
 		const Die &die = dies[i];
 		switch (die.tag) {
-		case DW_TAG_base_type: case DW_TAG_pointer_type: case DW_TAG_structure_type: case DW_TAG_union_type:
+		case DW_TAG_base_type: case DW_TAG_pointer_type: case DW_TAG_reference_type: case DW_TAG_structure_type: case DW_TAG_union_type:
 		case DW_TAG_array_type: case DW_TAG_typedef: case DW_TAG_const_type: case DW_TAG_volatile_type:
 		case DW_TAG_enumeration_type: case DW_TAG_subroutine_type: {
 			DwarfType type;
-			type.tag = (uint16_t)die.tag;
+			/* A reference (BASIC's by-reference parameters) is a pointer to a reader that follows one. */
+			type.tag = (uint16_t)(die.tag == DW_TAG_reference_type ? (unsigned)DW_TAG_pointer_type : (unsigned)die.tag);
 			type.name = die.name();
 			type.size = (uint32_t)die.number(DW_AT_byte_size);
 			type.encoding = (uint8_t)die.number(DW_AT_encoding);
