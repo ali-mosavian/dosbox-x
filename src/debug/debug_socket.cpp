@@ -786,14 +786,18 @@ static const uint32_t VAR_MAX_ELEMENTS = 64;
 // A far or huge pointer, followed: the segment and offset in its bytes, and what they point at read through that segment.
 // 16:16 is two words, 16:32 a word after a dword.
 static std::string pointer_json(const std::vector<uint8_t>& bytes, const DebugPointer& pointer) {
-    if (pointer.reach == DEBUG_REACH_NEAR || (bytes.size() != 4 && bytes.size() != 6)) return std::string();
+    const bool near = pointer.reach == DEBUG_REACH_NEAR;
+    // A near pointer is an offset (two bytes, or four on a flat target); the data segment is the one it is read through.
+    if (near ? (pointer.targetSize == 0 || (bytes.size() != 2 && bytes.size() != 4)) : (bytes.size() != 4 && bytes.size() != 6)) return std::string();
     uint32_t offset = (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8;
-    if (bytes.size() == 6) offset |= (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
-    const uint16_t segment = (uint16_t)((uint32_t)bytes[bytes.size() - 2] | (uint32_t)bytes[bytes.size() - 1] << 8);
+    if (bytes.size() == 6 || (near && bytes.size() == 4)) offset |= (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+    const uint16_t segment = near ? SegValue(SegNames::ds)
+                                  : (uint16_t)((uint32_t)bytes[bytes.size() - 2] | (uint32_t)bytes[bytes.size() - 1] << 8);
     char text[32];
-    snprintf(text, sizeof(text), bytes.size() == 6 ? "%04X:%08X" : "%04X:%04X", segment, (unsigned int)offset);
-    std::string out = ",\"pointer\":{" + json_str("reach", pointer.reach == DEBUG_REACH_HUGE ? "huge" : "far") + "," +
+    snprintf(text, sizeof(text), bytes.size() == 6 || (near && bytes.size() == 4) ? "%04X:%08X" : "%04X:%04X", segment, (unsigned int)offset);
+    std::string out = ",\"pointer\":{" + json_str("reach", near ? "near" : pointer.reach == DEBUG_REACH_HUGE ? "huge" : "far") + "," +
                       json_num("segment", segment) + "," + json_num("offset", (long long)offset) + "," + json_str("address", text);
+    if (near) out += "," + json_str("via", "DS");
     if (!pointer.targetType.empty()) out += "," + json_str("target_type", pointer.targetType);
     if (pointer.targetSize != 0) {
         const uint32_t linear = (uint32_t)GetAddress(segment, offset);
