@@ -625,6 +625,13 @@ enum {
 	S3_CHANGESEG = 0x11
 };
 
+/* A CodeView 3 type index of a scalar, the numbers from 0x80; any other (an array's, a record's) is a place in a type table
+ * this reader does not read, and says nothing: it is not a CodeView 4 primitive. */
+static uint16_t Cv3Scalar(uint16_t type)
+{
+	return type >= 0x80 && type < 0x100 ? type : 0;
+}
+
 /* SegInfo {seg, offset, cb}, ovl, iLib, cSeg, reserved, name, then the
  * other cSeg-1 SegInfos. LINK 3.69 writes cSeg 0 with SegInfo filled in. */
 static bool ParseModule3(const DebugBytes &body,uint16_t index,CvModule &out)
@@ -721,6 +728,7 @@ static void ParseSymbols3(const DebugBytes &body,uint16_t moduleIndex,uint16_t c
 			break;
 		case S3_BPREL:
 			local.frameOffset = (int32_t)(int16_t)body.u16(data);
+			local.type = Cv3Scalar(body.u16(data + 2));
 			local.name = body.pstr(data + 4);
 			if (inProc && !local.name.empty()) open.locals.push_back(local);
 			break;
@@ -734,6 +742,7 @@ static void ParseSymbols3(const DebugBytes &body,uint16_t moduleIndex,uint16_t c
 			symbol.kind = inProc ? CV_SYM_LOCAL_DATA : CV_SYM_GLOBAL_DATA;
 			symbol.offset = body.u16(data);
 			symbol.segment = body.u16(data + 2);
+			symbol.type = Cv3Scalar(body.u16(data + 4));
 			symbol.name = body.pstr(data + 6);
 			if (!symbol.name.empty()) out.symbols.push_back(symbol);
 			break;

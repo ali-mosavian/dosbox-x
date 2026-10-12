@@ -32,6 +32,25 @@ static std::string CvPrimitiveName(uint16_t type,DebugSymbol &out)
 	out.valueSize = 0;
 	out.valueKind = DEBUG_VALUE_UNKNOWN;
 
+	/* BASIC's compilers' CodeView (the BC dialect, CodeView 3's): a scalar is one number from 0x80, and none of CodeView
+	 * 4's primitives is. */
+	if (type >= 0x80 && type < 0x100) {
+		struct Scalar { uint16_t code; const char *name; uint32_t size; DebugValueKind kind; };
+		static const Scalar scalars[] = {
+			{0x80,"CHAR",1,DEBUG_VALUE_SIGNED},{0x81,"INTEGER",2,DEBUG_VALUE_SIGNED},{0x82,"LONG",4,DEBUG_VALUE_SIGNED},
+			{0x84,"UNSIGNED CHAR",1,DEBUG_VALUE_UNSIGNED},{0x85,"UNSIGNED INTEGER",2,DEBUG_VALUE_UNSIGNED},
+			{0x86,"UNSIGNED LONG",4,DEBUG_VALUE_UNSIGNED},{0x88,"SINGLE",4,DEBUG_VALUE_FLOAT},
+			{0x89,"DOUBLE",8,DEBUG_VALUE_FLOAT},{0x8A,"LONG DOUBLE",10,DEBUG_VALUE_FLOAT},{0x99,"CURRENCY",8,DEBUG_VALUE_SIGNED}
+		};
+		for (size_t i = 0;i < sizeof(scalars) / sizeof(scalars[0]);i++) {
+			if (scalars[i].code != type) continue;
+			out.valueSize = scalars[i].size;
+			out.valueKind = scalars[i].kind;
+			return scalars[i].name;
+		}
+		return std::string();
+	}
+
 	const uint16_t mode = (uint16_t)((type >> 8) & 7u);
 	const uint16_t base = (uint16_t)(type & 0xffu);
 
