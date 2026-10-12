@@ -842,7 +842,9 @@ void CollectScopes(const Sections &sections,const std::vector<Unit> &units,const
 		if (locations.empty()) continue;
 
 		const int owner = die.parent >= 0 && scopeOf.count(die.parent) ? scopeOf[die.parent] : -1;
-		if (owner >= 0) {
+		/* A variable at an address is static, wherever it is declared: a symbol of its own, as one at the unit's top. A
+		 * BASIC array is one inside its module's function. */
+		if (owner >= 0 && locations[0].kind != DWARF_LOCATION_ADDRESS) {
 			DwarfVariable variable;
 			variable.name = die.name();
 			variable.type = die.has(DW_AT_type) ? die.number(DW_AT_type) : 0;
