@@ -45,6 +45,7 @@ struct Function {
 	std::string name;
 	std::string program;
 	uint64_t self = 0,selfMemory = 0,inclusive = 0,inclusiveMemory = 0,calls = 0;
+	uint64_t inclusiveUnknown = 0;	/* of inclusive, run in (unknown) code, which the program's map does not name */
 	uint32_t active = 0;		/* frames of it on the stack: only the outermost adds to inclusive */
 };
 
@@ -59,6 +60,7 @@ struct Frame {
 	uint32_t returnTo = 0;
 	int32_t function = NO_FUNCTION;
 	uint64_t instructions = 0,memory = 0;
+	uint64_t unknown = 0;		/* instructions run in (unknown) when the frame opened */
 };
 
 std::vector<Range> ranges;
@@ -74,6 +76,7 @@ uint16_t builtPsp = 0;
 int32_t current = -1;			/* the range being attributed to */
 uint64_t lastInstructions = 0,lastMemory = 0;
 uint64_t startInstructions = 0,startMemory = 0;
+uint64_t unknownTotal = 0;		/* instructions flushed to (unknown) */
 
 const char *UNKNOWN = "(unknown)";
 
@@ -118,11 +121,21 @@ void Flush()
 	const Range &range = ranges[(size_t)current];
 	const int32_t function = range.function >= 0 ? range.function : FunctionIndex("(outside the program)","");
 	functions[(size_t)function].self += instructions;
+	if (functions[(size_t)function].name == UNKNOWN) unknownTotal += instructions;
 	functions[(size_t)function].selfMemory += memory;
 	if (range.line >= 0) {
 		lines[(size_t)range.line].self += instructions;
 		lines[(size_t)range.line].memory += memory;
 	}
+}
+
+/* The instructions run in (unknown) so far, flushed or not. */
+uint64_t UnknownNow()
+{
+	uint64_t total = unknownTotal;
+	if (current >= 0 && ranges[(size_t)current].function >= 0 && functions[(size_t)ranges[(size_t)current].function].name == UNKNOWN)
+		total += dosrun_instructions - lastInstructions;
+	return total;
 }
 
 struct Span {
@@ -330,6 +343,7 @@ void DEBUG_ProfileTransfer(uint32_t from,uint32_t fromSp,uint32_t fromBase,uint3
 			frame.function = ranges[range].counted ? ranges[range].function : NO_FUNCTION;
 			frame.instructions = dosrun_instructions;
 			frame.memory = dosrun_memory;
+			frame.unknown = UnknownNow();
 			if (frame.function >= 0) {
 				functions[(size_t)frame.function].calls++;
 				functions[(size_t)frame.function].active++;
@@ -355,6 +369,7 @@ void DEBUG_ProfileTransfer(uint32_t from,uint32_t fromSp,uint32_t fromBase,uint3
 					if (function.active == 0) {
 						function.inclusive += dosrun_instructions - frame.instructions;
 						function.inclusiveMemory += dosrun_memory - frame.memory;
+						function.inclusiveUnknown += UnknownNow() - frame.unknown;
 					}
 				}
 				frames.pop_back();
@@ -388,6 +403,7 @@ std::string DEBUG_ProfileJson(void)
 
 	/* Frames still open (a program that exits inside its callees) count up to now, outermost only. */
 	std::vector<Function> shown = functions;
+	const uint64_t unknownNow = UnknownNow();
 	std::vector<uint32_t> open(functions.size(),0);
 	for (size_t i = 0;i < frames.size();i++)
 		if (frames[i].function >= 0) open[(size_t)frames[i].function]++;
@@ -398,6 +414,7 @@ std::string DEBUG_ProfileJson(void)
 		if (open[(size_t)f] == 0) {
 			shown[(size_t)f].inclusive += dosrun_instructions - frames[i].instructions;
 			shown[(size_t)f].inclusiveMemory += dosrun_memory - frames[i].memory;
+			shown[(size_t)f].inclusiveUnknown += unknownNow - frames[i].unknown;
 		}
 	}
 
@@ -419,7 +436,8 @@ std::string DEBUG_ProfileJson(void)
 		out += (k ? "," : "") + std::string("{\"name\":") + Quoted(f.name) + ",\"program\":" + Quoted(f.program) +
 		       ",\"self\":" + Number(f.self) + ",\"self_memory\":" + Number(f.selfMemory) +
 		       ",\"inclusive\":" + Number(f.inclusive ? f.inclusive : f.self) + ",\"inclusive_memory\":" +
-		       Number(f.inclusive ? f.inclusiveMemory : f.selfMemory) + ",\"calls\":" + Number(f.calls) + "}";
+		       Number(f.inclusive ? f.inclusiveMemory : f.selfMemory) + ",\"calls\":" + Number(f.calls) +
+		       ",\"inclusive_unknown\":" + Number(f.inclusive ? f.inclusiveUnknown : 0) + "}";
 	}
 	out += "],\"lines\":[";
 	std::vector<size_t> lineOrder;
