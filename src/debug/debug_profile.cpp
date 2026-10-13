@@ -46,6 +46,7 @@ struct Function {
 	std::string program;
 	uint64_t self = 0,selfMemory = 0,inclusive = 0,inclusiveMemory = 0,calls = 0;
 	uint64_t inclusiveUnknown = 0;	/* of inclusive, run in (unknown) code, which the program's map does not name */
+	bool sized = false;		/* its symbol has a length, so the function ends where the debug info says */
 	uint32_t active = 0;		/* frames of it on the stack: only the outermost adds to inclusive */
 };
 
@@ -69,6 +70,7 @@ std::vector<Line> lines;
 std::map<std::string,int32_t> functionIndex;
 std::map<std::string,int32_t> lineIndex;
 std::vector<Frame> frames;
+std::vector<DebugSymbol> sizedSymbols;	/* the store's symbols, a public given the length of the procedure at its address */
 
 uint32_t builtFor = 0;
 bool built = false;
@@ -203,8 +205,22 @@ void Rebuild()
 	const DebugSymbolStore &store = DEBUG_Symbols();
 	const std::vector<Span> spans = ProgramSpans();
 
+	/* A public (the name BASIC or C gives a function) has no length; the procedure record the debug info holds for the
+	 * same address has. A function ends where its record says, not where the next symbol starts: code that follows it
+	 * and that no symbol names is not its. */
+	sizedSymbols = store.All();
+	std::map<uint32_t,uint32_t> lengths;
+	for (size_t i = 0;i < sizedSymbols.size();i++)
+		if (sizedSymbols[i].hasSize && sizedSymbols[i].size > 0) lengths[sizedSymbols[i].linear] = sizedSymbols[i].size;
+	for (size_t i = 0;i < sizedSymbols.size();i++) {
+		if (sizedSymbols[i].hasSize) continue;
+		const std::map<uint32_t,uint32_t>::const_iterator found = lengths.find(sizedSymbols[i].linear);
+		if (found == lengths.end()) continue;
+		sizedSymbols[i].hasSize = true;
+		sizedSymbols[i].size = found->second;
+	}
 	std::vector<const DebugSymbol *> symbols;
-	for (size_t i = 0;i < store.All().size();i++) symbols.push_back(&store.All()[i]);
+	for (size_t i = 0;i < sizedSymbols.size();i++) symbols.push_back(&sizedSymbols[i]);
 	std::stable_sort(symbols.begin(),symbols.end(),[](const DebugSymbol *a,const DebugSymbol *b) {
 		if (a->linear != b->linear) return a->linear < b->linear;
 		return a->isFunction && !b->isFunction;
@@ -246,6 +262,7 @@ void Rebuild()
 			range.counted = true;
 			const DebugSymbol *symbol = SymbolAt(symbols,range.begin);
 			range.function = symbol != NULL ? FunctionIndex(symbol->name,symbol->program) : FunctionIndex(UNKNOWN,"");
+			if (symbol != NULL && symbol->hasSize && symbol->size > 0) functions[(size_t)range.function].sized = true;
 			const DebugSourceLine *line = LineAtSorted(sourceLines,range.begin);
 			if (line != NULL) range.line = LineIndex(line->file,line->line,range.function);
 			ranges.push_back(range);
@@ -437,7 +454,8 @@ std::string DEBUG_ProfileJson(void)
 		       ",\"self\":" + Number(f.self) + ",\"self_memory\":" + Number(f.selfMemory) +
 		       ",\"inclusive\":" + Number(f.inclusive ? f.inclusive : f.self) + ",\"inclusive_memory\":" +
 		       Number(f.inclusive ? f.inclusiveMemory : f.selfMemory) + ",\"calls\":" + Number(f.calls) +
-		       ",\"inclusive_unknown\":" + Number(f.inclusive ? f.inclusiveUnknown : 0) + "}";
+		       ",\"inclusive_unknown\":" + Number(f.inclusive ? f.inclusiveUnknown : 0) +
+		       ",\"sized\":" + (f.sized ? "true" : "false") + "}";
 	}
 	out += "],\"lines\":[";
 	std::vector<size_t> lineOrder;
