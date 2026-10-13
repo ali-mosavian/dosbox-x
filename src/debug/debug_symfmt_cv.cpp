@@ -229,7 +229,8 @@ static CvType ParseTypeRecord(const DebugBytes &body,size_t record,uint16_t leng
 		break;
 	case 0x0002:					/* LF_POINTER */
 		type.utype = body.u16(record + 4);
-		type.size = (body.u16(record + 2) & 0x1fu) == 0 ? 2u : 4u;
+		type.pointerKind = (uint8_t)(body.u16(record + 2) & 0x1fu);
+		type.size = type.pointerKind == 0 ? 2u : type.pointerKind == 11 ? 6u : 4u;
 		break;
 	case 0x0003: {					/* LF_ARRAY */
 		size_t next = 0;
