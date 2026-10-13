@@ -95,14 +95,15 @@ static std::string CvPrimitiveName(uint16_t type,DebugSymbol &out)
 	if (mode == 0) return name;
 
 	/* A pointer is the address, whatever it points at. */
-	const char * const kinds[3] = {"near ptr","far ptr","huge ptr"};
-	out.pointer.reach = mode == 1 ? DEBUG_REACH_NEAR : mode == 2 ? DEBUG_REACH_FAR : DEBUG_REACH_HUGE;
+	/* Modes 1 near, 2 far, 3 huge, then the 32-bit ones: 4 near (flat), 5 far (16:32). */
+	const char * const kinds[5] = {"near ptr","far ptr","huge ptr","near ptr","far ptr"};
+	out.pointer.reach = (mode == 1 || mode == 4) ? DEBUG_REACH_NEAR : mode == 3 ? DEBUG_REACH_HUGE : DEBUG_REACH_FAR;
 	out.pointer.targetSize = out.valueSize;
 	out.pointer.targetKind = out.valueKind;
 	out.pointer.targetType = name;
-	out.valueSize = mode == 1 ? 2u : 4u;
+	out.valueSize = mode == 1 ? 2u : mode == 5 ? 6u : 4u;
 	out.valueKind = DEBUG_VALUE_UNSIGNED;
-	return std::string(kinds[mode <= 3 ? mode - 1 : 2]) + (name.empty() ? "" : " to " + name);
+	return std::string(kinds[mode >= 1 && mode <= 5 ? mode - 1 : 2]) + (name.empty() ? "" : " to " + name);
 }
 
 /* Depth-limited: a type table is free to point back at itself. */
@@ -135,11 +136,12 @@ static std::string CodeViewTypeName(const std::vector<CvType> &types,uint16_t ty
 	case 0x0002:					/* LF_POINTER */
 		out.valueSize = record.size != 0 ? record.size : 2u;
 		out.valueKind = DEBUG_VALUE_UNSIGNED;
-		out.pointer.reach = out.valueSize == 2 ? DEBUG_REACH_NEAR : DEBUG_REACH_FAR;
+		out.pointer.reach = (record.pointerKind == 0 || record.pointerKind == 10) ? DEBUG_REACH_NEAR
+			: record.pointerKind == 2 ? DEBUG_REACH_HUGE : DEBUG_REACH_FAR;
 		out.pointer.targetSize = inner.valueSize;
 		out.pointer.targetKind = inner.fields.empty() ? inner.valueKind : DEBUG_VALUE_UNKNOWN;
 		out.pointer.targetType = underlying;
-		return (out.valueSize == 2 ? "near ptr" : "far ptr") +
+		return std::string(out.pointer.reach == DEBUG_REACH_NEAR ? "near ptr" : out.pointer.reach == DEBUG_REACH_HUGE ? "huge ptr" : "far ptr") +
 		       (underlying.empty() ? std::string() : " to " + underlying);
 	case 0x0003: {					/* LF_ARRAY */
 		out.valueSize = record.size;

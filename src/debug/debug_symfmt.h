@@ -180,7 +180,8 @@ struct CvMember {
 struct CvType {
 	uint16_t leaf = 0;
 	uint16_t utype = 0;	/* element, pointed-to or return type */
-	uint32_t size = 0;	/* bytes, for arrays and structures */
+	uint32_t size = 0;	/* bytes, for arrays and structures; a pointer's own */
+	uint8_t pointerKind = 0;	/* LF_POINTER: CV_ptrtype_e (0 near, 1 far, 2 huge, 10 near32, 11 far32) */
 	uint16_t fieldList = 0;	/* LF_FIELDLIST holding the members, for a structure */
 	std::string name;
 	std::vector<CvMember> members;	/* on the LF_FIELDLIST record itself */
