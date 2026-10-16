@@ -6,6 +6,11 @@
  * Commands (send as JSON):
  *   {"cmd":"break"}           - Break execution
  *   {"cmd":"continue"}        - Continue execution  
+ *   {"cmd":"continue","ms":N} - Continue, and park the guest again after N emulated ms ("run_limit" event)
+ *   {"cmd":"key_wait_arm","stop":true} - The next idle keyboard read sends "key_wait" and parks the guest
+ *     until "continue" ("key" takes "stop" too). Both events carry "emulated_us". Together they run a client in
+ *     lockstep with the guest: virtual_time_status says "lockstep":true.
+ *   {"cmd":"screenshot","path":P,"async":true} - Reply at once; a "screenshot" event follows the next frame
  *   {"cmd":"step"}            - Single step
  *   {"cmd":"step_over"}       - Step over (step past call)
  *   {"cmd":"bp_set","seg":X,"off":Y}  - Set breakpoint; or "addr":X (linear), or
@@ -265,10 +270,16 @@ static bool image_stop_armed = false;
 static std::vector<std::string> symbol_load_specs;
 // A screenshot command waiting for its file: later commands wait too, so replies stay in order.
 static bool screenshot_pending = false;
+// "async":true: the reply comes at once and the file is announced by a "screenshot" event, so a parked guest can be run on to draw the frame.
+static bool screenshot_async = false;
 static std::string screenshot_path;
 static std::chrono::steady_clock::time_point screenshot_deadline;
 // Set when a key is injected: BIOS INT 16h (which DOS's keyboard functions call) reports the first read that finds nothing.
 bool debug_key_wait_armed = false;
+// "stop":true on key_wait_arm or key: a key_wait parks the guest in place until "continue", so the client acts at an emulated instant.
+static bool key_wait_stop = false;
+void DEBUG_Socket_FreezeWait(void);
+static void run_limit_reached(Bitu);
 static std::string last_stop_event_json;
 static std::string last_fault_stop_event_json;
 static std::string current_response_id_json;
@@ -2545,6 +2556,10 @@ static void process_command(const std::string& json) {
     }
 
     if (cmd == "continue" || cmd == "run") {
+        // "ms":N parks the guest again after N emulated milliseconds (a "run_limit" event), whatever the host does meanwhile.
+        PIC_RemoveEvents(run_limit_reached);
+        long long limit_ms = 0;
+        if (json_get_int(json, "ms", limit_ms) && limit_ms > 0) PIC_AddEvent(run_limit_reached, (pic_tickindex_t)limit_ms);
         if (socket_freeze_wait) {
             // We are blocked in-place inside the CPU core. Just release the
             // freeze; the original core invocation resumes transparently. Do
@@ -3138,7 +3153,7 @@ static void process_command(const std::string& json) {
     if (cmd == "virtual_time_status") {
         send_ok(json_bool("on", ticksLocked && CPU_CycleAutoAdjust == false) + "," + json_num("cycles_per_ms", (long long)CPU_CycleMax) + "," +
                 json_bool("skip_idle", vtime_skip_idle) + "," + json_num("skipped_ms", (long long)VTIME_SkippedMs()) + "," +
-                json_num("clock_reads", (long long)VTIME_ClockReads()) + "," + json_num("emulated_us", (long long)(PIC_FullIndex() * 1000.0)));
+                json_num("clock_reads", (long long)VTIME_ClockReads()) + "," + json_bool("lockstep", true) + "," + json_num("emulated_us", (long long)(PIC_FullIndex() * 1000.0)));
         return;
     }
 
@@ -3533,7 +3548,9 @@ static void process_command(const std::string& json) {
         screenshot_path = path;
         screenshot_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
         screenshot_pending = true;
+        screenshot_async = json_get_flag(json, "async");
         CAPTURE_ScreenShotEvent(true);
+        if (screenshot_async) send_ok(json_str("msg", "Screenshot queued"));
         return;
     }
 
@@ -4024,6 +4041,7 @@ static void process_command(const std::string& json) {
     if (cmd == "key_wait_arm") {
         // The next time the guest reads the keyboard and finds nothing there: one key_wait event.
         debug_key_wait_armed = true;
+        if (json.find("\"stop\":") != std::string::npos) key_wait_stop = json_get_flag(json, "stop");
         send_ok(json_bool("armed", true));
         return;
     }
@@ -4031,6 +4049,7 @@ static void process_command(const std::string& json) {
     if (cmd == "key" || cmd == "keypress") {
         // The key goes in; the next read that finds the buffer empty again is when the program is done with it.
         debug_key_wait_armed = true;
+        if (json.find("\"stop\":") != std::string::npos) key_wait_stop = json_get_flag(json, "stop");
         // Inject a single key or special key
         std::string key;
         long long scancode = -1, ascii = -1;
@@ -5100,6 +5119,10 @@ void DEBUG_Socket_Shutdown(void) {
 void DEBUG_Socket_ScreenshotWritten(bool written) {
     if (!screenshot_pending) return;
     screenshot_pending = false;
+    if (screenshot_async) {
+        send_response("{" + json_str("event", "screenshot") + "," + json_str("result", written ? "ok" : "error") + "," + json_str("path", screenshot_path) + "}");
+        return;
+    }
     if (!written) {
         send_error("Screenshot could not be written");
         return;
@@ -5114,19 +5137,27 @@ void DEBUG_Socket_ScreenshotWritten(bool written) {
     send_ok(json_str("msg", "Screenshot written") + "," + json_str("path", screenshot_path) + "," + json_num("size", size));
 }
 
+static void run_limit_reached(Bitu) {
+    if (client_socket < 0 || gdb_mode) return;
+    send_response("{" + json_str("event", "run_limit") + "," + json_num("emulated_us", (long long)(PIC_FullIndex() * 1000.0)) + "}");
+    DEBUG_Socket_FreezeWait();
+}
+
 void DEBUG_Socket_KeyWait(uint8_t function) {
     debug_key_wait_armed = false;
     if (client_socket < 0 || gdb_mode) return;
     char at[32];
     snprintf(at, sizeof(at), "%04X:%08X", SegValue(cs), (unsigned)reg_eip);
     send_response("{" + json_str("event", "key_wait") + "," + json_hex("function", function) + "," +
-                  json_str("at", at) + "," + json_hex("linear", (uint32_t)GetAddress(SegValue(cs), reg_eip)) + "}");
+                  json_str("at", at) + "," + json_hex("linear", (uint32_t)GetAddress(SegValue(cs), reg_eip)) + "," +
+                  json_num("emulated_us", (long long)(PIC_FullIndex() * 1000.0)) + "}");
+    if (key_wait_stop) DEBUG_Socket_FreezeWait();
 }
 
 bool DEBUG_Socket_CheckCommands(void) {
     if (server_socket < 0) return false;
 
-    if (screenshot_pending) {
+    if (screenshot_pending && !screenshot_async) {
         // Nothing else is read until the file is there, or no frame is going to be drawn.
         if (std::chrono::steady_clock::now() < screenshot_deadline) return false;
         screenshot_pending = false;
