@@ -21,6 +21,9 @@ bool DOSRUN_ShellInput(char *line, unsigned int size);
  * run loop. */
 bool DOSRUN_Forked(void);
 
+/* False for a job that said :nosymbols: protected-mode programs are not watched for their loader. */
+bool DOSRUN_Symbols(void);
+
 /* One emulated millisecond passed. */
 void DOSRUN_Tick(void);
 
