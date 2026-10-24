@@ -14,6 +14,7 @@
 #include "cpu.h"
 #include "debug_image.h"
 #include "debug_socket.h"
+#include "dosrun.h"
 
 #include <algorithm>
 #include <set>
@@ -394,6 +395,7 @@ static bool LooksLikeImage(const char *program)
  * to place it. False when the file is anything else. */
 static bool WatchForLoader(const char *program,uint16_t psp)
 {
+	if (!DOSRUN_Symbols()) return false;
 	PendingImage pending;
 	pending.program = program;
 	pending.psp = psp;
