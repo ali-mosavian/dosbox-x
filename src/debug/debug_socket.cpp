@@ -11,6 +11,9 @@
  *     until "continue" ("key" takes "stop" too). Both events carry "emulated_us". Together they run a client in
  *     lockstep with the guest: virtual_time_status says "lockstep":true.
  *   {"cmd":"screenshot","path":P,"async":true} - Reply at once; a "screenshot" event follows the next frame
+ *   {"cmd":"video_start","dir":D} - Record every frame drawn (and the sound) to an AVI in D, as the
+ *                             capture key does; the file is named as the capture dir names it
+ *   {"cmd":"video_stop"}      - Close the AVI
  *   {"cmd":"step"}            - Single step
  *   {"cmd":"step_over"}       - Step over (step past call)
  *   {"cmd":"bp_set","seg":X,"off":Y}  - Set breakpoint; or "addr":X (linear), or
@@ -3273,6 +3276,20 @@ static void process_command(const std::string& json) {
         if (!alloc_trace_fp) { send_error("Could not open 'file' for writing"); return; }
         alloc_trace_n = 0;
         send_ok(json_str("file", path));
+        return;
+    }
+
+    if (cmd == "video_start" || cmd == "video_stop") {
+        extern std::string capturedir;
+        extern void CAPTURE_VideoStart(), CAPTURE_VideoStop();
+        std::string dir;
+        if (cmd == "video_start") {
+            if (json_get_string(json, "dir", dir)) capturedir = dir;
+            CAPTURE_VideoStart();
+        } else {
+            CAPTURE_VideoStop();
+        }
+        send_ok(json_str("msg", cmd == "video_start" ? "Recording" : "Stopped"));
         return;
     }
 
