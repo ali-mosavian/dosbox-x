@@ -3486,6 +3486,9 @@ void DOSBOX_SetupConfigSections(void) {
     Pstring->Set_values(voodoo_settings);
     Pstring->Set_help("Enable support for the 3dfx Voodoo card.");
     Pstring->SetBasic(true);
+	Pint = secprop->Add_int("voodoo_type",Property::Changeable::OnlyAtStart,2);
+	Pint->SetMinMax(1,2);
+	Pint->Set_help("The 3dfx card emulated: 1, the Voodoo Graphics; 2, the Voodoo 2 (its setup triangles, PCI device 2).");
 	Pbool = secprop->Add_bool("voodoo_maxmem",Property::Changeable::OnlyAtStart,true);
 	Pbool->Set_help("Specify whether to enable maximum memory size for the Voodoo card.\n"
                     "If set (on by default), the memory size will be 12MB (4MB front buffer + 2x4MB texture units)\n"
